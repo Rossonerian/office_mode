@@ -34,7 +34,8 @@ fn read_stdin() -> Option<Vec<u8>> {
 }
 
 /// Send one line to the socket with an overall deadline (UnixStream has no connect timeout).
-fn send_line(line: String) {
+/// Returns true only if the office received it (i.e. the office is running).
+fn send_line(line: String) -> bool {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let ok = (|| -> std::io::Result<()> {
@@ -47,7 +48,7 @@ fn send_line(line: String) {
         .is_ok();
         let _ = tx.send(ok);
     });
-    let _ = rx.recv_timeout(SEND_TIMEOUT);
+    rx.recv_timeout(SEND_TIMEOUT).unwrap_or(false)
 }
 
 fn run() {
@@ -71,9 +72,13 @@ fn run() {
     if let Some(id) = &request_id {
         line["request_id"] = json!(id);
     }
-    send_line(line.to_string());
+    let delivered = send_line(line.to_string());
 
     let Some(request_id) = request_id else { return };
+    // Office not running: never make the user wait; fall through to the normal Claude prompt.
+    if !delivered {
+        return;
+    }
     let timeout_s = office_core::config::Config::load().permission_timeout_s;
     if timeout_s == 0 {
         return;
