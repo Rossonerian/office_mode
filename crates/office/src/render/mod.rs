@@ -79,6 +79,8 @@ pub struct Renderer {
     ceo: CeoConfig,
     ceo_look: ceo::CeoLook,
     hover: Option<AgentId>,
+    /// Interior mutability: the cat continues its walk across frames while themes are borrowed.
+    cat_mem: std::cell::RefCell<cat::Memory>,
 }
 
 impl Renderer {
@@ -102,6 +104,7 @@ impl Renderer {
             ceo: cfg.ceo.clone(),
             ceo_look: ceo::look(&cfg.ceo),
             hover: None,
+            cat_mem: Default::default(),
         };
         r.ensure_mix();
         r
@@ -451,7 +454,7 @@ impl Renderer {
         // the office cat: above the floor and furniture, below the labels
         let mut cat_at: Option<cat::CatState> = None;
         if self.cat.enabled {
-            let st = cat::state(lay, scene, t);
+            let st = self.cat_mem.borrow_mut().state(lay, scene, t);
             let hl = selected == Some(&CAT_ID.to_string()) || self.hover.as_deref() == Some(CAT_ID);
             let mut buf = RgbaImage::new(cat::BOX_W as u32 + 8, cat::BOX_H as u32 + 4);
             cat::draw(&mut buf, 4 + cat::BOX_W / 2, 2 + cat::BOX_H, &st, &cat::coat(&self.cat.color));

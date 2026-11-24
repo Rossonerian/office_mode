@@ -84,33 +84,122 @@ fn waypoint(lay: &Layout, alerts: &[Spot], k: u64) -> (Spot, bool) {
     (spot.unwrap_or(fallback), false)
 }
 
-/// Where the cat is and what it is doing at time `t`.
+/// One leg of the cat's day: from one waypoint to the next, starting at `start` (ms).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leg {
+    pub k: u64,
+    pub start: u64,
+    pub from: Spot,
+    pub to: Spot,
+    pub alert: bool,
+    /// The alerting desks when this leg was planned.
+    alerts: Vec<Spot>,
+    /// Layout geometry the leg was planned on.
+    layout: String,
+}
+
+impl Leg {
+    fn plan(lay: &Layout, alerts: &[Spot], k: u64, start: u64, from: Spot) -> Leg {
+        let (to, alert) = waypoint(lay, alerts, k);
+        Leg { k, start, from, to, alert, alerts: alerts.to_vec(), layout: lay.static_key() }
+    }
+
+    /// The leg a fresh cat would be on at `t` (a pure function of `t`).
+    fn fresh(lay: &Layout, alerts: &[Spot], t: u64) -> Leg {
+        let k = t / LEG_MS + 1;
+        let (from, _) = waypoint(lay, alerts, k - 1);
+        Leg::plan(lay, alerts, k, (k - 1) * LEG_MS, from)
+    }
+
+    fn walk_ms(&self, lay: &Layout) -> f32 {
+        (path_len(&lay.route(&self.from, &self.to)) / WALK_PX_PER_S * 1000.0).min(MAX_WALK_MS)
+    }
+}
+
+/// The cat's memory between frames, so a change in the alerts (or the clock) never makes it
+/// teleport: a walk in progress always finishes before the cat retargets.
+#[derive(Debug, Clone, Default)]
+pub struct Memory {
+    leg: Option<Leg>,
+}
+
+impl Memory {
+    /// Where the cat is and what it is doing at `t`, continuing the current leg.
+    pub fn state(&mut self, lay: &Layout, scene: &Scene, t: u64) -> CatState {
+        let alerts = alert_desks(scene, lay);
+        let key = lay.static_key();
+        let mut leg = match self.leg.take() {
+            // a new layout, a clock jump backwards or a long gap: start over
+            Some(l) if l.layout == key && t >= l.start && t < l.start + 2 * LEG_MS => l,
+            _ => Leg::fresh(lay, &alerts, t),
+        };
+        let walked = t as f32 >= leg.start as f32 + leg.walk_ms(lay);
+        if t >= leg.start + LEG_MS {
+            let start = leg.start + LEG_MS;
+            leg = Leg::plan(lay, &alerts, leg.k + 1, start.max(t.saturating_sub(LEG_MS - 1)), leg.to);
+        } else if walked && leg.alerts != alerts {
+            // the alerts changed: once there, head off at once (to the new alert, or away)
+            leg = Leg::plan(lay, &alerts, leg.k + 1, t, leg.to);
+        }
+        let st = leg_state(lay, &leg, t);
+        self.leg = Some(leg);
+        st
+    }
+}
+
+/// Where a fresh cat is and what it is doing at time `t` (pure; the renderer uses `Memory`).
 pub fn state(lay: &Layout, scene: &Scene, t: u64) -> CatState {
     let alerts = alert_desks(scene, lay);
-    let k = t / LEG_MS + 1;
-    let within = t % LEG_MS;
-    let (from, _) = waypoint(lay, &alerts, k - 1);
-    let (to, alert) = waypoint(lay, &alerts, k);
-    let (dx, dy) = ((to.x - from.x) as f32, (to.y - from.y) as f32);
-    let dist = (dx * dx + dy * dy).sqrt();
-    let walk_ms = (dist / WALK_PX_PER_S * 1000.0).min(MAX_WALK_MS);
-    let left = if dx.abs() >= 1.0 { dx < 0.0 } else { mix(k ^ 0x51) % 2 == 0 };
+    leg_state(lay, &Leg::fresh(lay, &alerts, t), t)
+}
+
+fn path_len(pts: &[(i32, i32)]) -> f32 {
+    pts.windows(2).map(|w| ((w[1].0 - w[0].0).abs() + (w[1].1 - w[0].1).abs()) as f32).sum()
+}
+
+/// Feet position at progress `p` (0..=1) along the route, with hop arcs on the first segment
+/// (leaving furniture) and the last one (reaching it). Also returns the segment index and its
+/// horizontal direction.
+pub fn walk_pos(lay: &Layout, from: &Spot, to: &Spot, p: f32) -> (f32, f32, usize, i32) {
+    pos_on(&lay.route(from, to), from, to, p)
+}
+
+fn pos_on(pts: &[(i32, i32)], from: &Spot, to: &Spot, p: f32) -> (f32, f32, usize, i32) {
+    let total = path_len(pts).max(1.0);
+    let mut d = p.clamp(0.0, 1.0) * total;
+    let last = pts.len().saturating_sub(2);
+    for (i, w) in pts.windows(2).enumerate() {
+        let len = ((w[1].0 - w[0].0).abs() + (w[1].1 - w[0].1).abs()) as f32;
+        if d <= len || i == last {
+            let q = if len > 0.0 { (d / len).clamp(0.0, 1.0) } else { 1.0 };
+            let x = w[0].0 as f32 + (w[1].0 - w[0].0) as f32 * q;
+            let mut y = w[0].1 as f32 + (w[1].1 - w[0].1) as f32 * q;
+            let hop = (i == 0 && from.elevated()) || (i == last && to.elevated());
+            if hop {
+                y -= (std::f32::consts::PI * q).sin() * 7.0;
+            }
+            return (x, y, i, (w[1].0 - w[0].0).signum());
+        }
+        d -= len;
+    }
+    (to.x as f32, to.y as f32, last, 0)
+}
+
+fn leg_state(lay: &Layout, leg: &Leg, t: u64) -> CatState {
+    let (from, to, alert, k) = (leg.from, leg.to, leg.alert, leg.k);
+    let within = t.saturating_sub(leg.start);
+    let walk_ms = leg.walk_ms(lay);
+    let dx = to.x - from.x;
     let tail_up = (t / 450) % 7 == 0 || (alert && (t / 250) % 2 == 0);
+    let default_left = if dx != 0 { dx < 0 } else { mix(k ^ 0x51) % 2 == 0 };
     if (within as f32) < walk_ms {
         let p = within as f32 / walk_ms;
-        let mut y = from.y as f32 + dy * p;
-        // hop arcs leaving / reaching furniture
-        let arc = |q: f32| -(std::f32::consts::PI * q.clamp(0.0, 1.0)).sin() * 7.0;
-        if from.elevated() && p < 0.18 {
-            y += arc(p / 0.18);
-        }
-        if to.elevated() && p > 0.82 {
-            y += arc((p - 0.82) / 0.18);
-        }
-        let x = from.x as f32 + dx * p;
+        let (x, y, _, sx) = walk_pos(lay, &from, &to, p);
+        let left = if sx != 0 { sx < 0 } else { default_left };
         let frame = ((t / 110) % 4) as u8;
         return clamp_in(lay, CatState { x: x.round() as i32, y: y.round() as i32, left, action: Action::Walk(frame), tail_up });
     }
+    let left = default_left;
     let rest = within as f32 - walk_ms;
     let action = if alert {
         Action::Alert
@@ -311,6 +400,88 @@ mod tests {
         assert!(visits > 30, "alert visits: {visits}");
         let none = alert_desks(&Scene::default(), &lay);
         assert!((0..300u64).all(|k| !waypoint(&lay, &none, k).1));
+    }
+
+    /// Layouts to exercise: the demo office, an empty one, and crowded ones, with/without the CEO.
+    fn layouts() -> Vec<(Scene, layout::Layout)> {
+        let now = 10_000_000;
+        let mut out = Vec::new();
+        let mut big = demo::demo_scene(now);
+        for i in 0..14 {
+            let mut a = big.agents.values().next().unwrap().clone();
+            a.id = format!("extra:{i}");
+            a.parent = None;
+            a.kind = office_core::model::AgentKind::Claude;
+            a.state = if i % 3 == 0 { AgentState::NeedsYou } else { AgentState::Typing };
+            a.started_ms = now + i;
+            big.agents.insert(a.id.clone(), a);
+        }
+        for s in [demo::demo_scene(now), Scene::default(), big] {
+            for (pw, ph, ceo) in [(640, 360, true), (1600, 900, false), (300, 800, true), (1920, 400, true)] {
+                let lay = layout::build_with(&s, pw, ph, layout::Extras { ceo });
+                out.push((s.clone(), lay));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cat_routes_never_cross_desks_or_the_nameplate() {
+        for (s, lay) in layouts() {
+            let obstacles = lay.obstacles();
+            let mut spots = lay.spots.clone();
+            spots.extend(alert_desks(&s, &lay));
+            for from in &spots {
+                for to in &spots {
+                    let pts = lay.route(from, to);
+                    let last = pts.len().saturating_sub(2);
+                    let n = (path_len(&pts) as usize).max(1);
+                    for i in 0..=n {
+                        let (x, y, seg, _) = pos_on(&pts, from, to, i as f32 / n as f32);
+                        let (x, y) = (x.round() as i32, y.round() as i32);
+                        for o in obstacles.iter().filter(|o| o.contains(x, y)) {
+                            // only the deliberate hops: off the start desk, onto the target desk
+                            let ok = (seg == last && o.spot == Some(to.kind)) || (seg == 0 && o.spot == Some(from.kind));
+                            assert!(ok, "cat at {:?} (segment {seg}/{last}) inside {o:?} on {from:?} -> {to:?} via {pts:?}", (x, y));
+                        }
+                    }
+                    // Manhattan: every segment is horizontal or vertical
+                    assert!(pts.windows(2).all(|w| w[0].0 == w[1].0 || w[0].1 == w[1].1), "{pts:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_teleport_when_alerts_start_or_clear() {
+        let now = 10_000_000;
+        let alerting = demo::demo_scene(now);
+        let mut calm = alerting.clone();
+        for a in calm.agents.values_mut() {
+            if matches!(a.state, AgentState::NeedsYou | AgentState::Error) {
+                a.state = AgentState::Idle;
+            }
+        }
+        let lay = layout::build(&alerting, 640, 360);
+        assert_eq!(lay.static_key(), layout::build(&calm, 640, 360).static_key());
+        let mut mem = Memory::default();
+        let mut prev: Option<CatState> = None;
+        let mut alert_frames = 0;
+        for i in 0..6_000u64 {
+            let t = now + i * 50;
+            // alerts flip on and off at odd moments, often mid-walk
+            let s = if (t / 3_700) % 2 == 0 { &alerting } else { &calm };
+            let c = mem.state(&lay, s, t);
+            if let Some(p) = prev {
+                let jump = (c.x - p.x).abs() + (c.y - p.y).abs();
+                assert!(jump <= 24, "teleport {p:?} -> {c:?} at t={t}");
+            }
+            if c.action == Action::Alert {
+                alert_frames += 1;
+            }
+            prev = Some(c);
+        }
+        assert!(alert_frames > 0, "the cat still answers alerts");
     }
 
     #[test]

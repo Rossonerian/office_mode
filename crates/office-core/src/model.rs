@@ -56,8 +56,15 @@ pub struct Agent {
     pub activity: String,
     pub started_ms: u64,
     pub last_event_ms: u64,
+    /// Fresh (uncached) input tokens.
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Input tokens served from the prompt cache (cheap; not shown in totals).
+    #[serde(default)]
+    pub tokens_cache_read: u64,
+    /// Input tokens written to the prompt cache.
+    #[serde(default)]
+    pub tokens_cache_write: u64,
     pub cost_usd: f64,
     pub context_pct: Option<f32>,
     pub rss_mb: Option<u32>,
@@ -67,6 +74,14 @@ pub struct Agent {
     pub resume_id: Option<String>,
     /// Pending Claude permission request id (control action: approve/deny).
     pub pending_permission: Option<String>,
+}
+
+impl Agent {
+    /// Tokens for the sidebar/header: input + cache writes + output, without cache reads (which
+    /// dominate long sessions while costing a tenth of fresh input).
+    pub fn tokens_shown(&self) -> u64 {
+        self.tokens_in + self.tokens_cache_write + self.tokens_out
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

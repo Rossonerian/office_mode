@@ -112,7 +112,7 @@ impl Default for Config {
             presets: BTreeMap::new(),
             fps: 12,
             notifications: true,
-            cost_alert_usd: 5.0,
+            cost_alert_usd: 50.0,
             stuck_after_s: 120,
             prices,
             agy_models: agy,

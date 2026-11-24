@@ -97,6 +97,9 @@ fn usage(id: &str, secs: u64, in_rate: u64, out_rate: u64, price_in: f64, price_
         id: id.into(),
         tokens_in: tin,
         tokens_out: tout,
+        // long sessions re-read their context from the prompt cache every turn
+        tokens_cache_read: secs * in_rate * 6,
+        tokens_cache_write: 2_000 + secs * in_rate / 5,
         cost_usd: (tin as f64 * price_in + tout as f64 * price_out) / 1_000_000.0,
         context_pct: Some(((tin as f32) / 2_000.0).min(95.0)),
     }

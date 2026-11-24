@@ -257,7 +257,8 @@ pub fn search_dirs() -> Vec<PathBuf> {
     v
 }
 
-/// Theme names found on disk plus "procedural" (first), deduplicated.
+/// Theme names found on disk plus "procedural" (first), deduplicated. Templates (`*.example`)
+/// are skipped.
 pub fn list(dirs: &[PathBuf]) -> Vec<String> {
     let mut names = vec!["procedural".to_string()];
     let mut found = Vec::new();
@@ -265,7 +266,7 @@ pub fn list(dirs: &[PathBuf]) -> Vec<String> {
         let Ok(rd) = std::fs::read_dir(d) else { continue };
         for e in rd.flatten() {
             if e.path().join("theme.toml").is_file() {
-                if let Some(n) = e.file_name().to_str() {
+                if let Some(n) = e.file_name().to_str().filter(|n| !n.ends_with(".example")) {
                     found.push(n.to_string());
                 }
             }
@@ -381,5 +382,24 @@ mod tests {
             assert!(t.sprites.values().any(|s| !s.fallback), "{n} uses no sheet sprites");
         }
         assert!(load("does-not-exist", &dirs).is_err());
+    }
+
+    #[test]
+    fn premium_template_uses_the_loader_format() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes/premium.example");
+        let src = std::fs::read_to_string(dir.join("theme.toml")).unwrap();
+        let tf: ThemeFile = toml::from_str(&src).expect("template parses as a theme.toml");
+        assert!(!tf.sheets.is_empty() && !tf.sprites.is_empty());
+        for (k, def) in &tf.sprites {
+            assert!(tf.sheets.contains_key(&def.sheet), "sprite {k}: unknown sheet {}", def.sheet);
+            let region = def.tiles.is_some() || (def.col.is_some() && def.row.is_some()) || def.w.is_some();
+            assert!(region, "sprite {k} names no region");
+        }
+        for n in SPRITE_NAMES {
+            assert!(tf.sprites.contains_key(n), "template maps {n}");
+        }
+        // a template is not a theme: it never shows up in the theme cycle
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes");
+        assert!(!list(&[root]).iter().any(|n| n.ends_with(".example")));
     }
 }

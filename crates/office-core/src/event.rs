@@ -43,8 +43,13 @@ pub enum EventKind {
     ToolEnd { id: AgentId, tool: String, ok: bool },
     Usage {
         id: AgentId,
+        /// Fresh (uncached) input tokens.
         tokens_in: u64,
         tokens_out: u64,
+        #[serde(default)]
+        tokens_cache_read: u64,
+        #[serde(default)]
+        tokens_cache_write: u64,
         cost_usd: f64,
         context_pct: Option<f32>,
     },

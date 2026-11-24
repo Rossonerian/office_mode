@@ -31,8 +31,11 @@ struct Tok {
 
 #[derive(Default)]
 struct Totals {
+    /// Fresh (uncached) input.
     tokens_in: u64,
     tokens_out: u64,
+    tokens_cache_read: u64,
+    tokens_cache_write: u64,
     cost: f64,
     context_pct: Option<f32>,
     /// message.id -> usage already counted (assistant messages are split over several lines).
@@ -116,6 +119,8 @@ impl Tailer {
                     id: id.clone(),
                     tokens_in: t.tokens_in,
                     tokens_out: t.tokens_out,
+                    tokens_cache_read: t.tokens_cache_read,
+                    tokens_cache_write: t.tokens_cache_write,
                     cost_usd: t.cost,
                     context_pct: t.context_pct,
                 }));
@@ -248,8 +253,10 @@ impl Tailer {
             };
             t.seen.insert(key, merged);
         }
-        t.tokens_in += d.input + d.cache_write + d.cache_read;
+        t.tokens_in += d.input;
         t.tokens_out += d.output;
+        t.tokens_cache_read += d.cache_read;
+        t.tokens_cache_write += d.cache_write;
         t.cost += self.cfg.cost_usd(model, d.input, d.output, d.cache_write, d.cache_read);
         // Context % reflects the agent's own window; rolled-up sidechain lines don't overwrite the parent's.
         let sidechain = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
@@ -369,6 +376,12 @@ mod tests {
                 _ => None,
             })
         };
+        let cache = |evs: &[Event], who: &str| {
+            evs.iter().find_map(|e| match &e.kind {
+                EventKind::Usage { id, tokens_cache_read, tokens_cache_write, .. } if id == who => Some((*tokens_cache_read, *tokens_cache_write)),
+                _ => None,
+            })
+        };
         let (i, o, c) = usage(&evs, "cc:s1").unwrap();
         assert_eq!((i, o), (1010, 110));
         let expect = (1000.0 * 15.0 + 100.0 * 75.0 + 10.0 * 0.8 + 10.0 * 4.0) / 1e6;
@@ -383,8 +396,11 @@ mod tests {
         assert!(usage(&t.poll(SystemTime::now()), "cc:s1").is_none());
         f.write_all(b.as_bytes()).unwrap();
         let evs = t.poll(SystemTime::now());
-        let (i, _, _) = usage(&evs, "cc:s1").unwrap();
-        assert_eq!(i, 1010 + 11_000);
+        let (i, _, c2) = usage(&evs, "cc:s1").unwrap();
+        // cache tokens are booked separately (fresh input unchanged); cost still counts them
+        assert_eq!(i, 1010);
+        assert_eq!(cache(&evs, "cc:s1"), Some((10_000, 1000)));
+        assert!(c2 > c);
         let ctx = evs.iter().find_map(|e| match &e.kind {
             EventKind::Usage { id, context_pct, .. } if id == "cc:s1" => *context_pct,
             _ => None,

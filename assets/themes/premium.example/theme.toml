@@ -1,0 +1,85 @@
+# Premium theme template (agent-office theme.toml format; see crates/office/src/render/theme.rs).
+#
+# Paid packs are NOT bundled and must never be committed. To use one:
+#   mkdir -p ~/.config/agent-office/themes/premium
+#   cp assets/themes/premium.example/theme.toml ~/.config/agent-office/themes/premium/
+#   copy the PNGs you bought into ~/.config/agent-office/themes/premium/{tiles,characters,animated,pets}/
+#   and the pack licences into .../premium/LICENSES/
+# then press `t` (or `T` for the mixer) in `office`, or set `theme = { furniture = "premium", ... }`.
+# Directories ending in ".example" (like this one) are skipped by the theme list.
+#
+# Filenames below follow LimeZu "Modern Interiors" / "Modern Office" and Shubibubi "Cozy Interior"
+# exports (16 px tiles, no spacing; characters in 16x32 cells). They differ between pack versions:
+# rename the `file` values to match yours. Every col/row/x/y is a starting guess: open the sheet in
+# an editor with a 16 px grid and adjust. Anything you delete falls back to the procedural sprite
+# (drawn with this theme's [colors] and [fx]), so a partial mapping is fine.
+#
+# Region forms (all in the sheet's own pixels/tiles):
+#   { sheet, col, row }                      one tile at grid (col, row)
+#   { sheet, col, row, cols, rows }          a cols x rows block of tiles
+#   { sheet, tiles = [[c,r], ...], grid = [w,h] }  tiles stitched into a w x h grid
+#   { sheet, x, y, w, h, frames }            a pixel rect; frames step right by w (+ spacing)
+#   tint = "#rrggbb" multiplies a sprite; screen = [x,y,w,h] marks a monitor's screen.
+
+[sheets]
+# --- tiles/ (LimeZu Modern Interiors + Modern Office) ---
+room = { file = "tiles/Room_Builder_16x16.png", tile = 16, spacing = 0 }
+interiors = { file = "tiles/Interiors_16x16.png", tile = 16, spacing = 0 }
+office = { file = "tiles/Modern_Office_16x16.png", tile = 16, spacing = 0 }
+# --- tiles/ (Shubibubi Cozy Interior) ---
+cozy = { file = "tiles/Cozy_Interior_16x16.png", tile = 16, spacing = 0 }
+# --- animated/ (LimeZu animated objects: one strip per object, frames left to right) ---
+anim_monitor = { file = "animated/Animated_Computer_16x16.png", tile = 16, spacing = 0 }
+# --- characters/ (LimeZu: 16x32 cells; idle_anim rows hold right, up, left, down x 6 frames) ---
+adam_idle = { file = "characters/Adam_idle_anim_16x16.png", tile = 16, spacing = 0 }
+adam_sit = { file = "characters/Adam_sit_16x16.png", tile = 16, spacing = 0 }
+adam_run = { file = "characters/Adam_run_16x16.png", tile = 16, spacing = 0 }
+# --- pets/ (cat sheet: 16x16 cells, one animation per row) ---
+cat = { file = "pets/Cat_16x16.png", tile = 16, spacing = 0 }
+
+[sprites]
+# Room shell
+floor = { sheet = "room", col = 11, row = 5 }
+wall = { sheet = "room", col = 1, row = 1, rows = 2 }
+window = { sheet = "interiors", col = 0, row = 40, cols = 2, rows = 2 }
+door = { sheet = "room", tiles = [[14, 0], [14, 1]], grid = [1, 2] }
+rug = { sheet = "interiors", col = 4, row = 60, cols = 3, rows = 2 }
+
+# Furniture (the renderer centres sprites in each 48x64 desk cell; desks look best ~32-40 px wide)
+desk = { sheet = "office", tiles = [[0, 6], [1, 6]] }
+chair = { sheet = "office", col = 4, row = 8 }
+monitor_off = { sheet = "office", col = 6, row = 2, screen = [2, 2, 12, 8] }
+monitor_on = { sheet = "anim_monitor", x = 0, y = 0, w = 16, h = 16, frames = 4, screen = [2, 2, 12, 8] }
+sofa = { sheet = "cozy", col = 0, row = 10, cols = 3 }
+whiteboard = { sheet = "office", col = 10, row = 0, cols = 2, rows = 2 }
+
+# Decor
+plant = { sheet = "cozy", col = 8, row = 2, rows = 2 }
+cooler = { sheet = "office", col = 14, row = 4, rows = 2 }
+lamp = { sheet = "cozy", col = 12, row = 6 }
+
+# Characters and the cat: parsed and validated, reserved for sprite-based characters. The
+# renderer currently draws agents, the CEO and the cat procedurally (tinted by this theme's [fx]).
+char_idle_down = { sheet = "adam_idle", x = 288, y = 0, w = 16, h = 32, frames = 6 }
+char_idle_up = { sheet = "adam_idle", x = 96, y = 0, w = 16, h = 32, frames = 6 }
+char_sit_down = { sheet = "adam_sit", x = 0, y = 0, w = 16, h = 32, frames = 6 }
+char_walk_right = { sheet = "adam_run", x = 0, y = 0, w = 16, h = 32, frames = 6 }
+char_walk_left = { sheet = "adam_run", x = 192, y = 0, w = 16, h = 32, frames = 6 }
+cat_walk = { sheet = "cat", x = 0, y = 0, w = 16, h = 16, frames = 4 }
+cat_sit = { sheet = "cat", x = 0, y = 16, w = 16, h = 16, frames = 4 }
+cat_sleep = { sheet = "cat", x = 0, y = 32, w = 16, h = 16, frames = 4 }
+cat_groom = { sheet = "cat", x = 0, y = 48, w = 16, h = 16, frames = 4 }
+
+[colors]
+# used by procedural fallbacks (see procedural::Colors::set)
+wall_trim = "#8a7f74"
+metal = "#4a4f58"
+backdrop = "#2a2520"
+rug = "#7d5b4b"
+rug_trim = "#c2a68f"
+fabric = "#6b8fb3"
+
+[fx]
+# tint = "#ffffff"       # multiply every sprite
+# glow = "#9ad1ff"       # glow around active monitors
+# floor_bg = "#1e1a16"   # fill under transparent floor tiles

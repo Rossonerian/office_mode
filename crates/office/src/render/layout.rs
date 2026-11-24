@@ -265,6 +265,118 @@ pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
     Layout { w, h, cols, rows, pods, seats, door: (MARGIN + 9, h - 14), ceo, spots }
 }
 
+/// Desk furniture rect [x, y, w, h] of the desk cell at (ox, oy) (as drawn by the renderer).
+pub fn desk_rect(ox: i32, oy: i32) -> [i32; 4] {
+    [ox + 4, oy + 32, 40, 16]
+}
+
+/// Floor aisle y below the desk of cell row `oy` (between the desk and the next row's chairs).
+const fn aisle_below(oy: i32) -> i32 {
+    oy + 56
+}
+
+/// Something the cat must not walk across.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Obstacle {
+    /// The spot that sits on top of it (the cat may hop onto it when that is its target), or
+    /// `None` when it is never walkable (the CEO nameplate).
+    pub spot: Option<SpotKind>,
+    pub rect: [i32; 4],
+}
+
+impl Obstacle {
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        let [rx, ry, rw, rh] = self.rect;
+        x >= rx && x < rx + rw && y >= ry && y < ry + rh
+    }
+}
+
+impl Layout {
+    /// The corridor along the wall, in front of the top row (above every desk).
+    pub fn aisle_top(&self) -> i32 {
+        WALL_H + DECOR_H + 2
+    }
+
+    /// The CEO desk [x, y, w, h] (surface, front and legs).
+    pub fn ceo_desk_rect(&self) -> Option<[i32; 4]> {
+        self.ceo.map(|[cx, cy, cw, _]| [cx + 2, cy + CEO_DESK_TOP, cw - 4, 17])
+    }
+
+    /// The widest the CEO nameplate can be (it is centred on the desk front).
+    pub fn nameplate_rect(&self) -> Option<[i32; 4]> {
+        self.ceo.map(|[cx, cy, cw, _]| [cx + 6, cy + CEO_DESK_TOP + 6, cw - 12, 5 + 4])
+    }
+
+    /// Desks (every pod cell has one), the CEO desk and its nameplate.
+    pub fn obstacles(&self) -> Vec<Obstacle> {
+        let mut v = Vec::new();
+        for (pi, pod) in self.pods.iter().enumerate() {
+            for d in 0..DESKS_PER_POD {
+                let (ox, oy) = pod.cell(d);
+                v.push(Obstacle { spot: Some(SpotKind::Desk(pi, d)), rect: desk_rect(ox, oy) });
+            }
+        }
+        if let Some(r) = self.ceo_desk_rect() {
+            v.push(Obstacle { spot: Some(SpotKind::CeoDesk), rect: r });
+        }
+        if let Some(r) = self.nameplate_rect() {
+            v.push(Obstacle { spot: None, rect: r });
+        }
+        v
+    }
+
+    /// The floor point the cat hops to/from for a spot (always on a horizontal aisle).
+    /// Desks are reached from the aisle in front of them; the sofa, windowsill and CEO desk from
+    /// the wall corridor (the CEO desk from behind, so the cat never crosses the nameplate).
+    pub fn access(&self, s: &Spot) -> (i32, i32) {
+        match s.kind {
+            SpotKind::Desk(..) => (s.x, aisle_below(s.y - 34)),
+            SpotKind::Floor => (s.x, s.y),
+            SpotKind::Sofa | SpotKind::Sill | SpotKind::CeoDesk => (s.x, self.aisle_top()),
+        }
+    }
+
+    /// Vertical aisles: left of each pod column, between a pod's two desk columns, and right of
+    /// the last column (all left of the CEO corner).
+    pub fn aisles_x(&self) -> Vec<i32> {
+        let mut xs: Vec<i32> = Vec::new();
+        for p in &self.pods {
+            xs.extend([p.x - GAP_X / 2, p.x + CELL_W, p.x + POD_W + GAP_X / 2]);
+        }
+        if xs.is_empty() {
+            xs.push(MARGIN / 2);
+        }
+        xs.sort_unstable();
+        xs.dedup();
+        xs
+    }
+
+    /// Manhattan route between two spots along floor aisles: hop down to the access point, walk
+    /// the aisle to a vertical aisle, along it, then the target's aisle, and hop up. Returns the
+    /// polyline including both end points (consecutive duplicates removed).
+    pub fn route(&self, from: &Spot, to: &Spot) -> Vec<(i32, i32)> {
+        if from == to {
+            return vec![(from.x, from.y)];
+        }
+        let a = self.access(from);
+        let b = self.access(to);
+        let mut pts = vec![(from.x, from.y), a];
+        if a.1 != b.1 {
+            let xv = self
+                .aisles_x()
+                .into_iter()
+                .min_by_key(|x| ((a.0 - x).abs() + (b.0 - x).abs(), *x))
+                .unwrap_or(a.0);
+            pts.push((xv, a.1));
+            pts.push((xv, b.1));
+        }
+        pts.push(b);
+        pts.push((to.x, to.y));
+        pts.dedup();
+        pts
+    }
+}
+
 /// Sofa centre, measured from the right wall (the renderer centres the sofa sprite here).
 pub const SOFA_CX_FROM_RIGHT: i32 = 46;
 /// Feet y of a cat sitting on the first window's sill.
@@ -294,6 +406,8 @@ mod tests {
             last_event_ms: t,
             tokens_in: 0,
             tokens_out: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
             cost_usd: 0.0,
             context_pct: None,
             rss_mb: None,

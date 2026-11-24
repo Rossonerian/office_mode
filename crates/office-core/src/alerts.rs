@@ -1,6 +1,6 @@
 use crate::event::{Event, EventKind};
 use crate::model::{AgentId, AgentState, Alert, AlertLevel, Scene};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Same tool + same summary this many times in a row => "loop".
 pub const LOOP_REPEATS: u32 = 4;
@@ -21,7 +21,8 @@ pub struct Detector {
     cost_alert_usd: f64,
     stuck_after_ms: u64,
     per: BTreeMap<AgentId, PerAgent>,
-    cost_alerted: BTreeSet<AgentId>,
+    /// Highest multiple of `cost_alert_usd` already alerted per agent (re-fires at each multiple).
+    cost_alerted: BTreeMap<AgentId, u64>,
 }
 
 impl Default for Detector {
@@ -48,7 +49,7 @@ impl Detector {
             cost_alert_usd: cfg.cost_alert_usd,
             stuck_after_ms: cfg.stuck_after_s.max(1) * 1000,
             per: BTreeMap::new(),
-            cost_alerted: BTreeSet::new(),
+            cost_alerted: BTreeMap::new(),
         }
     }
 
@@ -120,13 +121,18 @@ impl Detector {
                 }
             }
             EventKind::Usage { id, cost_usd, .. } => {
-                if self.cost_alert_usd > 0.0 && *cost_usd > self.cost_alert_usd && self.cost_alerted.insert(id.clone()) {
+                // fire once per multiple crossed: $50, $100, $150, …
+                let step = self.cost_alert_usd;
+                let level = if step > 0.0 && cost_usd.is_finite() { (*cost_usd / step).floor() as u64 } else { 0 };
+                let done = self.cost_alerted.get(id).copied().unwrap_or(0);
+                if level > done {
+                    self.cost_alerted.insert(id.clone(), level);
                     out.push(alert(
                         at,
                         AlertLevel::Critical,
                         Some(id),
                         "cost",
-                        format!("{} passed ${:.2} (now ${cost_usd:.2})", label_of(scene, id), self.cost_alert_usd),
+                        format!("{} passed ${:.2} (now ${cost_usd:.2})", label_of(scene, id), step * level as f64),
                     ));
                 }
             }

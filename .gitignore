@@ -1,3 +1,7 @@
 target/
 *.swp
 .DS_Store
+
+# paid theme packs (LimeZu, Shubibubi, ...): never commit
+themes/premium/
+**/themes/premium/

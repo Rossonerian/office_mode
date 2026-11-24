@@ -55,6 +55,8 @@ fn new_agent(id: &str, kind: AgentKind, parent: Option<AgentId>, at: u64) -> Age
         last_event_ms: at,
         tokens_in: 0,
         tokens_out: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
         cost_usd: 0.0,
         context_pct: None,
         rss_mb: None,
@@ -106,7 +108,7 @@ impl Reducer {
     fn recompute_totals(&mut self) {
         let (mut t, mut c) = (self.retired_tokens, self.retired_cost);
         for a in self.scene.agents.values() {
-            t += a.tokens_in + a.tokens_out;
+            t += a.tokens_shown();
             c += a.cost_usd;
         }
         self.scene.total_tokens = t;
@@ -209,11 +211,13 @@ impl Reducer {
                 self.set_state(&id, AgentState::Thinking, at);
                 true
             }
-            EventKind::Usage { id, tokens_in, tokens_out, cost_usd, context_pct } => {
+            EventKind::Usage { id, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, cost_usd, context_pct } => {
                 // Usage carries running totals (not deltas).
                 let a = self.ensure(&id, at);
                 a.tokens_in = tokens_in;
                 a.tokens_out = tokens_out;
+                a.tokens_cache_read = tokens_cache_read;
+                a.tokens_cache_write = tokens_cache_write;
                 a.cost_usd = cost_usd;
                 if context_pct.is_some() {
                     a.context_pct = context_pct;
@@ -306,7 +310,7 @@ impl Reducer {
         }
         for id in to_remove {
             if let Some(a) = self.scene.agents.remove(&id) {
-                self.retired_tokens += a.tokens_in + a.tokens_out;
+                self.retired_tokens += a.tokens_shown();
                 self.retired_cost += a.cost_usd;
             }
             self.leaving_since.remove(&id);
@@ -411,7 +415,15 @@ mod tests {
         let mut r = Reducer::new();
         r.apply(ev(1, seen("cc:a", None, None)));
         r.apply(ev(1, seen("cc:b", None, None)));
-        let u = |id: &str, i, o, c| EventKind::Usage { id: id.into(), tokens_in: i, tokens_out: o, cost_usd: c, context_pct: Some(10.0) };
+        let u = |id: &str, i, o, c| EventKind::Usage {
+            id: id.into(),
+            tokens_in: i,
+            tokens_out: o,
+            tokens_cache_read: 1_000_000,
+            tokens_cache_write: 0,
+            cost_usd: c,
+            context_pct: Some(10.0),
+        };
         r.apply(ev(2, u("cc:a", 100, 50, 1.0)));
         r.apply(ev(3, u("cc:a", 200, 60, 2.0))); // running totals, not deltas
         r.apply(ev(3, u("cc:b", 10, 0, 0.5)));
@@ -514,14 +526,39 @@ mod tests {
     }
 
     #[test]
-    fn cost_alert_once() {
-        let mut r = Reducer::new(); // default cost_alert_usd = 5
+    fn cost_alert_fires_at_each_multiple() {
+        let mut r = Reducer::new(); // default cost_alert_usd = 50
         r.apply(ev(0, seen("cc:a", None, None)));
-        for c in [1.0, 5.5, 7.0] {
-            r.apply(ev(1, EventKind::Usage { id: "cc:a".into(), tokens_in: 1, tokens_out: 1, cost_usd: c, context_pct: None }));
+        for c in [1.0, 5.5, 49.9, 50.5, 70.0, 99.0, 100.0, 160.0, 120.0, 161.0] {
+            r.apply(ev(1, EventKind::Usage {
+                id: "cc:a".into(),
+                tokens_in: 1,
+                tokens_out: 1,
+                tokens_cache_read: 0,
+                tokens_cache_write: 0,
+                cost_usd: c,
+                context_pct: None,
+            }));
         }
-        assert_eq!(codes(&r), vec!["cost"]);
+        // $50, $100, $150 (the jump to 160 crosses one more multiple); no repeats
+        assert_eq!(codes(&r), vec!["cost", "cost", "cost"]);
         assert_eq!(r.scene().alerts[0].level, AlertLevel::Critical);
+        assert!(r.scene().alerts[2].message.contains("$150.00"), "{}", r.scene().alerts[2].message);
+    }
+
+    #[test]
+    fn usage_without_cache_fields_still_parses() {
+        // events/agents serialised before the cache split default the cache fields to 0
+        let ev: EventKind = serde_json::from_str(
+            r#"{"Usage":{"id":"cc:a","tokens_in":5,"tokens_out":2,"cost_usd":0.1,"context_pct":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(ev, EventKind::Usage { tokens_cache_read: 0, tokens_cache_write: 0, .. }));
+        let mut a = serde_json::to_value(new_agent("cc:a", AgentKind::Claude, None, 0)).unwrap();
+        a.as_object_mut().unwrap().remove("tokens_cache_read");
+        a.as_object_mut().unwrap().remove("tokens_cache_write");
+        let a: crate::model::Agent = serde_json::from_value(a).unwrap();
+        assert_eq!((a.tokens_cache_read, a.tokens_cache_write), (0, 0));
     }
 
     #[test]

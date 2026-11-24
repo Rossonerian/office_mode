@@ -113,7 +113,7 @@ fn draw_header(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
         Span::styled(format!("subs {s}"), Style::new().fg(kind_color(AgentKind::ClaudeSub))),
         Span::raw(" · "),
         Span::styled(format!("agy {g}"), Style::new().fg(kind_color(AgentKind::Agy))),
-        Span::raw(format!(")  │ tokens {}  │ {}", fmt_tokens(scene.total_tokens), fmt_cost(scene.total_cost_usd))),
+        Span::raw(format!(")  │ tokens {} (excl. cache reads)  │ {}", fmt_tokens(scene.total_tokens), fmt_cost(scene.total_cost_usd))),
     ];
     if !app.notifications {
         spans.push(Span::styled("  │ notif off", Style::new().fg(Color::DarkGray)));
@@ -195,7 +195,7 @@ pub fn agent_cells(a: &Agent, depth: usize, now_ms: u64) -> [String; 6] {
         trunc(&role_or_model(a), AGENT_COLS[1] as usize),
         state_short(a.state).to_string(),
         fmt_elapsed_short(now_ms.saturating_sub(a.started_ms)),
-        fmt_tokens(a.tokens_in + a.tokens_out),
+        fmt_tokens(a.tokens_shown()),
         fmt_cost_short(a.cost_usd),
     ]
 }
@@ -362,7 +362,16 @@ pub fn detail_lines(app: &App, a: &Agent, scene: &Scene, now_ms: u64) -> Vec<Lin
         kv("pid", a.pid.map(|s| s.to_string()).unwrap_or_else(|| "-".into())),
         kv("elapsed", fmt_elapsed_long(now_ms.saturating_sub(a.started_ms))),
         kv("last event", format!("{} ago", fmt_ago(now_ms, a.last_event_ms))),
-        kv("tokens", format!("{} in · {} out", fmt_tokens(a.tokens_in), fmt_tokens(a.tokens_out))),
+        kv(
+            "tokens",
+            format!(
+                "{} in / {} cache-read / {} cache-write / {} out",
+                fmt_tokens(a.tokens_in),
+                fmt_tokens(a.tokens_cache_read),
+                fmt_tokens(a.tokens_cache_write),
+                fmt_tokens(a.tokens_out)
+            ),
+        ),
         kv("cost", fmt_cost(a.cost_usd)),
         kv("context", a.context_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into())),
         kv("rss", a.rss_mb.map(|m| format!("{m} MB")).unwrap_or_else(|| "-".into())),

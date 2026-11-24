@@ -18,6 +18,8 @@ fn mk(id: &str, kind: AgentKind, label: &str, parent: Option<&str>, cwd: &str, s
         last_event_ms: last,
         tokens_in: 12_000,
         tokens_out: 3_400,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
         cost_usd: 0.42,
         context_pct: Some(31.0),
         rss_mb: None,
