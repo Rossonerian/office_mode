@@ -1,0 +1,12 @@
+[package]
+name = "office-hook"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "office-hook"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+office-core = { path = "../office-core" }
