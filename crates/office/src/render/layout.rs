@@ -15,6 +15,53 @@ pub const DECOR_H: i32 = 28;
 pub const BOTTOM_H: i32 = 36;
 pub const MIN_W: i32 = 272;
 pub const DESKS_PER_POD: usize = 4;
+/// The CEO's corner office (top-right, below the decor strip).
+pub const CEO_W: i32 = 72;
+pub const CEO_H: i32 = 64;
+
+/// Optional room features that change the geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extras {
+    /// Reserve the CEO corner office.
+    pub ceo: bool,
+}
+
+impl Default for Extras {
+    fn default() -> Self {
+        Extras { ceo: true }
+    }
+}
+
+/// Where the office cat likes to hang out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpotKind {
+    Sofa,
+    Sill,
+    /// On top of a desk (pod index, desk index).
+    Desk(usize, usize),
+    CeoDesk,
+    Floor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spot {
+    pub kind: SpotKind,
+    /// Feet position.
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Spot {
+    /// Up on furniture (the cat hops to get there).
+    pub fn elevated(&self) -> bool {
+        !matches!(self.kind, SpotKind::Floor)
+    }
+}
+
+/// Feet position of the cat sitting on desk cell (ox, oy) (between the monitor and the lamp).
+pub fn desk_top(ox: i32, oy: i32) -> (i32, i32) {
+    (ox + 28, oy + 34)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PodKind {
@@ -60,6 +107,10 @@ pub struct Layout {
     pub seats: HashMap<AgentId, Seat>,
     /// Feet position at the door (walk start/end).
     pub door: (i32, i32),
+    /// The CEO corner office [x, y, w, h], when reserved.
+    pub ceo: Option<[i32; 4]>,
+    /// Cat waypoints (sofa, windowsill, CEO desk, floor, then every desk top).
+    pub spots: Vec<Spot>,
 }
 
 impl Layout {
@@ -68,6 +119,9 @@ impl Layout {
         let mut k = format!("{}x{}:{}x{}", self.w, self.h, self.cols, self.rows);
         for p in &self.pods {
             k.push_str(&format!("|{:?}@{},{}", p.kind, p.x, p.y));
+        }
+        if let Some(c) = self.ceo {
+            k.push_str(&format!("|ceo@{c:?}"));
         }
         k
     }
@@ -119,20 +173,29 @@ pub fn groups(scene: &Scene) -> Vec<(AgentId, Vec<AgentId>)> {
 }
 
 pub fn room_size(cols: usize, rows: usize) -> (i32, i32) {
+    room_size_with(cols, rows, Extras::default())
+}
+
+pub fn room_size_with(cols: usize, rows: usize, ex: Extras) -> (i32, i32) {
     let cols = cols.max(1) as i32;
     let rows = rows.max(1) as i32;
-    let w = (MARGIN * 2 + cols * POD_W + (cols - 1) * GAP_X).max(MIN_W);
-    let h = WALL_H + DECOR_H + rows * POD_H + (rows - 1) * GAP_Y + BOTTOM_H;
+    let ceo_w = if ex.ceo { GAP_X + CEO_W } else { 0 };
+    let w = (MARGIN * 2 + cols * POD_W + (cols - 1) * GAP_X + ceo_w).max(MIN_W);
+    let h = (WALL_H + DECOR_H + rows * POD_H + (rows - 1) * GAP_Y + BOTTOM_H).max(WALL_H + DECOR_H + CEO_H + BOTTOM_H);
     (w, h)
 }
 
 /// Pick the pod grid that gives the largest scale for a px_w × px_h target.
 pub fn best_cols(n_pods: usize, px_w: u32, px_h: u32) -> usize {
+    best_cols_with(n_pods, px_w, px_h, Extras::default())
+}
+
+pub fn best_cols_with(n_pods: usize, px_w: u32, px_h: u32, ex: Extras) -> usize {
     let n = n_pods.max(1);
     let mut best = (1usize, f32::MIN);
     for cols in 1..=n {
         let rows = n.div_ceil(cols);
-        let (w, h) = room_size(cols, rows);
+        let (w, h) = room_size_with(cols, rows, ex);
         let fit = (px_w as f32 / w as f32).min(px_h as f32 / h as f32);
         if fit > best.1 + 1e-4 {
             best = (cols, fit);
@@ -142,6 +205,10 @@ pub fn best_cols(n_pods: usize, px_w: u32, px_h: u32) -> usize {
 }
 
 pub fn build(scene: &Scene, px_w: u32, px_h: u32) -> Layout {
+    build_with(scene, px_w, px_h, Extras::default())
+}
+
+pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
     let mut pod_plans: Vec<(PodKind, Vec<AgentId>)> = Vec::new();
     for (host, ids) in groups(scene) {
         let lab = host.is_empty();
@@ -153,12 +220,16 @@ pub fn build(scene: &Scene, px_w: u32, px_h: u32) -> Layout {
     if pod_plans.is_empty() {
         pod_plans.push((PodKind::Session, Vec::new()));
     }
-    let cols = best_cols(pod_plans.len(), px_w, px_h);
+    let cols = best_cols_with(pod_plans.len(), px_w, px_h, ex);
     let rows = pod_plans.len().div_ceil(cols);
-    let (w, h) = room_size(cols, rows);
-    // centre the pod grid horizontally
+    let (w, h) = room_size_with(cols, rows, ex);
+    // centre the pod grid horizontally (left of the CEO corner, when reserved)
     let grid_w = cols as i32 * POD_W + (cols as i32 - 1) * GAP_X;
-    let x0 = (w - grid_w) / 2;
+    let ceo = ex.ceo.then(|| [w - MARGIN - CEO_W, WALL_H + DECOR_H, CEO_W, CEO_H]);
+    let x0 = match ceo {
+        Some(c) => MARGIN + (c[0] - GAP_X - MARGIN - grid_w).max(0) / 2,
+        None => (w - grid_w) / 2,
+    };
     let mut pods = Vec::new();
     let mut seats = HashMap::new();
     for (i, (kind, ids)) in pod_plans.into_iter().enumerate() {
@@ -176,8 +247,30 @@ pub fn build(scene: &Scene, px_w: u32, px_h: u32) -> Layout {
         }
         pods.push(pod);
     }
-    Layout { w, h, cols, rows, pods, seats, door: (MARGIN + 9, h - 14) }
+    let mut spots = vec![
+        Spot { kind: SpotKind::Sofa, x: w - SOFA_CX_FROM_RIGHT, y: WALL_H + DECOR_H - 9 },
+        Spot { kind: SpotKind::Sill, x: 28, y: SILL_Y },
+        Spot { kind: SpotKind::Floor, x: MARGIN + 30, y: WALL_H + DECOR_H + 2 },
+    ];
+    if let Some([cx, cy, cw, _]) = ceo {
+        spots.push(Spot { kind: SpotKind::CeoDesk, x: cx + cw - 16, y: cy + CEO_DESK_TOP + 2 });
+    }
+    for (pi, pod) in pods.iter().enumerate() {
+        for d in 0..DESKS_PER_POD {
+            let (ox, oy) = pod.cell(d);
+            let (x, y) = desk_top(ox, oy);
+            spots.push(Spot { kind: SpotKind::Desk(pi, d), x, y });
+        }
+    }
+    Layout { w, h, cols, rows, pods, seats, door: (MARGIN + 9, h - 14), ceo, spots }
 }
+
+/// Sofa centre, measured from the right wall (the renderer centres the sofa sprite here).
+pub const SOFA_CX_FROM_RIGHT: i32 = 46;
+/// Feet y of a cat sitting on the first window's sill.
+pub const SILL_Y: i32 = 30;
+/// Top of the CEO desk surface, relative to the corner office top.
+pub const CEO_DESK_TOP: i32 = 34;
 
 #[cfg(test)]
 mod tests {
@@ -255,6 +348,40 @@ mod tests {
                 no_overlap(&l);
             }
         }
+    }
+
+    #[test]
+    fn ceo_corner_is_reserved_without_overlap() {
+        for n in 0..40usize {
+            let mut v = Vec::new();
+            for s in 0..(n / 4 + 1).min(n) {
+                v.push(agent(&format!("cc:{s}"), AgentKind::Claude, None, Some(&format!("/p/{s}")), s as u64));
+            }
+            let sessions = v.len();
+            for i in sessions..n {
+                let kind = if i % 2 == 0 { AgentKind::Agy } else { AgentKind::ClaudeSub };
+                let parent = if kind == AgentKind::ClaudeSub && sessions > 0 { Some(format!("cc:{}", i % sessions)) } else { None };
+                v.push(agent(&format!("a:{i}"), kind, parent.as_deref(), None, 100 + i as u64));
+            }
+            for (pw, ph) in [(640, 360), (1600, 900), (300, 800), (1920, 400)] {
+                let l = build(&scene(v.clone()), pw, ph);
+                let [cx, cy, cw, ch] = l.ceo.expect("CEO corner reserved");
+                assert!(cx >= 0 && cy >= WALL_H && cx + cw <= l.w && cy + ch <= l.h - BOTTOM_H, "CEO corner inside the room (n={n})");
+                for p in &l.pods {
+                    let apart = p.x + POD_W <= cx || p.x >= cx + cw || p.y + POD_H <= cy || p.y >= cy + ch;
+                    assert!(apart, "pod {:?} overlaps the CEO corner {:?} (n={n}, {pw}x{ph})", (p.x, p.y), (cx, cy));
+                }
+                assert_eq!(l.seats.len(), n);
+                no_overlap(&l);
+                for sp in &l.spots {
+                    assert!(sp.x >= 0 && sp.y >= 0 && sp.x < l.w && sp.y < l.h, "spot {sp:?} outside the room");
+                }
+                assert!(l.spots.iter().any(|s| s.kind == SpotKind::CeoDesk));
+                assert!(l.spots.iter().any(|s| s.kind == SpotKind::Sofa));
+            }
+        }
+        let off = build_with(&Scene::default(), 640, 360, Extras { ceo: false });
+        assert!(off.ceo.is_none() && !off.spots.iter().any(|s| s.kind == SpotKind::CeoDesk));
     }
 
     #[test]

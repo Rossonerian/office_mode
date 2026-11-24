@@ -16,6 +16,9 @@ An original terminal "office" for AI coding agents (Claude Code sessions plus su
 - The scene is composed into an RGBA framebuffer (the `image` crate) from a Theme: floor/wall tiles, desks with computers, decor, characters. Displayed via `ratatui-image` (Kitty graphics in Ghostty, then Sixel/iTerm2, then half-blocks as the universal fallback).
 - Layout: auto-grid of desk pods. Each top-level session gets a pod; its subagents and agy calls sit at the pod's extra desks ("interns"). Overflow goes to a second room. Agents walk in from the door (Arriving) and out (Leaving).
 - Character animation per state: idle, typing, reading, running (glowing monitor), thinking (dots), needs-you (raised hand + blinking lamp), queued (waiting by the door), error (red bubble), done (arms up). Labels sit above heads, coloured by kind (Claude orange, sub amber, agy teal).
+- Ambient characters (not agents; `hit_test` returns `office:cat` / `office:ceo`, selectable and hoverable):
+  - The CEO (you), `render/ceo.rs`: a corner office reserved by `layout.rs` at the top-right (pods never overlap it), a big desk with a "CEO" nameplate. Original sprite in a red-and-black vertical-stripe jersey (no crest, logo or sponsor), black shorts, optional number on the back. Mood mirrors the office: any NeedsYou means it stands, points toward the alert and shows a "!" bubble; agents working means it reviews papers and nods; all idle means coffee, leaning back, or looking out (back view with the number).
+  - The office cat, `render/cat.rs`: ~12×8 px procedural pet whose behaviour is a pure function of `t_ms` (no RNG state). It walks/hops between layout waypoints (sofa, windowsill, CEO desk, floor, desks), sits, grooms and sleeps (zZ), and sometimes hops onto the desk of a NeedsYou/Error agent. Drawn above furniture, below labels; its name shows only on hover/selection.
 - Themes: `assets/themes/<name>/theme.toml` maps logical sprite names to (atlas file, x, y, w, h, frames). Themes are MIXABLE: config `theme = { floor = "cozy", furniture = "modern", characters = "retro" }`. A built-in `procedural` theme (drawn in code, no files) always works.
 
 ## TUI (crates/office/src/app/)
@@ -28,7 +31,7 @@ An original terminal "office" for AI coding agents (Claude Code sessions plus su
 loop (same tool + same summary 4× in a row), stuck (no events for 120 s while not Idle/Done/NeedsYou/Queued), tool failures in a row (3), needs_you (permission/AskUserQuestion), router tool_denied/timeout/busy/empty_response, and cost (session > config.cost_alert_usd).
 
 ## Config (~/.config/agent-office/config.toml)
-theme mix, fps (default 12), notifications on/off, cost_alert_usd, price table, the agy role→model map, permission_timeout_s (default 0 = off).
+theme mix, `[cat] enabled/name/color (grey|orange|black|white|calico)`, `[ceo] enabled/name/number/skin/hair/hair_style (short|curly|long|bald)`, fps (default 12), notifications on/off, cost_alert_usd, price table, the agy role→model map, permission_timeout_s (default 0 = off).
 
 ## Non-goals
 No network access, no telemetry, and nothing outside the user's machine. Original name and art: we use only free (CC0/CC-BY) assets with attribution in `assets/CREDITS.md`.

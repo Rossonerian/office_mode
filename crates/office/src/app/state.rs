@@ -104,8 +104,15 @@ pub fn persist_theme(path: &std::path::Path, mix: &ThemeMix) -> anyhow::Result<(
     Ok(())
 }
 
+/// Ambient office characters (the cat, the CEO) are selectable but are not agents.
+pub fn is_ambient(id: &str) -> bool {
+    id.starts_with("office:")
+}
+
 pub struct App {
     pub selected: Option<AgentId>,
+    /// What the mouse hovers in the office (agent id or an ambient "office:*" id).
+    pub hover: Option<AgentId>,
     pub popup: Popup,
     pub sidebar: bool,
     pub notifications: bool,
@@ -132,6 +139,7 @@ impl App {
     pub fn new(cfg: &office_core::config::Config, demo: bool) -> Self {
         App {
             selected: None,
+            hover: None,
             popup: Popup::None,
             sidebar: cfg.sidebar,
             notifications: cfg.notifications,
@@ -189,7 +197,7 @@ impl App {
     pub fn observe(&mut self, scene: &Scene, now_ms: u64, ctl: &mut dyn Control) {
         // Selection repair.
         let rows = fmt::agent_rows(scene);
-        let sel_ok = self.selected.as_ref().is_some_and(|id| scene.agents.contains_key(id));
+        let sel_ok = self.selected.as_ref().is_some_and(|id| scene.agents.contains_key(id) || is_ambient(id));
         if !sel_ok {
             self.selected = rows.first().map(|(id, _)| id.clone());
         }
@@ -522,6 +530,14 @@ impl App {
     /// Mouse: left click on a sidebar row or on an agent in the office selects it.
     /// `hit` maps office pixel coordinates to an agent (Renderer::hit_test).
     pub fn handle_mouse(&mut self, ev: MouseEvent, scene: &Scene, hit: &dyn Fn(u32, u32) -> Option<AgentId>) -> bool {
+        if ev.kind == MouseEventKind::Moved {
+            let id = self.office_hit(ev.column, ev.row, hit);
+            if id != self.hover {
+                self.hover = id;
+                return true;
+            }
+            return false;
+        }
         if ev.kind != MouseEventKind::Down(MouseButton::Left) {
             return match ev.kind {
                 MouseEventKind::ScrollUp if self.popup == Popup::None => {
@@ -545,21 +561,26 @@ impl App {
             }
             return false;
         }
-        let o = self.layout.office;
-        if x >= o.x && x < o.x + o.width && y >= o.y && y < o.y + o.height {
-            if let Some((fw, fh)) = self.layout.font_px {
-                let px = (x - o.x) as u32 * fw as u32 + fw as u32 / 2;
-                let py = (y - o.y) as u32 * fh as u32 + fh as u32 / 2;
-                if let Some(id) = hit(px, py) {
-                    if scene.agents.contains_key(&id) {
-                        self.selected = Some(id);
-                        self.dirty = true;
-                        return true;
-                    }
-                }
+        if let Some(id) = self.office_hit(x, y, hit) {
+            if scene.agents.contains_key(&id) || is_ambient(&id) {
+                self.selected = Some(id);
+                self.dirty = true;
+                return true;
             }
         }
         false
+    }
+
+    /// The agent (or ambient character) under terminal cell (x, y) in the office, if any.
+    fn office_hit(&self, x: u16, y: u16, hit: &dyn Fn(u32, u32) -> Option<AgentId>) -> Option<AgentId> {
+        let o = self.layout.office;
+        if x >= o.x && x < o.x + o.width && y >= o.y && y < o.y + o.height {
+            let (fw, fh) = self.layout.font_px?;
+            let px = (x - o.x) as u32 * fw as u32 + fw as u32 / 2;
+            let py = (y - o.y) as u32 * fh as u32 + fh as u32 / 2;
+            return hit(px, py);
+        }
+        None
     }
 }
 
@@ -852,5 +873,15 @@ mod tests {
         assert!(h.app.handle_mouse(click(3, 3), &h.scene, &hit));
         assert_eq!(h.app.selected.as_deref(), Some("cc:office"));
         assert!(!h.app.handle_mouse(click(4, 3), &h.scene, &hit));
+        // the cat / CEO are selectable and hoverable, and survive selection repair
+        let cat = |x: u32, y: u32| if (x, y) == (35, 50) { Some("office:cat".to_string()) } else { None };
+        let mv = MouseEvent { kind: MouseEventKind::Moved, column: 3, row: 3, modifiers: KeyModifiers::NONE };
+        assert!(h.app.handle_mouse(mv, &h.scene, &cat));
+        assert_eq!(h.app.hover.as_deref(), Some("office:cat"));
+        assert!(!h.app.handle_mouse(mv, &h.scene, &cat), "same hover: no redraw");
+        assert!(h.app.handle_mouse(click(3, 3), &h.scene, &cat));
+        assert_eq!(h.app.selected.as_deref(), Some("office:cat"));
+        h.app.observe(&h.scene, 9_000, &mut h.ctl);
+        assert_eq!(h.app.selected.as_deref(), Some("office:cat"));
     }
 }

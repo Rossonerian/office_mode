@@ -38,6 +38,17 @@ fn main() -> anyhow::Result<()> {
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
         println!("{t:<11} {} ({}x{} logical {:?}, scale {}) | 640x360: {ms:.2} ms/frame", p.display(), w, h, r.logical_size(), r.scale());
     }
+    // ambient extras: an idle office (CEO leaning back / coffee), the cat hovered (name shown)
+    r.set_mix(&ThemeMix::default());
+    r.set_hover(Some(render::CAT_ID.to_string()));
+    for (name, t) in [("ambient-lean", now + 13_000), ("ambient-sip", now + 23_000), ("ambient-back", now + 18_000)] {
+        let idle = office_core::Scene { now_ms: t, ..Default::default() };
+        let img = r.compose(&idle, None, w, h, t);
+        let p = out.join(format!("{name}.png"));
+        img.save(&p)?;
+        println!("{name:<11} {}", p.display());
+    }
+    r.set_hover(None);
     for e in r.theme_errors() {
         eprintln!("theme error: {e}");
     }

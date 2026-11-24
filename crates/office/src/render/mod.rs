@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 pub mod canvas;
+pub mod cat;
+pub mod ceo;
 pub mod character;
 pub mod demo;
 pub mod font;
@@ -17,7 +19,7 @@ use canvas::{add, blit, fill, outline, put, rgb, shade, Col};
 use character::{Arms, Legs, Pose};
 use image::RgbaImage;
 use layout::{Layout, PodKind, CELL_H, CELL_W, DECOR_H, MARGIN, POD_H, POD_W, WALL_H};
-use office_core::{config::{Config, ThemeMix}, model::AgentKind, Agent, AgentId, AgentState, Scene};
+use office_core::{config::{CatConfig, CeoConfig, Config, ThemeMix}, model::AgentKind, Agent, AgentId, AgentState, Scene};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use theme::Theme;
@@ -29,6 +31,9 @@ pub const KIND_OTHER: Col = rgb(0x9aa0a6);
 const SELECT: Col = rgb(0xffe14d);
 const INK: Col = rgb(0x1b1d22);
 const PAPER: Col = rgb(0xfbfaf5);
+/// Pseudo agent ids that `hit_test` returns for the ambient characters.
+pub const CAT_ID: &str = "office:cat";
+pub const CEO_ID: &str = "office:ceo";
 
 pub fn kind_color(k: AgentKind) -> Col {
     match k {
@@ -70,6 +75,10 @@ pub struct Renderer {
     hits: Vec<([i32; 4], AgentId)>,
     view: View,
     logical: (u32, u32),
+    cat: CatConfig,
+    ceo: CeoConfig,
+    ceo_look: ceo::CeoLook,
+    hover: Option<AgentId>,
 }
 
 impl Renderer {
@@ -89,6 +98,10 @@ impl Renderer {
             hits: Vec::new(),
             view: View { ox: 0.0, oy: 0.0, s: 1.0 },
             logical: (0, 0),
+            cat: cfg.cat.clone(),
+            ceo: cfg.ceo.clone(),
+            ceo_look: ceo::look(&cfg.ceo),
+            hover: None,
         };
         r.ensure_mix();
         r
@@ -103,6 +116,11 @@ impl Renderer {
         self.mix = mix.clone();
         self.static_key.clear();
         self.ensure_mix();
+    }
+
+    /// What the mouse is over (shows the cat's name, highlights the CEO).
+    pub fn set_hover(&mut self, id: Option<AgentId>) {
+        self.hover = id;
     }
 
     pub fn mix(&self) -> &ThemeMix {
@@ -161,7 +179,7 @@ impl Renderer {
     pub fn compose(&mut self, scene: &Scene, selected: Option<&AgentId>, px_w: u32, px_h: u32, t_ms: u64) -> image::RgbaImage {
         self.ensure_mix();
         let (px_w, px_h) = (px_w.max(1), px_h.max(1));
-        let lay = layout::build(scene, px_w, px_h);
+        let lay = layout::build_with(scene, px_w, px_h, layout::Extras { ceo: self.ceo.enabled });
         let key = format!("{:?}#{}", self.mix_names(), lay.static_key());
         if key != self.static_key {
             self.static_img = self.draw_static(&lay);
@@ -275,7 +293,7 @@ impl Renderer {
         let cooler = furn_t.sprite("cooler");
         blit(&mut img, cooler.frame(0), 4 + plant.w() + 8, strip_bottom - cooler.h());
         let sofa = furn_t.sprite("sofa");
-        blit(&mut img, sofa.frame(0), w - 4 - plant.w() - 6 - sofa.w(), strip_bottom - sofa.h());
+        blit(&mut img, sofa.frame(0), w - layout::SOFA_CX_FROM_RIGHT - sofa.w() / 2, strip_bottom - sofa.h());
         // a plant by the door, too
         blit(&mut img, plant.frame(0), w - 4 - plant.w(), h - bh - plant.h() + 2);
 
@@ -293,8 +311,44 @@ impl Renderer {
                 font::label(&mut img, pod.x + 2 + font::text_width("AGY LAB") / 2, pod.y + POD_H - 7, "AGY LAB", c, with_alpha(INK, 200));
             }
         }
+        if let Some(r) = lay.ceo {
+            self.draw_ceo_office(&mut img, r);
+        }
         let _ = MARGIN;
         img
+    }
+
+    /// Static part of the CEO corner: carpet, glass partition, executive chair.
+    fn draw_ceo_office(&self, img: &mut RgbaImage, [cx, cy, cw, ch]: [i32; 4]) {
+        let decor = self.th(Layer::Decor);
+        let walls = self.th(Layer::Walls);
+        let furn = self.th(Layer::Furniture);
+        let fd = |c: Col| decor.fx.apply(c);
+        let carpet = fd(shade(decor.colors.rug, 0.8));
+        fill(img, cx - 2, cy - 1, cw + 4, ch + 1, carpet);
+        outline(img, cx - 2, cy - 1, cw + 4, ch + 1, fd(decor.colors.rug_trim));
+        // glass partition on the left (half height at the front, with a gap to walk in)
+        let fw = |c: Col| walls.fx.apply(c);
+        let glass = with_alpha(fw(walls.colors.sky), 120);
+        let frame = fw(walls.colors.wall_trim);
+        fill(img, cx - 7, cy - 2, 3, ch - 14, glass);
+        fill(img, cx - 7, cy - 2, 1, ch - 14, frame);
+        fill(img, cx - 5, cy - 2, 1, ch - 14, frame);
+        fill(img, cx - 7, cy + ch - 16, 3, 1, frame);
+        // executive chair (behind the CEO)
+        let ff = |c: Col| furn.fx.apply(c);
+        let leather = ff(rgb(0x3a2a24));
+        let ccx = cx + CEO_CX;
+        fill(img, ccx - 9, cy + 12, 18, 18, leather);
+        fill(img, ccx - 8, cy + 11, 16, 1, leather);
+        fill(img, ccx - 7, cy + 14, 14, 1, ff(shade(rgb(0x3a2a24), 1.4)));
+        fill(img, ccx - 10, cy + 24, 2, 8, ff(shade(rgb(0x3a2a24), 0.7)));
+        fill(img, ccx + 8, cy + 24, 2, 8, ff(shade(rgb(0x3a2a24), 0.7)));
+        // a trophy shelf on the right wall of the corner
+        let gold = ff(rgb(0xe8c547));
+        fill(img, cx + cw - 10, cy + 2, 8, 1, ff(furn.colors.wood));
+        fill(img, cx + cw - 8, cy - 2, 4, 3, gold);
+        fill(img, cx + cw - 7, cy + 1, 2, 1, gold);
     }
 
     // ---------------------------------------------------------------- dynamic layer
@@ -386,6 +440,27 @@ impl Renderer {
             hits.push(([fx - 9, fy - 26, 18, 27], a.id.clone()));
         }
 
+        // the CEO in the corner office
+        let mut ceo_head: Option<(i32, i32, ceo::Mood)> = None;
+        if let Some(r) = lay.ceo {
+            let hl = selected == Some(&CEO_ID.to_string()) || self.hover.as_deref() == Some(CEO_ID);
+            let (top, mood) = self.draw_ceo(img, scene, lay, r, t, hl);
+            hits.push(([r[0] + CEO_CX - 10, top - 2, 20, r[1] + layout::CEO_DESK_TOP - top + 2], CEO_ID.to_string()));
+            ceo_head = Some((r[0] + CEO_CX, top, mood));
+        }
+        // the office cat: above the floor and furniture, below the labels
+        let mut cat_at: Option<cat::CatState> = None;
+        if self.cat.enabled {
+            let st = cat::state(lay, scene, t);
+            let hl = selected == Some(&CAT_ID.to_string()) || self.hover.as_deref() == Some(CAT_ID);
+            let mut buf = RgbaImage::new(cat::BOX_W as u32 + 8, cat::BOX_H as u32 + 4);
+            cat::draw(&mut buf, 4 + cat::BOX_W / 2, 2 + cat::BOX_H, &st, &cat::coat(&self.cat.color));
+            themed_sprite(&mut buf, char_t, hl);
+            blit(img, &buf, st.x - cat::BOX_W / 2 - 4, st.y - cat::BOX_H - 2);
+            hits.push(([st.x - cat::BOX_W / 2 - 1, st.y - cat::BOX_H - 1, cat::BOX_W + 2, cat::BOX_H + 2], CAT_ID.to_string()));
+            cat_at = Some(st);
+        }
+
         // overlays: labels, bubbles, icons (selected last so it sits on top)
         let mut order: Vec<&Agent> = scene.agents.values().filter(|a| !matches!(places.get(&a.id), Some(Place::Hidden) | None)).collect();
         order.sort_by_key(|a| (selected == Some(&a.id), a.started_ms));
@@ -401,7 +476,127 @@ impl Renderer {
             };
             overlays(img, char_t, a, cx, head_y, t, is_sel);
         }
+        let f = |c: Col| char_t.fx.apply(c);
+        if let Some((hx, top, mood)) = ceo_head {
+            if matches!(mood, ceo::Mood::Alert { .. }) {
+                icon_bubble(img, char_t, hx + 6, top - 9, AgentState::NeedsYou, t);
+            }
+        }
+        if let Some(st) = cat_at {
+            // visible top of the sprite (the sleeping loaf is lower)
+            let top = st.y - if st.action == cat::Action::Sleep { 6 } else { cat::BOX_H };
+            let named = selected == Some(&CAT_ID.to_string()) || self.hover.as_deref() == Some(CAT_ID);
+            let mut name_w = 0;
+            if named && !self.cat.name.is_empty() {
+                let name = font::truncate(&self.cat.name, 80);
+                name_w = font::text_width(&name);
+                font::label(img, st.x, top - 8, &name, f(INK), f(SELECT));
+            }
+            if st.action == cat::Action::Sleep {
+                let txt = ["z", "zZ", "zZz"][((t / 700) % 3) as usize];
+                let dy = ((t / 350) % 2) as i32;
+                let x0 = st.x + 3 + name_w / 2;
+                font::label(img, x0 + font::text_width(txt) / 2, top - 7 - dy, txt, f(PAPER), with_alpha(f(INK), 150));
+            }
+        }
         self.hits = hits;
+    }
+}
+
+/// CEO centre x within the corner office.
+const CEO_CX: i32 = 32;
+
+impl Renderer {
+    /// Dynamic part of the CEO corner: the CEO, the desk in front, monitor, mug, nameplate.
+    /// Returns the sprite top y and the mood.
+    fn draw_ceo(&self, img: &mut RgbaImage, scene: &Scene, lay: &Layout, [cx, cy, cw, _]: [i32; 4], t: u64, hl: bool) -> (i32, ceo::Mood) {
+        let char_t = self.th(Layer::Characters);
+        let furn = self.th(Layer::Furniture);
+        let ccx = cx + CEO_CX;
+        let alert_x = |id: &str| lay.seats.get(id).map(|s| s.x + CELL_W / 2);
+        let mood = ceo::mood(scene, &self.ceo_look, ccx, alert_x, t);
+        let top = if mood.standing() { cy + 5 } else { cy + 12 };
+        let mut buf = RgbaImage::new(ceo::W as u32 + 16, ceo::H as u32 + 8);
+        ceo::draw(&mut buf, 8, 4, &self.ceo_look, mood, (t + 333) % 4200 < 140);
+        themed_sprite(&mut buf, char_t, hl);
+        blit(img, &buf, ccx - ceo::W / 2 - 8, top - 4);
+
+        // desk (in front of the CEO)
+        let ff = |c: Col| furn.fx.apply(c);
+        let wood = furn.colors.wood;
+        let dt = cy + layout::CEO_DESK_TOP;
+        let (dx, dw) = (cx + 2, cw - 4);
+        fill(img, dx, dt, dw, 4, ff(shade(wood, 1.15)));
+        fill(img, dx, dt + 3, dw, 1, ff(shade(wood, 0.9)));
+        fill(img, dx + 1, dt + 4, dw - 2, 11, ff(wood));
+        fill(img, dx + 1, dt + 14, dw - 2, 1, ff(shade(wood, 0.7)));
+        fill(img, dx + 2, dt + 15, 3, 2, ff(furn.colors.metal));
+        fill(img, dx + dw - 5, dt + 15, 3, 2, ff(furn.colors.metal));
+        if let Some(rim) = furn.fx.palette.last() {
+            // low-colour palettes: keep the desk readable against the floor
+            outline(img, dx, dt, dw, 15, *rim);
+        }
+        // nameplate
+        let name = font::truncate(&self.ceo.name, dw - 10);
+        let plate_w = font::text_width(&name) + 4;
+        let pcx = dx + dw / 2;
+        fill(img, pcx - plate_w / 2 - 1, dt + 6, plate_w + 2, font::GLYPH_H + 4, ff(rgb(0x6b4a1e)));
+        font::label(img, pcx, dt + 8, &name, ff(INK), ff(rgb(0xe8c547)));
+        // monitor with a little dashboard: one bar per agent state group
+        let mon = furn.sprite("monitor_on");
+        let (mx, my) = (cx + 6, dt + 2 - mon.h());
+        blit(img, mon.frame(0), mx, my);
+        let sr = mon.screen.unwrap_or([2, 2, mon.w() - 4, mon.h() - 6]);
+        let [sx, sy, sw, sh] = [mx + sr[0], my + sr[1], sr[2], sr[3]];
+        if sw > 2 && sh > 2 {
+            fill(img, sx, sy, sw, sh, ff(rgb(0x14202e)));
+            let n = scene.agents.len().max(1) as i32;
+            let count = |f: &dyn Fn(AgentState) -> bool| scene.agents.values().filter(|a| f(a.state)).count() as i32;
+            let groups: [(i32, u32); 3] = [
+                (count(&|s| matches!(s, AgentState::Typing | AgentState::Reading | AgentState::Running | AgentState::Thinking | AgentState::Delegating)), 0x3fdc52),
+                (count(&|s| matches!(s, AgentState::NeedsYou | AgentState::Error)), 0xff5050),
+                (count(&|s| matches!(s, AgentState::Idle | AgentState::Done | AgentState::Queued)), 0x82aaff),
+            ];
+            let bw = ((sw - 1) / 3).max(1);
+            for (i, (v, c)) in groups.iter().enumerate() {
+                let bh = ((sh - 1) * v / n).max(if *v > 0 { 1 } else { 0 });
+                fill(img, sx + 1 + i as i32 * bw, sy + sh - bh, (bw - 1).max(1), bh, ff(rgb(*c)));
+            }
+            if (t / 600) % 2 == 0 {
+                put(img, sx + sw - 2, sy + 1, ff(rgb(0xb6ff9e)));
+            }
+            if let Some(g) = furn.glow {
+                glow(img, [sx, sy, sw, sh], g, 4, 0.3);
+            }
+        }
+        // mug on the desk unless it's in hand
+        if !matches!(mood, ceo::Mood::Coffee { .. }) {
+            let (ux, uy) = (cx + 44, dt - 2);
+            fill(img, ux, uy, 3, 3, ff(rgb(0xf2f2f2)));
+            put(img, ux + 3, uy + 1, ff(rgb(0xf2f2f2)));
+            fill(img, ux, uy, 3, 1, ff(rgb(0x5a3a22)));
+        }
+        (top, mood)
+    }
+}
+
+/// Apply a theme's colour fx to a sprite buffer, plus a rim on palette themes (or the highlight).
+fn themed_sprite(buf: &mut RgbaImage, th: &Theme, selected: bool) {
+    if !th.fx.is_identity() {
+        canvas::map_pixels(buf, &|c| th.fx.apply(c));
+    }
+    let rim = if selected { Some(th.fx.apply(SELECT)) } else { th.fx.palette.last().copied() };
+    if let Some(sel) = rim {
+        let src = buf.clone();
+        let (w, h) = (src.width() as i32, src.height() as i32);
+        let on = |x: i32, y: i32| x >= 0 && y >= 0 && x < w && y < h && src.get_pixel(x as u32, y as u32).0[3] > 0;
+        for yy in 0..h {
+            for xx in 0..w {
+                if !on(xx, yy) && (on(xx - 1, yy) || on(xx + 1, yy) || on(xx, yy - 1) || on(xx, yy + 1)) {
+                    put(buf, xx, yy, sel);
+                }
+            }
+        }
     }
 }
 
@@ -508,24 +703,9 @@ fn pose_for(a: &Agent, t: u64, at_desk: bool) -> Pose {
 fn draw_char(img: &mut RgbaImage, th: &Theme, a: &Agent, pose: &Pose, x: i32, y: i32, selected: bool) {
     let mut buf = RgbaImage::new(character::CW as u32 + 4, character::CH as u32 + 8);
     character::draw(&mut buf, 2, 6, &character::look_for(&a.id), pose);
-    if !th.fx.is_identity() {
-        canvas::map_pixels(&mut buf, &|c| th.fx.apply(c));
-    }
-    // On palette-remapped themes (e.g. 2-colour retro) give characters a light rim so dark hair/pants
+    // On palette-remapped themes (e.g. 2-colour retro) characters get a light rim so dark hair/pants
     // don't vanish into the floor; the selected agent gets the highlight rim instead.
-    let rim = if selected { Some(th.fx.apply(SELECT)) } else { th.fx.palette.last().copied() };
-    if let Some(sel) = rim {
-        let src = buf.clone();
-        let (w, h) = (src.width() as i32, src.height() as i32);
-        let on = |x: i32, y: i32| x >= 0 && y >= 0 && x < w && y < h && src.get_pixel(x as u32, y as u32).0[3] > 0;
-        for yy in 0..h {
-            for xx in 0..w {
-                if !on(xx, yy) && (on(xx - 1, yy) || on(xx + 1, yy) || on(xx, yy - 1) || on(xx, yy + 1)) {
-                    put(&mut buf, xx, yy, sel);
-                }
-            }
-        }
-    }
+    themed_sprite(&mut buf, th, selected);
     blit(img, &buf, x - 2, y - 6);
 }
 
@@ -711,6 +891,12 @@ mod tests {
         let (x, y, w, h) = r.agent_rect(&"cc:alpha".to_string()).unwrap();
         assert_eq!(r.hit_test(x + w / 2, y + h / 2).as_deref(), Some("cc:alpha"));
         assert_eq!(r.hit_test(0, 0), None);
+        let hit_of = |r: &Renderer, id: &str| {
+            let (x, y, w, h) = r.agent_rect(&id.to_string()).expect("drawn");
+            r.hit_test(x + w / 2, y + h / 2)
+        };
+        assert_eq!(hit_of(&r, CEO_ID).as_deref(), Some(CEO_ID));
+        assert_eq!(hit_of(&r, CAT_ID).as_deref(), Some(CAT_ID));
         // big target → integer scale ≥ 2
         r.compose(&s, None, 1600, 900, now);
         assert!(r.scale() >= 2.0 && r.scale().fract() == 0.0);

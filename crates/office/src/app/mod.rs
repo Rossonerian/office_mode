@@ -26,6 +26,8 @@ use std::time::Duration;
 pub trait OfficeView: ThemeHost {
     fn compose(&mut self, scene: &Scene, selected: Option<&AgentId>, px_w: u32, px_h: u32, t_ms: u64) -> image::RgbaImage;
     fn hit_test(&self, x: u32, y: u32) -> Option<AgentId>;
+    /// What the mouse is over (the renderer shows the cat's name on hover).
+    fn set_hover(&mut self, _id: Option<AgentId>) {}
 }
 
 /// render::Renderer behind panic guards, so an unfinished renderer degrades to text mode.
@@ -50,6 +52,9 @@ impl OfficeView for RendererView {
     }
     fn hit_test(&self, x: u32, y: u32) -> Option<AgentId> {
         guarded(|| self.0.hit_test(x, y)).ok().flatten()
+    }
+    fn set_hover(&mut self, id: Option<AgentId>) {
+        self.0.set_hover(id);
     }
 }
 

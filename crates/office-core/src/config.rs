@@ -37,6 +37,54 @@ pub struct Config {
     /// 0 = approve/deny from the office disabled.
     pub permission_timeout_s: u64,
     pub sidebar: bool,
+    /// The office cat (ambient pet, not an agent).
+    pub cat: CatConfig,
+    /// The CEO (you), at the big desk in the top-right corner.
+    pub ceo: CeoConfig,
+}
+
+/// `[cat] enabled = true, name = "Pixel", color = "grey"|"orange"|"black"|"white"|"calico"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CatConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub color: String,
+}
+
+impl Default for CatConfig {
+    fn default() -> Self {
+        CatConfig { enabled: true, name: "Pixel".into(), color: "grey".into() }
+    }
+}
+
+/// `[ceo] enabled = true, name = "CEO", number = 9, skin = "#c68642", hair = "black",
+/// hair_style = "short"|"curly"|"long"|"bald"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CeoConfig {
+    pub enabled: bool,
+    pub name: String,
+    /// Shirt number on the back of the jersey (0 = none).
+    pub number: u32,
+    /// "#rrggbb".
+    pub skin: String,
+    /// A colour name (black, brown, blonde, red, grey, white) or "#rrggbb".
+    pub hair: String,
+    pub hair_style: String,
+}
+
+impl Default for CeoConfig {
+    fn default() -> Self {
+        CeoConfig {
+            enabled: true,
+            name: "CEO".into(),
+            number: 9,
+            skin: "#c68642".into(),
+            hair: "black".into(),
+            hair_style: "short".into(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -71,6 +119,8 @@ impl Default for Config {
             agy_route: dirs::home_dir().unwrap_or_default().join(".claude/bin/agy-route").to_string_lossy().into(),
             permission_timeout_s: 0,
             sidebar: true,
+            cat: CatConfig::default(),
+            ceo: CeoConfig::default(),
         }
     }
 }
@@ -123,5 +173,28 @@ mod tests {
         let c: Config = toml::from_str("permission_timeout_s = 30\n").unwrap();
         assert_eq!(c.permission_timeout_s, 30);
         assert_eq!(c.fps, 12);
+        assert_eq!(c.cat, CatConfig::default());
+        assert_eq!(c.ceo, CeoConfig::default());
+    }
+    #[test]
+    fn cat_and_ceo_sections_parse() {
+        let c: Config = toml::from_str(
+            "[cat]\nname = \"Mochi\"\ncolor = \"calico\"\n\n[ceo]\nnumber = 10\nskin = \"#8d5524\"\nhair_style = \"curly\"\n",
+        )
+        .unwrap();
+        assert!(c.cat.enabled);
+        assert_eq!((c.cat.name.as_str(), c.cat.color.as_str()), ("Mochi", "calico"));
+        assert!(c.ceo.enabled);
+        assert_eq!(c.ceo.name, "CEO");
+        assert_eq!(c.ceo.number, 10);
+        assert_eq!(c.ceo.skin, "#8d5524");
+        assert_eq!(c.ceo.hair, "black");
+        assert_eq!(c.ceo.hair_style, "curly");
+        let off: Config = toml::from_str("[cat]\nenabled = false\n[ceo]\nenabled = false\n").unwrap();
+        assert!(!off.cat.enabled && !off.ceo.enabled);
+        assert_eq!(off.cat.name, "Pixel");
+        let d = Config::default();
+        assert_eq!((d.ceo.skin.as_str(), d.ceo.hair.as_str(), d.ceo.hair_style.as_str(), d.ceo.number), ("#c68642", "black", "short", 9));
+        assert_eq!(d.cat.color, "grey");
     }
 }

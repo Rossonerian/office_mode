@@ -55,6 +55,7 @@ impl OfficeCtx {
         let px_h = (area.height as u32 * fh).min(MAX_PX_H);
         let cells = Rect::new(area.x, area.y, (px_w / fw) as u16, (px_h / fh) as u16);
         let sel = app.selected.clone();
+        view.set_hover(app.hover.clone());
         let img = guarded(|| view.compose(scene, sel.as_ref(), px_w, px_h, t_ms))?;
         let dynimg = image::DynamicImage::ImageRgba8(img);
         match picker.protocol_type() {
