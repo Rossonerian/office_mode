@@ -13,6 +13,7 @@ USAGE:
     office install-hooks [--claude] [--antigravity] [--uninstall]
                                 install (or remove) the office-hook entries
     office doctor               check hooks, socket, router and config
+    office config               validate config.toml and print the effective settings
     office -h | --help          show this help
     office -V | --version       show the version
 
@@ -40,6 +41,21 @@ fn main() -> anyhow::Result<()> {
             args.iter().any(|a| a == "--uninstall"),
         ),
         Some("doctor") => cli::doctor(),
+        Some("config") => {
+            let path = office_core::paths::config_file();
+            match std::fs::read_to_string(&path) {
+                Err(_) => println!("# {} not found: using defaults", path.display()),
+                Ok(s) => match toml::from_str::<office_core::config::Config>(&s) {
+                    Ok(_) => println!("# {}: OK", path.display()),
+                    Err(e) => {
+                        eprintln!("# {}: INVALID, so the office falls back to defaults\n{e}", path.display());
+                        std::process::exit(1);
+                    }
+                },
+            }
+            println!("{}", toml::to_string_pretty(&cfg)?);
+            Ok(())
+        }
         Some("demo") => app::run(cfg, true),
         None => app::run(cfg, false),
         Some(other) => {
