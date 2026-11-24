@@ -1,0 +1,27 @@
+# cozy: Kenney "Roguelike Indoors" (CC0) furniture on warm procedural wood floors.
+[sheets]
+indoor = { file = "roguelikeIndoor.png", tile = 16, spacing = 1 }
+
+[sprites]
+desk = { sheet = "indoor", tiles = [[4, 4], [6, 4]] }
+chair = { sheet = "indoor", col = 0, row = 3 }
+plant = { sheet = "indoor", col = 17, row = 0 }
+sofa = { sheet = "indoor", tiles = [[16, 9], [17, 9], [18, 9]] }
+whiteboard = { sheet = "indoor", tiles = [[20, 12], [21, 12]] }
+lamp = { sheet = "indoor", col = 17, row = 6 }
+rug = { sheet = "indoor", tiles = [[0, 9], [1, 9], [2, 9]] }
+
+[colors]
+floor_style = "wood"
+floor_a = "#b98252"
+floor_b = "#97653c"
+wall = "#d9b48a"
+wall_trim = "#7a4a2a"
+sky = "#ffd9a0"
+wood = "#8a5530"
+desk = "#c8945e"
+chair = "#9b4a2c"
+fabric = "#c0603a"
+rug = "#a8432f"
+rug_trim = "#e7b36a"
+backdrop = "#2a1b12"

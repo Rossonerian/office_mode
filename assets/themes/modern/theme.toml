@@ -1,0 +1,22 @@
+# modern: Kenney "Roguelike Modern City" + "Roguelike Indoors" (CC0). Tiles are 16 px with 1 px spacing.
+[sheets]
+city = { file = "roguelikeCity.png", tile = 16, spacing = 1, key = "#ff00ff" }
+indoor = { file = "roguelikeIndoor.png", tile = 16, spacing = 1 }
+
+[sprites]
+floor = { sheet = "city", col = 7, row = 20 }
+wall = { sheet = "city", col = 9, row = 8 }
+window = { sheet = "city", col = 25, row = 19 }
+door = { sheet = "city", col = 26, row = 26 }
+desk = { sheet = "indoor", tiles = [[4, 4], [6, 4]] }
+chair = { sheet = "indoor", col = 0, row = 8 }
+plant = { sheet = "indoor", col = 16, row = 0 }
+sofa = { sheet = "indoor", tiles = [[16, 9], [17, 9], [18, 9]] }
+
+[colors]
+wall_trim = "#6b6f78"
+metal = "#3c4048"
+backdrop = "#20232a"
+rug = "#5b6b7d"
+rug_trim = "#9fb0c2"
+fabric = "#c0603a"

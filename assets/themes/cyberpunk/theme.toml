@@ -1,0 +1,33 @@
+# cyberpunk: Kenney "1-Bit Pack" (CC0) tinted neon magenta/cyan on near-black, with glowing monitors.
+[sheets]
+ob = { file = "onebit_monochrome.png", tile = 16, spacing = 1 }
+
+[sprites]
+floor = { sheet = "ob", col = 1, row = 0, tint = "#3a1850" }
+wall = { sheet = "ob", col = 16, row = 0, tint = "#123c52" }
+window = { sheet = "ob", col = 1, row = 10, tint = "#00e5ff" }
+door = { sheet = "ob", col = 3, row = 9, tint = "#ff2bd6" }
+desk = { sheet = "ob", col = 2, row = 8, tint = "#ff2bd6" }
+monitor_off = { sheet = "ob", col = 0, row = 12, tint = "#3a6a80", screen = [3, 3, 10, 8] }
+monitor_on = { sheet = "ob", col = 0, row = 12, tint = "#00e5ff", screen = [3, 3, 10, 8] }
+chair = { sheet = "ob", col = 13, row = 9, tint = "#b026ff" }
+sofa = { sheet = "ob", col = 15, row = 9, tint = "#ff2bd6" }
+plant = { sheet = "ob", col = 1, row = 1, tint = "#39ff88" }
+whiteboard = { sheet = "ob", col = 15, row = 7, tint = "#00e5ff" }
+
+[fx]
+glow = "#00b8ff"
+floor_bg = "#0b0614"
+wall_bg = "#130a24"
+
+[colors]
+wall_trim = "#ff2bd6"
+metal = "#2a2140"
+screen_on = "#003a4a"
+screen_off = "#0b0614"
+fabric = "#ff2bd6"
+pot = "#b026ff"
+plant = "#39ff88"
+backdrop = "#07040d"
+rug = "#1a0d2e"
+rug_trim = "#ff2bd6"
