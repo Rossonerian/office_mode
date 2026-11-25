@@ -92,6 +92,8 @@ pub fn glyph(ch: char) -> u16 {
         '└' | '├' => g([0b100, 0b100, 0b100, 0b100, 0b111]),
         '✓' => g([0, 0b001, 0b010, 0b101, 0b010]),
         '✕' => g([0b101, 0b101, 0b010, 0b101, 0b101]),
+        '⟳' => g([0b010, 0b111, 0b101, 0b101, 0b010]),
+        '✂' => g([0b101, 0b101, 0b010, 0b101, 0b010]),
         _ => g([0b110, 0b001, 0b010, 0, 0b010]),
     }
 }
@@ -114,6 +116,28 @@ pub fn truncate(s: &str, max_px: i32) -> String {
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push('…');
     out
+}
+
+/// Like `truncate`, but cut at a word boundary (when one leaves at least ~half the text), with no
+/// dangling separator before the '…'.
+pub fn truncate_words(s: &str, max_px: i32) -> String {
+    let max_chars = ((max_px + 1) / ADVANCE).max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let room = max_chars - 1; // keep one cell for '…'
+    let cut = (1..=room.min(chars.len()))
+        .rev()
+        .find(|&i| chars.get(i).is_some_and(|c| c.is_whitespace()) && !chars[i - 1].is_whitespace())
+        .filter(|&i| i * 2 >= room)
+        .unwrap_or(room);
+    let head: String = chars[..cut].iter().collect();
+    let head = head.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '/' | '·'));
+    format!("{head}…")
 }
 
 pub fn draw_text(img: &mut RgbaImage, x: i32, y: i32, s: &str, c: Col) {
@@ -143,6 +167,16 @@ pub fn label(img: &mut RgbaImage, cx: i32, y: i32, s: &str, fg: Col, bg: Col) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_words_breaks_at_word_boundaries() {
+        assert_eq!(truncate_words("run the tests", 100), "run the tests");
+        // 7 chars max: room for 6 + '…'
+        assert_eq!(truncate_words("run tests now", 27), "run…");
+        assert_eq!(truncate_words("run the tests now", 43), "run the…");
+        assert_eq!(truncate_words("supercalifragilistic word", 27), "superc…");
+        assert!(text_width(&truncate_words("alpha beta gamma delta", 39)) <= 39);
+    }
 
     #[test]
     fn widths_and_truncation() {

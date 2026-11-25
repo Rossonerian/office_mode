@@ -1039,10 +1039,12 @@ impl Renderer {
         }
 
         // the Security Desk guard by the door: raises a hand for a few seconds after a denial
+        let mut guard: Option<(i32, i32, bool)> = None;
         if self.show.ambient {
             let g = &scene.guard;
             let alert = g.last_deny_ms > 0 && t >= g.last_deny_ms && t - g.last_deny_ms < extras::GUARD_ALERT_MS;
             extras::draw_guard(img, char_t, lay.door.0 + 24, lay.door.1, alert, t);
+            guard = Some((lay.door.0 + 24, lay.door.1, alert));
         }
 
         // the office cat: above the floor and furniture, below the labels
@@ -1060,7 +1062,7 @@ impl Renderer {
         }
 
         // overlays: priority-ordered rect collision resolver so no two badges or speech bubbles overlap
-        self.draw_overlays(img, char_t, scene, lay, &places, selected, t, ceo_head, cat_at, &reserved);
+        self.draw_overlays(img, char_t, scene, lay, &places, selected, t, ceo_head, cat_at, &reserved, guard);
         self.hits = hits;
         couriers > 0
             || places.values().any(|p| matches!(p, Place::Free { walk: Some(_), .. }))
@@ -1152,6 +1154,7 @@ impl Renderer {
         ceo_head: Option<(i32, i32, ceo::Mood)>,
         cat_at: Option<cat::CatState>,
         reserved: &[[i32; 4]],
+        guard: Option<(i32, i32, bool)>,
     ) {
         let mut order: Vec<(&Agent, u8)> = scene
             .agents
@@ -1233,6 +1236,22 @@ impl Renderer {
             placed.push([zx, zy, tw + 6 + tag_w, layout::ZONE_HEAD - 1]);
         }
         placed.extend_from_slice(reserved);
+        // the guard's tag and hand bubble go through the same resolver (tag first, then the icon beside/above it)
+        let mut guard_ov: Option<([i32; 4], Option<[i32; 4]>)> = None;
+        if let Some((gx, gy, alert)) = guard {
+            let fits = |r: &[i32; 4]| r[0] >= bounds[0] && r[1] >= bounds[1] && r[0] + r[2] <= bounds[0] + bounds[2] && r[1] + r[3] <= bounds[1] + bounds[3];
+            let pick = |c: Vec<[i32; 4]>, placed: &[[i32; 4]]| {
+                c.iter().copied().find(|r| fits(r) && !placed.iter().any(|p| rects_overlap(*r, *p))).or_else(|| c.iter().copied().find(fits))
+            };
+            if let Some(tag) = pick(extras::guard_tag_candidates(gx, gy), &placed) {
+                placed.push(tag);
+                let icon = if alert && self.show.icons { pick(extras::guard_icon_candidates(gx, gy), &placed) } else { None };
+                if let Some(i) = icon {
+                    placed.push(i);
+                }
+                guard_ov = Some((tag, icon));
+            }
+        }
         // Nameplates (and the boss's ballot) are never covered, even by must-show overlays.
         let plates: Vec<[i32; 4]> = placed.clone();
         let best_spot = |cands: &[[i32; 4]], placed: &[[i32; 4]]| -> Option<[i32; 4]> {
@@ -1268,8 +1287,14 @@ impl Renderer {
                 Place::Hidden => continue,
             };
             let max_name = if is_sel || is_hov { 120 } else { CELL_W - 4 };
-            let name = font::truncate(&a.label, max_name);
             let verdict = scene.verdicts.get(&a.id).map(String::as_str);
+            // ROSSO titles abbreviate ("SEC SEAT") before they would be cut, and the verdict chip keeps its room
+            let name_budget = if verdict.is_some() && !(is_sel || is_hov) {
+                max_name + 12 - verdict.map(extras::chip_width).unwrap_or(0)
+            } else {
+                max_name
+            };
+            let name = extras::tag_name(&a.label, name_budget);
             let name_w = font::text_width(&name) + 5; // +2px pip +1px gap +2px pad
             let nw = name_w + verdict.map(extras::chip_width).unwrap_or(0);
             let nh = font::GLYPH_H + 2;
@@ -1343,11 +1368,11 @@ impl Renderer {
             let mut bubble_op = None;
             if (speaking && !a.activity.is_empty() || fail.is_some()) && self.show.bubbles && (fail.is_some() || self.label_gate(focus)) {
                 let comp = match fail {
-                    Some(fi) => compact_activity(&fi.hint),
+                    Some(fi) => extras::compact_hint(&fi.hint),
                     None => compact_activity(&a.activity),
                 };
                 let max_b = if is_sel || is_hov || fail.is_some() { 124 } else { CELL_W - 4 };
-                let text = font::truncate(&comp, max_b);
+                let text = font::truncate_words(&comp, max_b);
                 let bw = font::text_width(&text) + 4;
                 let bh = font::GLYPH_H + 4;
                 let base_y = (ny - bh - 2).clamp(bounds[1], (bounds[1] + bounds[3] - bh).max(bounds[1]));
@@ -1363,12 +1388,12 @@ impl Renderer {
                 };
                 {
                     let max_x = (bounds[0] + bounds[2] - bw).max(bounds[0]);
-                    let mut candidates = Vec::with_capacity(21);
+                    let mut candidates = Vec::with_capacity(35);
                     // near-side council members face away: their bubble stacks below the label instead
                     let near_council = council_seat.get(&a.id).is_some_and(|c| c.0 >= 2);
                     let max_y = (bounds[1] + bounds[3] - bh).max(bounds[1]);
-                    for dy in [0, bh + 1, (bh + 1) * 2, (bh + 1) * 3] {
-                        let y = if near_council { (ny + nh + 1 + dy).min(max_y) } else { (base_y - dy).max(bounds[1]) };
+                    for dy in [0, 1, 2, 3, 4].map(|k| k * (bh + OVERLAY_GAP)) {
+                        let y = if near_council { (ny + nh + OVERLAY_GAP + dy).min(max_y) } else { (base_y - dy).max(bounds[1]) };
                         for dx in [0, -12, 12, -24, 24, -36, 36] {
                             candidates.push([(base_x + dx).clamp(bounds[0], max_x), y, bw, bh]);
                         }
@@ -1436,6 +1461,13 @@ impl Renderer {
                 icon_bubble(img, char_t, ix, iy, k, t);
             }
             let _ = p.head_y;
+        }
+
+        if let Some((tag, icon)) = guard_ov {
+            extras::draw_guard_tag(img, char_t, tag);
+            if let Some([ix, iy, _, _]) = icon {
+                extras::draw_hand_bubble(img, char_t, ix, iy, t);
+            }
         }
 
         if let Some((hx, top, mood)) = ceo_head {
@@ -1703,13 +1735,14 @@ fn draw_council_cabin(img: &mut RgbaImage, th: [&Theme; 4], x: i32, y: i32) {
     fill(img, x + 1, y + 14, w - 2, 1, with_alpha(INK, 60));
     // wall screen showing the agenda
     let sx = x + w / 2 - 21;
-    fill(img, sx - 1, y + 2, 44, 11, f(0x0e1116));
-    fill(img, sx, y + 3, 42, 9, f(0x16263d));
-    fill(img, sx, y + 3, 42, 1, f(0x24406a));
-    font::draw_text(img, sx + 3, y + 5, "AGENDA", f(0xdfe9f7));
+    // (kept 3 px below the pod's top edge so the zone's nameplate strip above stays clear)
+    fill(img, sx - 1, y + 3, 44, 10, f(0x0e1116));
+    fill(img, sx, y + 4, 42, 8, f(0x16263d));
+    fill(img, sx, y + 4, 42, 1, f(0x24406a));
+    font::draw_text(img, sx + 3, y + 6, "AGENDA", f(0xdfe9f7));
     for (k, c) in [(0, 0x4cc46a), (1, 0xffd23f), (2, 0x82aaff)] {
-        fill(img, sx + 29, y + 5 + k * 2, 2, 1, f(c));
-        fill(img, sx + 32, y + 5 + k * 2, 8 - k * 2, 1, f(0x8fa3b8));
+        fill(img, sx + 29, y + 6 + k * 2, 2, 1, f(c));
+        fill(img, sx + 32, y + 6 + k * 2, 8 - k * 2, 1, f(0x8fa3b8));
     }
     put(img, sx + 40, y + 10, f(0x5fd35f));
     // wall clock
@@ -2008,13 +2041,38 @@ fn draw_confetti(img: &mut RgbaImage, th: &Theme, cx: i32, head_y: i32, t: u64) 
     }
 }
 
+/// Empty pixels required between two overlays (name tags, bubbles, badges).
+const OVERLAY_GAP: i32 = 2;
+
+/// Do two `[x, y, w, h]` rects collide, counting the required `OVERLAY_GAP` between them? Rects at
+/// least `OVERLAY_GAP` px apart on either axis are clear (the old `+ 1` form let rects 1 px apart
+/// pass as touching because the edge pixel counts too).
 #[inline]
 fn rects_overlap(a: [i32; 4], b: [i32; 4]) -> bool {
-    a[0] < b[0] + b[2] + 1 && b[0] < a[0] + a[2] + 1 && a[1] < b[1] + b[3] + 1 && b[1] < a[1] + a[3] + 1
+    a[0] < b[0] + b[2] + OVERLAY_GAP
+        && b[0] < a[0] + a[2] + OVERLAY_GAP
+        && a[1] < b[1] + b[3] + OVERLAY_GAP
+        && b[1] < a[1] + a[3] + OVERLAY_GAP
+}
+
+/// Does the text after a "Bash " prefix look like a shell command (rather than a description)?
+fn looks_like_command(rest: &str) -> bool {
+    const CMDS: [&str; 24] = [
+        "cargo", "git", "rm", "ls", "cat", "npm", "npx", "pnpm", "yarn", "python", "python3", "sh", "bash", "cd", "grep", "rg", "make",
+        "curl", "sed", "awk", "echo", "mkdir", "cp", "mv",
+    ];
+    let first = rest.split_whitespace().next().unwrap_or("");
+    CMDS.contains(&first) || rest.contains(" -") || rest.contains("&&") || rest.contains('|') || rest.contains('$') || first.contains('/')
 }
 
 fn compact_activity(s: &str) -> String {
     let trimmed = s.trim();
+    // a described Bash call reads better without the tool name: "run the tests", not "Bash run the tests"
+    if let Some(rest) = trimmed.strip_prefix("Bash ").map(str::trim) {
+        if !rest.is_empty() && !looks_like_command(rest) {
+            return rest.to_string();
+        }
+    }
     if let Some((verb, rest)) = trimmed.split_once(' ') {
         if matches!(verb, "Edit" | "Read" | "Write" | "MultiEdit" | "View" | "write_file" | "read_file" | "edit_file")
             && rest.contains('/')

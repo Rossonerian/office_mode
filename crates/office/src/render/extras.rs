@@ -56,6 +56,78 @@ pub fn draw_chip(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, h: i32, v: &st
     font::draw_text(img, x + 3, y + 1, chip_text(v), th.fx.apply(fg));
 }
 
+/// Compact tag text for a ROSSO title, shortest last; the full label comes first. `label` may carry
+/// a "·model" suffix, which the short forms drop.
+fn title_candidates(label: &str) -> Vec<String> {
+    let base = label.split('\u{b7}').next().unwrap_or(label).trim();
+    let lower = base.to_ascii_lowercase();
+    let seat = |x: &str| match x {
+        "security" => "SEC",
+        "correctness" => "COR",
+        "reliability" => "REL",
+        "performance" => "PERF",
+        "maintainability" => "MNT",
+        "client intent" => "INT",
+        _ => "",
+    };
+    let mut out: Vec<String> = vec![label.to_string()];
+    let mut add = |v: &[&str]| out.extend(v.iter().map(|x| x.to_string()));
+    match lower.as_str() {
+        "chief architect" => add(&["CHIEF ARCH", "ARCHITECT", "ARCH"]),
+        "chief inspector" => add(&["INSPECTOR", "INSP"]),
+        "test inspector" => add(&["TESTER", "TEST"]),
+        "design engineer" => add(&["DESIGNER", "DESIGN"]),
+        "technician" => add(&["TECH"]),
+        "records clerk" => add(&["CLERK"]),
+        "mail clerk" => add(&["MAIL CLERK", "CLERK"]),
+        _ => {
+            if let Some(x) = lower.strip_suffix(" seat") {
+                let short = if seat(x).is_empty() { x.chars().take(3).collect::<String>().to_ascii_uppercase() } else { seat(x).to_string() };
+                add(&[&format!("{short} SEAT"), &short]);
+            } else if let Some(d) = lower.strip_suffix(" head") {
+                let short = match d {
+                    "frontend" => "FRONT",
+                    "backend" => "BACK",
+                    "database" => "DB",
+                    "integration" => "INTEG",
+                    "performance" => "PERF",
+                    "research" => "RES",
+                    "security" => "SEC",
+                    other => other,
+                };
+                add(&[&format!("{} HEAD", d.to_ascii_uppercase()), &format!("{} HEAD", short.to_ascii_uppercase()), &short.to_ascii_uppercase()]);
+            }
+        }
+    }
+    out
+}
+
+/// The name-tag text for `label` within `max_px`: the full label when it fits (always on hover or
+/// selection, where the budget is large), else the first ROSSO abbreviation that fits, else a
+/// plain truncation.
+pub fn tag_name(label: &str, max_px: i32) -> String {
+    let cands = title_candidates(label);
+    if let Some(c) = cands.iter().find(|c| font::text_width(c) <= max_px) {
+        return c.clone();
+    }
+    // nothing fits: truncate the shortest known form (or the label itself when it has none)
+    font::truncate(cands.last().map(String::as_str).unwrap_or(label), max_px)
+}
+
+/// Compact failure hint for its bubble: "⟳ retry", "✂ split", "✕ see log".
+pub fn compact_hint(hint: &str) -> String {
+    let h = hint.to_ascii_lowercase();
+    if h.contains("retry") {
+        "⟳ retry".into()
+    } else if h.contains("split") {
+        "✂ split".into()
+    } else if h.contains("log") {
+        "✕ see log".into()
+    } else {
+        font::truncate_words(hint, 44)
+    }
+}
+
 /// "DESKTOP" / "CLI" for a session entrypoint.
 pub fn entry_tag(entrypoint: &str) -> &'static str {
     if entrypoint.contains("desktop") {
@@ -75,8 +147,15 @@ pub fn draw_entry_tag(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, tag: &str
     w
 }
 
+/// The guard's name tag text.
+pub const GUARD_TAG: &str = "SECURITY";
+
+/// Size of the raised-hand icon bubble including its tail.
+pub const HAND_BUBBLE: (i32, i32) = (9, 11);
+
 /// The Security Desk guard: dark uniform, cap, gold badge. Feet at (fx, fy). With `alert` he
-/// raises a hand and a red hand icon bubble appears over his head.
+/// raises a hand. His name tag and the red hand bubble are overlays placed by the collision
+/// resolver (`guard_tag_candidates` / `guard_icon_candidates`).
 pub fn draw_guard(img: &mut RgbaImage, th: &Theme, fx: i32, fy: i32, alert: bool, t: u64) {
     let mut look = character::look_for("security-desk");
     look.hair = rgb(0x151a26); // cap
@@ -98,11 +177,32 @@ pub fn draw_guard(img: &mut RgbaImage, th: &Theme, fx: i32, fy: i32, alert: bool
     put(img, fx + 1, fy - 13, f(0xe8c547));
     put(img, fx + 1, fy - 12, f(0xe8c547));
     fill(img, fx - 5, fy - 14, 1, 3, f(0x3a4352));
-    // nameplate
-    font::label(img, fx, fy - 33, "SECURITY", f(0xf2f4f7), f(0x7a1f1f));
-    if alert {
-        draw_hand_bubble(img, th, fx - 4, fy - 46, t);
-    }
+}
+
+/// Candidate rects `[x, y, w, h]` for the guard's "SECURITY" tag, best first: above the cap,
+/// beside the head, then below the feet. (`fx`,`fy` = his feet.)
+pub fn guard_tag_candidates(fx: i32, fy: i32) -> Vec<[i32; 4]> {
+    let w = font::text_width(GUARD_TAG) + 2;
+    let h = font::GLYPH_H + 2;
+    vec![
+        [fx - w / 2, fy - 38, w, h],
+        [fx + 7, fy - 28, w, h],
+        [fx - 7 - w, fy - 28, w, h],
+        [fx - w / 2, fy + 3, w, h],
+    ]
+}
+
+/// Candidate rects for the hand bubble: above the tag first, then beside it.
+pub fn guard_icon_candidates(fx: i32, fy: i32) -> Vec<[i32; 4]> {
+    let (w, h) = HAND_BUBBLE;
+    vec![[fx - w / 2, fy - 52, w, h], [fx + 19, fy - 42, w, h], [fx - 19 - w, fy - 42, w, h], [fx + 19, fy - 54, w, h]]
+}
+
+/// Draw the guard's name tag in its resolved rect.
+pub fn draw_guard_tag(img: &mut RgbaImage, th: &Theme, rect: [i32; 4]) {
+    let f = |c: u32| th.fx.apply(rgb(c));
+    let w = font::text_width(GUARD_TAG);
+    font::label(img, rect[0] + 1 + w / 2, rect[1] + 1, GUARD_TAG, f(0xf2f4f7), f(0x7a1f1f));
 }
 
 /// Red bubble with a raised-hand glyph (the "stop" hand).
@@ -146,16 +246,63 @@ const STEP_COLORS: [u32; 4] = [0x4aa3df, 0xe05252, 0xf29a3a, 0x4cc46a];
 /// top-left (the cabin's AGENDA screen).
 pub fn draw_council_steps(img: &mut RgbaImage, th: &Theme, sx: i32, sy: i32, reached: [bool; 4], current: usize, t: u64) {
     let f = |c: u32| th.fx.apply(rgb(c));
-    fill(img, sx + 26, sy + 4, 15, 7, f(0x16263d));
+    fill(img, sx + 26, sy + 4, 15, 6, f(0x16263d));
     for i in 0..4 {
         let x = sx + 28 + i as i32 * 3;
         let c = if reached[i] { STEP_COLORS[i] } else { 0x2c3e57 };
         fill(img, x, sy + 5, 2, 2, f(c));
         if i == current && (t / 400) % 2 == 0 {
-            fill(img, x, sy + 8, 2, 1, f(0xffffff));
+            fill(img, x, sy + 7, 2, 1, f(0xffffff));
         }
     }
     let n = reached.iter().filter(|r| **r).count() as i32;
-    fill(img, sx + 28, sy + 10, 11, 1, f(0x24406a));
-    fill(img, sx + 28, sy + 10, (n * 11 / 4).max(if n > 0 { 1 } else { 0 }), 1, f(0x5fd35f));
+    fill(img, sx + 28, sy + 9, 11, 1, f(0x24406a));
+    fill(img, sx + 28, sy + 9, (n * 11 / 4).max(if n > 0 { 1 } else { 0 }), 1, f(0x5fd35f));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn titles_abbreviate_only_when_they_must() {
+        assert_eq!(tag_name("Security Seat", 200), "Security Seat");
+        assert_eq!(tag_name("Security Seat", 33), "SEC SEAT");
+        assert_eq!(tag_name("Correctness Seat", 33), "COR SEAT");
+        assert_eq!(tag_name("Reliability Seat", 33), "REL SEAT");
+        assert_eq!(tag_name("Chief Architect", 40), "CHIEF ARCH");
+        assert_eq!(tag_name("Chief Inspector", 36), "INSPECTOR");
+        assert_eq!(tag_name("Chief Inspector\u{b7}neon-medium", 36), "INSPECTOR");
+        assert_eq!(tag_name("Test Inspector", 28), "TESTER");
+        assert_eq!(tag_name("Frontend Head", 52), "Frontend Head");
+        assert_eq!(tag_name("Frontend Head", 48), "FRONT HEAD");
+        assert_eq!(tag_name("Frontend Head", 43), "FRONT HEAD");
+        assert_eq!(tag_name("Frontend Head", 25), "FRONT");
+        // unknown labels are plainly truncated
+        assert!(tag_name("worker\u{b7}hydrogen-low", 30).ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn failure_hints_are_compact() {
+        assert_eq!(compact_hint("stalled: retry once"), "⟳ retry");
+        assert_eq!(compact_hint("too big: split the task"), "✂ split");
+        assert!(font::text_width(&compact_hint("failed: see the run log")) <= 44);
+    }
+
+    #[test]
+    fn overlays_need_a_real_two_pixel_gap() {
+        use super::super::rects_overlap as o;
+        assert!(o([0, 0, 10, 9], [10, 0, 10, 9]), "touching");
+        assert!(o([0, 0, 10, 9], [11, 0, 10, 9]), "1 px apart is still too close");
+        assert!(!o([0, 0, 10, 9], [12, 0, 10, 9]), "2 px apart is clear");
+        assert!(o([0, 0, 10, 9], [0, 10, 10, 9]), "1 px apart vertically");
+        assert!(!o([0, 0, 10, 9], [0, 11, 10, 9]));
+    }
+
+    #[test]
+    fn guard_tag_and_icon_never_overlap_by_default() {
+        let tag = guard_tag_candidates(100, 100)[0];
+        let icon = guard_icon_candidates(100, 100)[0];
+        assert!(!super::super::rects_overlap(tag, icon));
+    }
 }

@@ -104,6 +104,56 @@ fn main() -> anyhow::Result<()> {
         println!("busy-vote   {}", p.display());
         r.set_hover(None);
     }
+    // ROSSO extras: guard deny, verdict chips on council seats, a failure, a council round, in-tray badges
+    {
+        use office_core::model::{AgentKind, AgentState};
+        use office_core::{Event, EventKind, Reducer, SourceKind};
+        let mut red = Reducer::new();
+        let mut ev = |k: EventKind| {
+            red.apply(Event { at_ms: now - 5_000, source: SourceKind::Demo, kind: k });
+        };
+        let seen = |id: &str, kind: AgentKind, label: &str, parent: Option<&str>, role: Option<&str>, cwd: Option<&str>| EventKind::AgentSeen {
+            id: id.into(), kind, label: Some(label.into()), parent: parent.map(Into::into), cwd: cwd.map(Into::into),
+            role: role.map(Into::into), model: None, slot: None, pid: None, resume_id: None,
+        };
+        ev(seen("cc:a", AgentKind::Claude, "cc:a", None, None, Some("/tmp/a")));
+        ev(seen("agy:1", AgentKind::Agy, "Chief Inspector\u{b7}neon-medium", None, Some("supervisor"), Some("/tmp/a")));
+        for (i, (role, label)) in [("agy-council-architect", "Chief Architect"), ("agy-council-advisor", "Security Seat"), ("agy-council-advisor", "Correctness Seat"), ("agy-council-advisor", "Reliability Seat")].iter().enumerate() {
+            ev(seen(&format!("cc-sub:a/c{i}"), AgentKind::ClaudeSub, label, Some("cc:a"), Some(role), None));
+        }
+        let mail = |from: &str, to: &str, ty: &str, v: Option<&str>| EventKind::RossoMail {
+            job: "j1".into(), from_title: from.into(), to_titles: vec![to.into()], doc_type: ty.into(),
+            verdict: v.map(Into::into), subject: "x".into(), doc_path: None, escalation: false, body: String::new(),
+        };
+        ev(mail("Chief Architect", "Security Seat", "Task Card", None));
+        ev(mail("Security Seat", "Chief Architect", "Critique", Some("OBJECT")));
+        ev(mail("Correctness Seat", "Chief Architect", "Critique", Some("REVISE")));
+        ev(mail("Reliability Seat", "Chief Architect", "Critique", Some("SUPPORT")));
+        ev(EventKind::Verdict { id: "agy:1".into(), verdict: "APPROVE".into() });
+        ev(EventKind::Failure {
+            id: "agy:1".into(),
+            info: office_core::FailureInfo { at_ms: now - 1_000, outcome: "ERROR/TIMEOUT".into(), diagnosis: "STALLED".into(), hint: "stalled: retry once".into() },
+        });
+        ev(EventKind::InTray { slug: "chief-inspector".into(), count: 3 });
+        ev(EventKind::Entrypoint { id: "cc:a".into(), entrypoint: "claude-desktop".into() });
+        ev(EventKind::GuardDecision { agent: "agy-tester".into(), tool: "Bash".into(), reason: "not allowed".into(), deny: true });
+        let mut s = red.scene().clone();
+        for a in s.agents.values_mut() {
+            a.state = AgentState::Running;
+            a.activity = "Bash cargo test --workspace -- --nocapture to verify the render".into();
+            a.started_ms = 0;
+            a.last_event_ms = now - 500;
+        }
+        s.guard.last_deny_ms = now - 500;
+        s.now_ms = now;
+        r.set_mix(&ThemeMix::default());
+        for (name, (bw, bh)) in [("extras", (w, h)), ("extras-small", (640, 360))] {
+            let img = r.compose(&s, None, bw, bh, now);
+            let p = out.join(format!("{name}.png"));
+            img.save(&p)?;
+            println!("{name:<11} {}", p.display());
+        }
+    }
     for e in r.theme_errors() {
         eprintln!("theme error: {e}");
     }
