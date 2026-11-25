@@ -10,6 +10,7 @@ pub mod cat;
 pub mod ceo;
 pub mod character;
 pub mod demo;
+pub mod extras;
 pub mod font;
 pub mod layout;
 pub mod procedural;
@@ -106,6 +107,8 @@ pub struct Renderer {
 const TRIP_MAX_MS: u64 = 20_000;
 /// How long a session stands at the boss's desk presenting a finished turn.
 const PRESENT_MS: u64 = 2_500;
+/// How long a failed call's red bubble and hint stay on its agent.
+const FAILURE_SHOW_MS: u64 = 60_000;
 
 /// A session's trip to the boss's office.
 #[derive(Debug, Clone, Copy)]
@@ -774,6 +777,13 @@ impl Renderer {
             }
         }
 
+        // council round on the meeting-room wall screen
+        if let Some(round) = office_core::rosso::council_round(scene) {
+            for pod in lay.pods.iter().filter(|p| p.kind == layout::PodKind::Council) {
+                extras::draw_council_steps(img, furn_t, pod.x + POD_W / 2 - 21, pod.y, round.reached, round.current(), t);
+            }
+        }
+
         // Animated coffee bar steam
         let cooler = furn_t.sprite("cooler");
         let plant = decor_t.sprite("plant");
@@ -802,6 +812,9 @@ impl Renderer {
                 } else {
                     rgb(0x4cc46a)
                 };
+                if scene.router_extra.orphans > 0 && (t / 300) % 2 == 0 {
+                    fill(img, rx + 9, ry + 1, 2, 2, furn_t.fx.apply(rgb(0xff2a2a)));
+                }
                 for bay in 0..4 {
                     let on = ((t / 350) as i32 + bay) % 2 == 0;
                     if on {
@@ -971,6 +984,9 @@ impl Renderer {
                 } else if night && on_state.is_some() && decor_t.fx.palette.is_empty() {
                     glow(img, [lx + lamp.w() / 2 - 1, ly + 1, 3, 3], rgb(0xffc966), 5, 0.16);
                 }
+                if let Some(n) = at_desk.and_then(|(a, _)| scene.in_trays.get(&a.id)).filter(|n| **n > 0) {
+                    extras::draw_in_tray(img, furn_t, desk_left + desk_w - 11, desk_top + 3, *n);
+                }
             }
         }
         while free_idx < free.len() {
@@ -1016,9 +1032,17 @@ impl Renderer {
             let Some(to) = r.to.as_deref().and_then(|to| desk_aisle(lay, to)) else { continue };
             let from = desk_aisle(lay, &r.from).unwrap_or(lay.door);
             if let Some(Place::Free { fx, fy, walk }) = walk_along_min(&lay.walk_route(from, to), r.at_ms, t, 2_800.0) {
-                draw_courier(img, char_t, r.id, fx, fy, walk.unwrap_or(0), r.kind == office_core::ReportKind::Task);
+                let doc = doc_kind_for(scene.report_types.get(&r.id).map(String::as_str), r.kind == office_core::ReportKind::Task);
+                draw_courier(img, char_t, r.id, fx, fy, walk.unwrap_or(0), doc);
                 couriers += 1;
             }
+        }
+
+        // the Security Desk guard by the door: raises a hand for a few seconds after a denial
+        if self.show.ambient {
+            let g = &scene.guard;
+            let alert = g.last_deny_ms > 0 && t >= g.last_deny_ms && t - g.last_deny_ms < extras::GUARD_ALERT_MS;
+            extras::draw_guard(img, char_t, lay.door.0 + 24, lay.door.1, alert, t);
         }
 
         // the office cat: above the floor and furniture, below the labels
@@ -1169,6 +1193,8 @@ impl Renderer {
             is_hov: bool,
             show_name: bool,
             name: String,
+            name_w: i32,
+            verdict: Option<&'a str>,
             name_rect: [i32; 4],
             bubble: Option<(String, [i32; 4], Col, Col)>,
             icon: Option<(AgentState, i32, i32)>,
@@ -1188,13 +1214,23 @@ impl Renderer {
                 None => "AGY LAB".to_string(),
             };
             let txt = if members > 1 { format!("{name} · {members}") } else { name };
-            let txt = font::truncate(&txt, zw - 6);
+            let tag = z
+                .session
+                .as_ref()
+                .and_then(|id| scene.entrypoints.get(id))
+                .map(|e| extras::entry_tag(e))
+                .filter(|t| !t.is_empty());
+            let tag_w = tag.map(|t| font::text_width(t) + 3 + 2).unwrap_or(0);
+            let txt = font::truncate(&txt, zw - 6 - tag_w);
             let tw = font::text_width(&txt);
             if !self.show.zones {
-                fill(img, zx, zy, tw + 6, layout::ZONE_HEAD - 1, with_alpha(f(INK), 200));
+                fill(img, zx, zy, tw + 6 + tag_w, layout::ZONE_HEAD - 1, with_alpha(f(INK), 200));
             }
             font::draw_text(img, zx + 3, zy + 2, &txt, f(PAPER));
-            placed.push([zx, zy, tw + 6, layout::ZONE_HEAD - 1]);
+            if let Some(tag) = tag {
+                extras::draw_entry_tag(img, char_t, zx + 3 + tw + 3, zy + 1, tag);
+            }
+            placed.push([zx, zy, tw + 6 + tag_w, layout::ZONE_HEAD - 1]);
         }
         placed.extend_from_slice(reserved);
         // Nameplates (and the boss's ballot) are never covered, even by must-show overlays.
@@ -1233,7 +1269,9 @@ impl Renderer {
             };
             let max_name = if is_sel || is_hov { 120 } else { CELL_W - 4 };
             let name = font::truncate(&a.label, max_name);
-            let nw = font::text_width(&name) + 5; // +2px pip +1px gap +2px pad
+            let verdict = scene.verdicts.get(&a.id).map(String::as_str);
+            let name_w = font::text_width(&name) + 5; // +2px pip +1px gap +2px pad
+            let nw = name_w + verdict.map(extras::chip_width).unwrap_or(0);
             let nh = font::GLYPH_H + 2;
             let nx = (cx - nw / 2).clamp(bounds[0], (bounds[0] + bounds[2] - nw).max(bounds[0]));
             let ny = (head_y - 10).clamp(bounds[1], (bounds[1] + bounds[3] - nh).max(bounds[1]));
@@ -1300,11 +1338,15 @@ impl Renderer {
                     | AgentState::Error
                     | AgentState::Queued
             );
-            let must_show = is_sel || is_hov || matches!(a.state, AgentState::NeedsYou | AgentState::Error);
+            let fail = scene.failures.get(&a.id).filter(|fi| t.saturating_sub(fi.at_ms) < FAILURE_SHOW_MS && !fi.hint.is_empty());
+            let must_show = is_sel || is_hov || fail.is_some() || matches!(a.state, AgentState::NeedsYou | AgentState::Error);
             let mut bubble_op = None;
-            if speaking && !a.activity.is_empty() && self.show.bubbles && self.label_gate(focus) {
-                let comp = compact_activity(&a.activity);
-                let max_b = if is_sel || is_hov { 124 } else { CELL_W - 4 };
+            if (speaking && !a.activity.is_empty() || fail.is_some()) && self.show.bubbles && (fail.is_some() || self.label_gate(focus)) {
+                let comp = match fail {
+                    Some(fi) => compact_activity(&fi.hint),
+                    None => compact_activity(&a.activity),
+                };
+                let max_b = if is_sel || is_hov || fail.is_some() { 124 } else { CELL_W - 4 };
                 let text = font::truncate(&comp, max_b);
                 let bw = font::text_width(&text) + 4;
                 let bh = font::GLYPH_H + 4;
@@ -1314,6 +1356,7 @@ impl Renderer {
                 let (bfg, bbg) = match a.state {
                     AgentState::NeedsYou => (f(INK), f(rgb(0xffd23f))),
                     AgentState::Error => (f(PAPER), f(rgb(0xe03c3c))),
+                    _ if fail.is_some() => (f(PAPER), f(rgb(0xe03c3c))),
                     _ if recent_fail => (f(PAPER), f(rgb(0xe03c3c))),
                     _ if is_sel || is_hov => (f(INK), f(PAPER)),
                     _ => (f(PAPER), with_alpha(f(rgb(0x1f2430)), 220)),
@@ -1347,6 +1390,7 @@ impl Renderer {
             }
 
             let icon = match a.state {
+                _ if fail.is_some() => Some(AgentState::Error),
                 AgentState::Thinking | AgentState::NeedsYou | AgentState::Error | AgentState::Queued => Some(a.state),
                 AgentState::Done if t.saturating_sub(a.last_event_ms) < DONE_CHEER_MS * 2 => Some(AgentState::Done),
                 _ => None,
@@ -1357,7 +1401,7 @@ impl Renderer {
                 placed.push([ix, iy, 9, 11]);
             }
 
-            planned.push(Planned { a, cx, head_y, is_sel, is_hov, show_name, name, name_rect, bubble: bubble_op, icon });
+            planned.push(Planned { a, cx, head_y, is_sel, is_hov, show_name, name, name_w, verdict, name_rect, bubble: bubble_op, icon });
         }
 
         for p in planned.into_iter().rev() {
@@ -1374,6 +1418,9 @@ impl Renderer {
                 }
                 fill(img, nx, ny, 2, nh, f(kind_color(p.a.kind)));
                 font::draw_text(img, nx + 3, ny + 1, &p.name, f(PAPER));
+            }
+            if let (true, Some(v)) = (p.show_name, p.verdict) {
+                extras::draw_chip(img, char_t, nx + p.name_w, ny, nh, v, t);
             }
             if let Some((text, [bx, by, bw, bh], fg, bg)) = p.bubble {
                 let border = f(INK);
@@ -1434,6 +1481,29 @@ enum DocKind {
     Plan,
     /// A finished turn handed to the boss (blue folder).
     Result,
+    /// A council critique (red folder).
+    Critique,
+    /// A rebuttal (orange folder).
+    Rebuttal,
+    /// A decision record (paper with a stamp).
+    Decision,
+    /// A sign-off sheet (paper with a green check).
+    Signoff,
+    /// An inspection report (clipboard).
+    Inspection,
+}
+
+/// Document icon for a ROSSO document type (falls back to the plain task/report art).
+fn doc_kind_for(doc_type: Option<&str>, task: bool) -> DocKind {
+    match doc_type {
+        Some("Critique") => DocKind::Critique,
+        Some("Rebuttal") => DocKind::Rebuttal,
+        Some("Decision Record") => DocKind::Decision,
+        Some("Sign-off Sheet") => DocKind::Signoff,
+        Some("Inspection Report") => DocKind::Inspection,
+        _ if task => DocKind::Task,
+        _ => DocKind::Report,
+    }
 }
 
 fn draw_doc(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, k: DocKind) {
@@ -1467,6 +1537,40 @@ fn draw_doc(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, k: DocKind) {
             outline(img, x, y, 7, 6, f(0x1d5a85));
             fill(img, x + 1, y + 2, 5, 1, f(0xd8f0ff));
         }
+        DocKind::Critique | DocKind::Rebuttal => {
+            let (body, edge, tab) = if k == DocKind::Critique { (0xd23c3c, 0x7a1f1f, 0xf08a8a) } else { (0xf29a3a, 0x8a4f12, 0xffd199) };
+            fill(img, x, y, 7, 6, f(body));
+            outline(img, x, y, 7, 6, f(edge));
+            fill(img, x, y - 1, 3, 1, f(edge));
+            fill(img, x + 1, y + 2, 5, 1, f(tab));
+            fill(img, x + 1, y + 4, 3, 1, f(tab));
+        }
+        DocKind::Decision => {
+            fill(img, x, y, 7, 8, f(0xfbfaf4));
+            outline(img, x, y, 7, 8, ink);
+            fill(img, x + 1, y + 1, 4, 1, f(0x8a8f9c));
+            fill(img, x + 1, y + 3, 5, 1, f(0x8a8f9c));
+            // round red stamp
+            fill(img, x + 3, y + 4, 3, 3, f(0xc02a2a));
+            put(img, x + 4, y + 5, f(0xfbfaf4));
+        }
+        DocKind::Signoff => {
+            fill(img, x, y, 7, 8, f(0xfbfaf4));
+            outline(img, x, y, 7, 8, ink);
+            fill(img, x + 1, y + 1, 4, 1, f(0x8a8f9c));
+            for (dx, dy) in [(1, 5), (2, 6), (3, 5), (4, 4), (5, 3)] {
+                put(img, x + dx, y + dy, f(0x2fae5e));
+            }
+        }
+        DocKind::Inspection => {
+            fill(img, x, y, 7, 9, f(0x8a5a36));
+            fill(img, x + 1, y + 1, 5, 7, f(0xfbfaf4));
+            fill(img, x + 2, y - 1, 3, 2, f(0xb9bec6));
+            for ky in [3, 5, 7] {
+                put(img, x + 2, y + ky, f(0x2fae5e));
+                fill(img, x + 3, y + ky, 2, 1, f(0x8a8f9c));
+            }
+        }
     }
 }
 
@@ -1490,7 +1594,7 @@ fn draw_vote(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, t: u64) {
 }
 
 /// The office postman: a navy-uniformed courier with a cap and a satchel, carrying a document.
-fn draw_courier(img: &mut RgbaImage, th: &Theme, seed: u64, fx: i32, fy: i32, phase: u8, task: bool) {
+fn draw_courier(img: &mut RgbaImage, th: &Theme, seed: u64, fx: i32, fy: i32, phase: u8, doc: DocKind) {
     let mut look = character::look_for(&format!("courier-{seed}"));
     look.hair = rgb(0x22335a); // cap
     look.hair_style = 0;
@@ -1509,7 +1613,7 @@ fn draw_courier(img: &mut RgbaImage, th: &Theme, seed: u64, fx: i32, fy: i32, ph
     put(img, fx - 3, fy - 14, f(0x6b4a2b));
     put(img, fx - 2, fy - 13, f(0x6b4a2b));
     fill(img, fx - 9, fy - 10, 4, 4, f(0x8a5a36));
-    draw_doc(img, th, fx + 4, fy - 13, if task { DocKind::Task } else { DocKind::Report });
+    draw_doc(img, th, fx + 4, fy - 13, doc);
 }
 
 /// Outdoor scene behind a back-wall window: sky (dusk-blue with stars at night), an optional
@@ -2440,5 +2544,133 @@ mod tests {
         let f1 = r.compose(&s, None, 320, 200, 10_000);
         let f2 = r.compose(&s, None, 320, 200, 10_400);
         assert_ne!(f1.as_raw(), f2.as_raw());
+    }
+
+    /// A scene with a session, a worker, a council (architect + advisors) and a Chief Inspector.
+    fn rosso_scene(now: u64) -> Scene {
+        use office_core::{Event, EventKind, Reducer, SourceKind};
+        let mut red = Reducer::new();
+        let mut ev = |k: EventKind| {
+            red.apply(Event { at_ms: now - 5_000, source: SourceKind::Demo, kind: k });
+        };
+        let seen = |id: &str, kind: AgentKind, label: &str, parent: Option<&str>, role: Option<&str>, cwd: Option<&str>| EventKind::AgentSeen {
+            id: id.into(),
+            kind,
+            label: Some(label.into()),
+            parent: parent.map(Into::into),
+            cwd: cwd.map(Into::into),
+            role: role.map(Into::into),
+            model: None,
+            slot: None,
+            pid: None,
+            resume_id: None,
+        };
+        ev(seen("cc:a", AgentKind::Claude, "cc:a", None, None, Some("/tmp/a")));
+        ev(seen("agy:1", AgentKind::Agy, "Chief Inspector\u{b7}neon-medium", None, Some("supervisor"), Some("/tmp/a")));
+        for (i, (role, label)) in [("agy-council-architect", "Chief Architect"), ("agy-council-advisor", "Security Seat"), ("agy-council-advisor", "Correctness Seat"), ("agy-council-advisor", "Reliability Seat")].iter().enumerate() {
+            ev(seen(&format!("cc-sub:a/c{i}"), AgentKind::ClaudeSub, label, Some("cc:a"), Some(role), None));
+        }
+        let mail = |from: &str, to: &str, ty: &str, v: Option<&str>| EventKind::RossoMail {
+            job: "j1".into(),
+            from_title: from.into(),
+            to_titles: vec![to.into()],
+            doc_type: ty.into(),
+            verdict: v.map(Into::into),
+            subject: "x".into(),
+            doc_path: None,
+            escalation: false,
+            body: String::new(),
+        };
+        ev(mail("Chief Architect", "Security Seat", "Task Card", None));
+        ev(mail("Security Seat", "Chief Architect", "Critique", Some("OBJECT")));
+        ev(mail("Correctness Seat", "Chief Architect", "Critique", Some("REVISE")));
+        ev(EventKind::Verdict { id: "agy:1".into(), verdict: "APPROVE".into() });
+        ev(EventKind::Failure {
+            id: "agy:1".into(),
+            info: office_core::FailureInfo { at_ms: now - 1_000, outcome: "ERROR/TIMEOUT".into(), diagnosis: "STALLED".into(), hint: "stalled: retry once".into() },
+        });
+        ev(EventKind::InTray { slug: "chief-inspector".into(), count: 3 });
+        ev(EventKind::Entrypoint { id: "cc:a".into(), entrypoint: "claude-desktop".into() });
+        ev(EventKind::RouterExtra(office_core::RouterExtra { orphans: 1, ..Default::default() }));
+        ev(EventKind::GuardDecision { agent: "agy-tester".into(), tool: "Bash".into(), reason: "not allowed".into(), deny: true });
+        let mut s = red.scene().clone();
+        for a in s.agents.values_mut() {
+            a.state = AgentState::Idle;
+            a.started_ms = 0;
+            a.last_event_ms = now;
+        }
+        s.guard.last_deny_ms = now - 500;
+        s.now_ms = now;
+        s
+    }
+
+    #[test]
+    fn rosso_extras_render_and_change_the_picture() {
+        let now = 9_000_000;
+        let full = rosso_scene(now);
+        assert_eq!(full.verdicts.len(), 3, "{:?}", full.verdicts);
+        assert_eq!(full.in_trays.get("agy:1"), Some(&3));
+        assert_eq!(full.entrypoints.len(), 1);
+        let mut base = full.clone();
+        base.guard = Default::default();
+        base.verdicts.clear();
+        base.failures.clear();
+        base.in_trays.clear();
+        base.entrypoints.clear();
+        base.report_types.clear();
+        base.router_extra = Default::default();
+        let mut r = quiet_renderer();
+        let b = r.compose(&base, None, 1280, 720, now);
+        let f = r.compose(&full, None, 1280, 720, now);
+        assert_ne!(b.as_raw(), f.as_raw());
+        // every extra changes pixels on its own
+        let mut each = [full.clone(), full.clone(), full.clone(), full.clone(), full.clone(), full.clone(), full.clone()];
+        each[0].guard.last_deny_ms = 0; // guard hand down
+        each[1].verdicts.clear();
+        each[2].failures.clear();
+        each[3].in_trays.clear();
+        each[4].entrypoints.clear();
+        each[5].router_extra = Default::default();
+        each[6].report_types.clear(); // no council round
+        for (i, e) in each.iter().enumerate() {
+            let img = r.compose(e, None, 1280, 720, now);
+            assert_ne!(img.as_raw(), f.as_raw(), "extra #{i} draws nothing");
+        }
+        if let Some(dir) = std::env::var_os("OFFICE_TEST_PNG_DIR") {
+            let _ = f.save(std::path::Path::new(&dir).join("rosso-extras.png"));
+        }
+    }
+
+    #[test]
+    fn doc_icons_follow_the_document_type() {
+        assert_eq!(doc_kind_for(Some("Critique"), false), DocKind::Critique);
+        assert_eq!(doc_kind_for(Some("Rebuttal"), false), DocKind::Rebuttal);
+        assert_eq!(doc_kind_for(Some("Decision Record"), false), DocKind::Decision);
+        assert_eq!(doc_kind_for(Some("Sign-off Sheet"), false), DocKind::Signoff);
+        assert_eq!(doc_kind_for(Some("Inspection Report"), false), DocKind::Inspection);
+        assert_eq!(doc_kind_for(Some("Work Order"), true), DocKind::Task);
+        assert_eq!(doc_kind_for(Some("Memo"), true), DocKind::Task);
+        assert_eq!(doc_kind_for(None, false), DocKind::Report);
+        // every icon draws something distinct
+        let th = Renderer::new(&Config::default());
+        let t = th.th(Layer::Characters);
+        let mut seen = Vec::new();
+        for k in [DocKind::Task, DocKind::Report, DocKind::Critique, DocKind::Rebuttal, DocKind::Decision, DocKind::Signoff, DocKind::Inspection] {
+            let mut img = RgbaImage::new(12, 14);
+            draw_doc(&mut img, t, 2, 3, k);
+            assert!(!seen.contains(img.as_raw()), "{k:?} duplicates another icon");
+            seen.push(img.as_raw().clone());
+        }
+    }
+
+    #[test]
+    fn verdict_chip_classes() {
+        assert_eq!(extras::chip_text("CHANGES_REQUESTED"), "CHG");
+        assert!(extras::chip_pulses("OBJECT") && extras::chip_pulses("REVISE") && extras::chip_pulses("FAIL"));
+        assert!(!extras::chip_pulses("APPROVE"));
+        assert_ne!(extras::chip_colors("PASS", 0).0, extras::chip_colors("FAIL", 0).0);
+        assert_ne!(extras::chip_colors("FAIL", 0).0, extras::chip_colors("FAIL", 400).0, "red pulses");
+        assert_eq!(extras::entry_tag("claude-desktop"), "DESKTOP");
+        assert_eq!(extras::entry_tag("cli"), "CLI");
     }
 }

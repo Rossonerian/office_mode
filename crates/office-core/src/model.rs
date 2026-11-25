@@ -157,9 +157,69 @@ pub struct Scene {
     /// Hand-offs between agents and to you, oldest first (bounded).
     #[serde(default)]
     pub reports: Vec<Report>,
+    /// ROSSO job name per report id (only for documents that came from a job's logbook/mailroom).
+    #[serde(default)]
+    pub report_jobs: BTreeMap<u64, String>,
+    /// ROSSO document type per report id (Critique, Rebuttal, Decision Record, ...).
+    #[serde(default)]
+    pub report_types: BTreeMap<u64, String>,
+    /// Last verdict (APPROVE, PASS, REVISE, OBJECT, ...) per agent.
+    #[serde(default)]
+    pub verdicts: BTreeMap<AgentId, String>,
+    /// Last failed agy call per agent (diagnosis + plain hint).
+    #[serde(default)]
+    pub failures: BTreeMap<AgentId, FailureInfo>,
+    /// Claude session entrypoint ("claude-desktop" | "cli") per `cc:<sid>` agent.
+    #[serde(default)]
+    pub entrypoints: BTreeMap<AgentId, String>,
+    /// Documents waiting in an agent's ROSSO in-tray.
+    #[serde(default)]
+    pub in_trays: BTreeMap<AgentId, u32>,
+    /// Security Desk (agy-guard) tallies.
+    #[serde(default)]
+    pub guard: GuardStats,
+    /// Extra agy-route --status fields (orphans, reserved RAM, role models).
+    #[serde(default)]
+    pub router_extra: RouterExtra,
     pub alerts: Vec<Alert>,
     pub router: RouterStatus,
     pub total_tokens: u64,
     pub total_cost_usd: f64,
     pub now_ms: u64,
+}
+
+/// A failed agy call, read from `~/.claude/run/failures/<run>.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FailureInfo {
+    pub at_ms: u64,
+    /// "ERROR" | "TIMEOUT" | other router outcome.
+    pub outcome: String,
+    /// "STALLED" | "ACTIVE_TOO_BIG" | "" (not diagnosed).
+    pub diagnosis: String,
+    /// Plain hint, e.g. "stalled: retry once".
+    pub hint: String,
+}
+
+/// Security Desk counters (bounded: at most `MAX_GUARD_REASONS` distinct reasons).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuardStats {
+    pub deny_total: u32,
+    pub by_reason: BTreeMap<String, u32>,
+    /// Event time of the last deny (0 = none yet).
+    pub last_deny_ms: u64,
+    pub last_agent: String,
+    pub last_tool: String,
+}
+
+pub const MAX_GUARD_REASONS: usize = 24;
+
+/// `agy-route --status` fields beyond `RouterStatus`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RouterExtra {
+    /// Leftover agy processes with no router (ORPHAN_AGY).
+    pub orphans: u32,
+    pub reserved_mb: Option<u32>,
+    pub would_start: Option<bool>,
+    /// role -> model (ROLE_MODELS).
+    pub role_models: BTreeMap<String, String>,
 }

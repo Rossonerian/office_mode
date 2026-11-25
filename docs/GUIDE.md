@@ -53,9 +53,47 @@ each session its own floor colour, so you can follow who belongs where.
 - `i` opens your **inbox**: only things addressed to you. New ones also pop up as a small card
   at the bottom right (`enter` reads it, `esc` dismisses it) and add a `✉ N` badge in the header.
 - The reader shows a one-line **status** (for example `✓ OK · Chief Architect (neon-xhigh) ·
-  3 m 58 s`), a **Summary**, **What it was asked** and **What it sent back**. Errors and
+  3 m 58 s`), and four views (Summary, Full, Brief, Raw; see below). Errors and
   questions for you are shown in red or yellow right under the title. Use `↑` `↓` / `PgUp`
   `PgDn` to scroll, `g` to go to the sender, `o` to resume its session, `esc` to go back.
+
+### The report reader in detail
+
+At the top of every report is a **header card**: a coloured verdict chip (green `PASS`, `APPROVE`,
+`SUPPORT`, `OK`; red `FAIL`, `OBJECT`, `ERROR`, `TIMEOUT`, `BLOCKED`; yellow `INSUFFICIENT`,
+`REVISE`; orange `CHANGES_REQUESTED`; magenta `NEEDS_USER_INPUT`), the ROSSO document type
+(`Memo`, `Critique`, ...), whether it is a brief, report or result, the title, who sent it to
+whom, how long ago, how long the call took and which model did it.
+
+Below it are four **views**. Switch with `Tab` or `←` `→`:
+
+| View | What it shows |
+|---|---|
+| Summary | the status line, the first paragraph, and short bullet cards for the lists it finds (Findings, Required changes, Risks, Open issues, Next steps, numbered items or the first table). Words like critical, major, minor, high or low colour the bullet. |
+| Full | the whole text, formatted |
+| Brief | what the agent was asked |
+| Raw | the unformatted text, exactly as received |
+
+File references such as `crates/x/y.rs:123` show in cyan and links are underlined. A scrollbar on
+the right and an `n/N` counter in the title show where you are in the list. `y` copies the
+current view as plain text to the clipboard, `w` saves the whole report as Markdown to
+`~/Downloads/rosso-report-<number>.md` (a message at the bottom tells you the path).
+
+## The sidebar tabs
+
+The bar at the top of the sidebar has four tabs. Press `1` to `4` or click one (the theme picker
+keeps its own `1`-`9` while it is open). With the sidebar hidden, pressing a number brings it back.
+
+| Tab | What it shows |
+|---|---|
+| `1 Agents` | the agent list, the selected agent's inspector, the router gauge and the alerts (the original view) |
+| `2 Jobs` | one block per ROSSO job: its name, the subject, how many documents it has, who sent the last one, a status (`active`, `idle`, `done`, `blocked`, `failed`), the latest verdict, how long ago, and a progress bar. The bar shows how far the job got through the pipeline: memo, task card, critique, decision, work order, sign-off, inspection. `↑` `↓` pick a job, `enter` opens its latest document. |
+| `3 Activity` | a timeline, newest first: `✉` a brief, `📁` a report, `⬆` a result for you, `⚠` an escalation, `✓` / `✗` a passed / failed verdict, `●` an agent that needs you, hit an error or finished. `↑` `↓` pick a line, `enter` reads the document. |
+| `4 Stats` | the router's busy slots against its capacity (green, then yellow, then red as it fills), memory pressure and queue, alert counts by level, token totals, a small graph of total cost over the last 30 minutes, another of how many agents were active, and bars for what each session has cost (top six). The graphs fill in as time passes: a point is taken every 10 seconds. |
+
+The header also shows a compact strip on the right when the window is wide enough:
+`● 3 active · ✉ 2 · $4.12 · router 2/5` (agents working, unread inbox items, total cost, busy and
+total router slots).
 
 ## Keys
 
@@ -64,7 +102,9 @@ each session its own floor colour, so you can follow who belongs where.
 | `↑ ↓` / `j k`, `g G` | pick an agent (or click one), first / last |
 | `Tab` | jump to the next agent that needs attention |
 | `enter` | agent details (scroll with `PgUp` / `PgDn`) |
+| `1` `2` `3` `4` | sidebar tabs: Agents, Jobs, Activity, Stats |
 | `r` / `i` | reports / inbox |
+| `Tab` `←` `→`, `y`, `w` | inside a report: change view, copy the view, save as Markdown |
 | `a` / `d` | approve / deny a permission the agent is asking for |
 | `x` | cancel the selected agy call (asks `y`/`n`) |
 | `o` | resume the selected Claude session in a terminal |

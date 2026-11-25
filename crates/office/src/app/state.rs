@@ -2,6 +2,8 @@
 //! Everything here is pure over (Scene, ThemeHost, Control) so it can be tested without a tty.
 use super::chime::{Chime, Chimer};
 use super::fmt;
+use super::panels::{self, SideTab, StateNote};
+use super::reader::{self, ReaderTab};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use office_core::{config::{ShowConfig, ThemeMix}, model::AgentKind, Agent, AgentId, AgentState, AlertLevel, Scene};
 use ratatui::layout::Rect;
@@ -23,6 +25,14 @@ pub trait Control {
     fn resume_claude(&mut self, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String>;
     fn notify(&mut self, title: &str, body: &str);
     fn play_sound(&mut self, _chime: Chime) {}
+    /// Put text on the system clipboard (non-blocking).
+    fn copy_text(&mut self, _text: &str) -> anyhow::Result<()> {
+        anyhow::bail!("clipboard not available")
+    }
+    /// Save a file into the downloads folder; returns the path to show.
+    fn save_file(&mut self, _name: &str, _content: &str) -> anyhow::Result<String> {
+        anyhow::bail!("saving not available")
+    }
 }
 
 pub const PRESET_ORDER: [&str; 6] = ["procedural", "modern", "cozy", "midnight", "retro", "cyberpunk"];
@@ -110,6 +120,8 @@ pub struct LayoutCache {
     pub detail_max_scroll: u16,
     /// Terminal font size in pixels (w, h) when an image protocol is active.
     pub font_px: Option<(u16, u16)>,
+    /// The sidebar's tab bar (empty when not drawn).
+    pub side_tabs: Rect,
 }
 
 pub fn mix_eq(a: &ThemeMix, b: &ThemeMix) -> bool {
@@ -204,6 +216,16 @@ pub struct App {
     pub dirty: bool,
     /// Theme restore requested where no view is at hand (mouse); the event loop applies it.
     pub pending_mix: Option<ThemeMix>,
+    /// Which sidebar tab is showing (keys 1-4).
+    pub side_tab: SideTab,
+    pub jobs_sel: usize,
+    pub feed_sel: usize,
+    /// Notable agent state changes for the Activity tab.
+    pub state_log: VecDeque<StateNote>,
+    /// Cost / active-agent history for the Stats tab.
+    pub samples: panels::Samples,
+    /// The report reader's current tab.
+    pub reader_tab: ReaderTab,
 }
 
 impl App {
@@ -236,6 +258,19 @@ impl App {
             layout: LayoutCache::default(),
             dirty: true,
             pending_mix: None,
+            side_tab: SideTab::Agents,
+            jobs_sel: 0,
+            feed_sel: 0,
+            state_log: VecDeque::new(),
+            samples: panels::Samples::default(),
+            reader_tab: ReaderTab::Summary,
+        }
+    }
+
+    /// Housekeeping tick: sample history for the Stats tab (every 10 s).
+    pub fn tick(&mut self, scene: &Scene, now_ms: u64) {
+        if self.samples.sample(scene, now_ms) && self.side_tab == SideTab::Stats {
+            self.dirty = true;
         }
     }
 
@@ -300,6 +335,12 @@ impl App {
                 }
             }
             let prev = self.prev_states.insert(a.id.clone(), a.state);
+            if prev.is_some_and(|p| p != a.state) && panels::notable(a.state) {
+                self.state_log.push_back(StateNote { at_ms: now_ms, label: a.label.clone(), state: a.state });
+                while self.state_log.len() > panels::MAX_STATE_NOTES {
+                    self.state_log.pop_front();
+                }
+            }
             if a.state == AgentState::NeedsYou && prev != Some(AgentState::NeedsYou) {
                 entered_needs_you.push(a);
             }
@@ -680,6 +721,38 @@ impl App {
                         let step = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) { 1 } else { 10 };
                         self.detail_scroll = self.detail_scroll.saturating_sub(step);
                     }
+                    KeyCode::Tab | KeyCode::Right => {
+                        self.reader_tab = self.reader_tab.next();
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::BackTab | KeyCode::Left => {
+                        self.reader_tab = self.reader_tab.prev();
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('y') => match scene.reports.iter().find(|r| r.id == id) {
+                        Some(r) => {
+                            let text = reader::tab_plain(r, self.reader_tab);
+                            match ctl.copy_text(&text) {
+                                Ok(()) => self.toast(
+                                    format!("copied {} tab ({} chars)", self.reader_tab.label(), text.chars().count()),
+                                    AlertLevel::Info,
+                                    now_ms,
+                                ),
+                                Err(e) => self.toast(format!("copy failed: {e}"), AlertLevel::Critical, now_ms),
+                            }
+                        }
+                        None => self.toast("report is gone", AlertLevel::Info, now_ms),
+                    },
+                    KeyCode::Char('w') => match scene.reports.iter().find(|r| r.id == id) {
+                        Some(r) => {
+                            let md = reader::report_markdown(r, scene.now_ms.max(now_ms));
+                            match ctl.save_file(&format!("rosso-report-{id}.md"), &md) {
+                                Ok(path) => self.toast(format!("saved {path}"), AlertLevel::Info, now_ms),
+                                Err(e) => self.toast(format!("save failed: {e}"), AlertLevel::Critical, now_ms),
+                            }
+                        }
+                        None => self.toast("report is gone", AlertLevel::Info, now_ms),
+                    },
                     KeyCode::Char('n') | KeyCode::Char('p') => {
                         let next = match (pos, key.code) {
                             (Some(i), KeyCode::Char('n')) => list_ids.get(i + 1).copied(),
@@ -799,6 +872,51 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.dismiss_card(scene);
+                    return Outcome::Continue;
+                }
+                _ => {}
+            }
+        }
+
+        if let KeyCode::Char(c) = key.code {
+            if let Some(tab) = SideTab::from_digit(c) {
+                self.side_tab = tab;
+                self.sidebar = true;
+                return Outcome::Continue;
+            }
+        }
+        if self.sidebar && matches!(self.side_tab, SideTab::Jobs | SideTab::Activity) {
+            let activity = self.side_tab == SideTab::Activity;
+            let n = if activity { panels::feed(scene, &self.state_log, panels::FEED_MAX).len() } else { panels::jobs(scene).len() };
+            let sel = if activity { &mut self.feed_sel } else { &mut self.jobs_sel };
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *sel = (*sel).min(n.saturating_sub(1)).saturating_sub(1);
+                    return Outcome::Continue;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = (*sel + 1).min(n.saturating_sub(1));
+                    return Outcome::Continue;
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    *sel = 0;
+                    return Outcome::Continue;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    *sel = n.saturating_sub(1);
+                    return Outcome::Continue;
+                }
+                KeyCode::Enter => {
+                    let i = (*sel).min(n.saturating_sub(1));
+                    let target = if activity {
+                        panels::feed(scene, &self.state_log, panels::FEED_MAX).get(i).and_then(|f| f.report)
+                    } else {
+                        panels::jobs(scene).get(i).map(|j| j.last_report)
+                    };
+                    match target {
+                        Some(id) => self.open_report(id, None, false),
+                        None => self.toast(if n == 0 { "nothing here yet" } else { "no document for this line" }, AlertLevel::Info, now_ms),
+                    }
                     return Outcome::Continue;
                 }
                 _ => {}
@@ -966,11 +1084,11 @@ impl App {
     ) -> bool {
         if self.popup != Popup::None {
             return match ev.kind {
-                MouseEventKind::ScrollUp if matches!(self.popup, Popup::Detail(_)) => {
+                MouseEventKind::ScrollUp if matches!(self.popup, Popup::Detail(_) | Popup::ReportView { .. }) => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(2);
                     true
                 }
-                MouseEventKind::ScrollDown if matches!(self.popup, Popup::Detail(_)) => {
+                MouseEventKind::ScrollDown if matches!(self.popup, Popup::Detail(_) | Popup::ReportView { .. }) => {
                     self.detail_scroll = self.detail_scroll.saturating_add(2).min(self.layout.detail_max_scroll);
                     true
                 }
@@ -1022,6 +1140,15 @@ impl App {
             };
         }
         let (x, y) = (ev.column, ev.row);
+        let tb = self.layout.side_tabs;
+        if self.sidebar && tb.width > 0 && x >= tb.x && x < tb.x + tb.width && y >= tb.y && y < tb.y + tb.height {
+            if let Some(t) = SideTab::at_offset(x - tb.x) {
+                self.side_tab = t;
+                self.dirty = true;
+                return true;
+            }
+            return false;
+        }
         let r = self.layout.agent_rows;
         if self.sidebar && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
             if let Some(id) = self.layout.row_ids.get((y - r.y) as usize).cloned() {
@@ -1760,5 +1887,143 @@ mod tests {
         h.press(key('L'));
         assert!(h.app.show.names && h.app.show.bubbles);
         assert_eq!(h.toast(), "name tags + bubbles on");
+    }
+
+    fn reader_report(id: u64) -> office_core::Report {
+        office_core::Report {
+            id, at_ms: 1, kind: office_core::ReportKind::Report, from: "cc:dice".into(), from_label: "cc·DICE".into(),
+            to: None, to_label: "you".into(), title: "Review: plan [PASS]".into(),
+            body: "STATUS: OK\nRESPONSE:\nAll good.\n\n## Findings\n- one".into(), brief: "check it".into(),
+        }
+    }
+
+    #[test]
+    fn reader_tabs_switch_with_tab_and_arrows() {
+        let mut h = Harness::new();
+        h.scene.reports.push(reader_report(5));
+        h.app.popup = Popup::ReportView { id: 5, only: None, inbox: false };
+        assert_eq!(h.app.reader_tab, ReaderTab::Summary);
+        h.press(code(KeyCode::Tab));
+        assert_eq!(h.app.reader_tab, ReaderTab::Full);
+        h.press(code(KeyCode::Right));
+        assert_eq!(h.app.reader_tab, ReaderTab::Brief);
+        h.press(code(KeyCode::Right));
+        assert_eq!(h.app.reader_tab, ReaderTab::Raw);
+        h.press(code(KeyCode::Right));
+        assert_eq!(h.app.reader_tab, ReaderTab::Summary);
+        h.press(code(KeyCode::Left));
+        assert_eq!(h.app.reader_tab, ReaderTab::Raw);
+        h.press(code(KeyCode::BackTab));
+        assert_eq!(h.app.reader_tab, ReaderTab::Brief);
+        assert!(matches!(h.app.popup, Popup::ReportView { id: 5, .. }), "tabs keep the popup open");
+    }
+
+    #[test]
+    fn reader_y_copies_the_current_tab_and_w_saves_markdown() {
+        let mut h = Harness::new();
+        h.scene.reports.push(reader_report(5));
+        h.app.popup = Popup::ReportView { id: 5, only: None, inbox: false };
+        h.app.reader_tab = ReaderTab::Brief;
+        h.press(key('y'));
+        assert_eq!(h.ctl.clipboard, vec!["check it".to_string()]);
+        assert!(h.toast().starts_with("copied Brief tab"), "{}", h.toast());
+        h.app.reader_tab = ReaderTab::Raw;
+        h.press(key('y'));
+        assert_eq!(h.ctl.clipboard[1], h.scene.reports[0].body);
+        h.press(key('w'));
+        assert_eq!(h.ctl.saved.len(), 1);
+        assert_eq!(h.ctl.saved[0].0, "rosso-report-5.md");
+        assert!(h.ctl.saved[0].1.starts_with("# Review: plan [PASS]") && h.ctl.saved[0].1.contains("All good."));
+        assert_eq!(h.toast(), "saved ~/Downloads/rosso-report-5.md");
+        h.ctl.fail = true;
+        h.press(key('y'));
+        assert!(h.toast().starts_with("copy failed"), "{}", h.toast());
+        h.press(key('w'));
+        assert!(h.toast().starts_with("save failed"), "{}", h.toast());
+    }
+
+    #[test]
+    fn digits_switch_sidebar_tabs_but_not_inside_popups() {
+        let mut h = Harness::new();
+        assert_eq!(h.app.side_tab, SideTab::Agents);
+        h.press(key('2'));
+        assert_eq!(h.app.side_tab, SideTab::Jobs);
+        h.press(key('3'));
+        assert_eq!(h.app.side_tab, SideTab::Activity);
+        h.press(key('4'));
+        assert_eq!(h.app.side_tab, SideTab::Stats);
+        h.press(key('1'));
+        assert_eq!(h.app.side_tab, SideTab::Agents);
+        h.press(key('5'));
+        assert_eq!(h.app.side_tab, SideTab::Agents);
+        // The theme picker keeps its own 1-9.
+        h.press(key('t'));
+        h.press(key('3'));
+        assert!(matches!(h.app.popup, Popup::Theme { sel: 2, .. }), "{:?}", h.app.popup);
+        assert_eq!(h.app.side_tab, SideTab::Agents);
+        h.press(code(KeyCode::Esc));
+        // Hidden sidebar comes back when you pick a tab.
+        h.app.sidebar = false;
+        h.press(key('4'));
+        assert!(h.app.sidebar && h.app.side_tab == SideTab::Stats);
+    }
+
+    #[test]
+    fn jobs_and_activity_lists_navigate_and_open_reports() {
+        let mut h = Harness::new();
+        let mk = |id: u64, at: u64, title: &str| office_core::Report {
+            id, at_ms: at, kind: office_core::ReportKind::Report, from: "rosso:A".into(), from_label: "A".into(),
+            to: Some("rosso:B".into()), to_label: "B".into(), title: title.into(), body: "x".into(), brief: String::new(),
+        };
+        h.scene.reports.push(mk(1, 10, "Memo: one"));
+        h.scene.reports.push(mk(2, 20, "Memo: two"));
+        h.scene.report_jobs.insert(1, "job-a".into());
+        h.scene.report_jobs.insert(2, "job-b".into());
+        h.press(key('2'));
+        h.press(key('j'));
+        assert_eq!(h.app.jobs_sel, 1);
+        h.press(key('j'));
+        assert_eq!(h.app.jobs_sel, 1, "clamped");
+        h.press(code(KeyCode::Enter));
+        // Newest job first: row 1 is job-a (report 1).
+        assert!(matches!(h.app.popup, Popup::ReportView { id: 1, .. }), "{:?}", h.app.popup);
+        h.press(code(KeyCode::Esc));
+        h.press(code(KeyCode::Esc));
+        h.press(key('3'));
+        h.press(code(KeyCode::Enter));
+        assert!(matches!(h.app.popup, Popup::ReportView { id: 2, .. }), "newest hand-off first: {:?}", h.app.popup);
+        h.press(code(KeyCode::Esc));
+        h.press(code(KeyCode::Esc));
+        // On the agents tab, j/k still move the agent selection.
+        h.press(key('1'));
+        let before = h.app.selected.clone();
+        h.press(key('j'));
+        assert_ne!(h.app.selected, before);
+    }
+
+    #[test]
+    fn activity_log_records_notable_state_changes_and_samples_are_bounded() {
+        let mut h = Harness::new();
+        h.scene.agents.get_mut("cc:dice").unwrap().state = AgentState::NeedsYou;
+        h.app.observe(&h.scene, 7_000, &mut h.ctl);
+        assert_eq!(h.app.state_log.len(), 1);
+        assert_eq!(h.app.state_log[0].label, "cc·DICE");
+        h.app.observe(&h.scene, 8_000, &mut h.ctl);
+        assert_eq!(h.app.state_log.len(), 1, "no repeat without a change");
+        for i in 0..(panels::SAMPLE_CAP as u64 + 40) {
+            h.app.tick(&h.scene, 100_000 + i * 10_000);
+        }
+        assert_eq!(h.app.samples.cost.len(), panels::SAMPLE_CAP);
+    }
+
+    #[test]
+    fn clicking_the_tab_bar_switches_tabs() {
+        let mut h = Harness::new();
+        h.app.layout.side_tabs = Rect::new(80, 1, 40, 1);
+        let click = |x| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: 1, modifiers: KeyModifiers::NONE };
+        assert!(h.app.handle_mouse_at(click(80 + 10), &h.scene, &|_, _| None, 100));
+        assert_eq!(h.app.side_tab, SideTab::Jobs);
+        assert!(h.app.handle_mouse_at(click(80 + 28), &h.scene, &|_, _| None, 100));
+        assert_eq!(h.app.side_tab, SideTab::Stats);
     }
 }

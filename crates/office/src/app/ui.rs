@@ -2,15 +2,19 @@
 use super::fmt::*;
 use super::kitty;
 use super::reader;
+use super::panels::{self, SideTab};
 use super::state::{layer_get, App, Popup, LAYERS};
 use super::{guarded, OfficeView};
 use crate::render;
 use office_core::{model::AgentKind, Agent, AlertLevel, Scene};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{
+        Bar, BarChart, BarGroup, Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Row,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs, Wrap,
+    },
     Frame,
 };
 use ratatui_image::{
@@ -310,71 +314,6 @@ fn draw_card(f: &mut Frame, app: &mut App, scene: &Scene, office: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The full text of one hand-off, friendly: who and when, a one-line status, a summary, what it was
-/// asked and what it sent back. `width` is the popup's inner width; text is wrapped by the reader.
-pub fn report_lines(r: &office_core::Report, now_ms: u64, width: usize) -> Vec<Line<'static>> {
-    let (tag, c) = report_kind_tag(r.kind);
-    let dim = Style::new().fg(Color::DarkGray);
-    let margin = if width >= 30 { 2 } else { 0 };
-    let w = width.saturating_sub(margin * 2).clamp(12, reader::MAX_WIDTH);
-    let pad = " ".repeat(margin);
-    let mut v: Vec<Line<'static>> = vec![
-        Line::from(vec![
-            Span::styled(tag.trim().to_string(), Style::new().fg(c).bold()),
-            Span::raw(format!("  {} → {}", r.from_label, r.to_label)),
-            Span::styled(format!("   {} ago", fmt_ago(now_ms, r.at_ms)), dim),
-        ]),
-        Line::from(Span::styled(r.title.clone(), Style::new().bold())),
-    ];
-    let parsed = reader::parse_body(&r.body);
-    if let Some((st, col)) = reader::status_line(&parsed) {
-        v.push(Line::from(Span::styled(st, Style::new().fg(col).bold())));
-    }
-    for (msg, col) in reader::alert_lines(&parsed) {
-        v.extend(reader::render_markdown(&msg, w).into_iter().map(|l| l.patch_style(Style::new().fg(col).bold())));
-    }
-    let header = |name: &str| Line::from(Span::styled(name.to_string(), Style::new().fg(Color::Yellow).bold()));
-    let content = parsed.content.trim();
-    let nonblank = content.lines().filter(|l| !l.trim().is_empty()).count();
-    let summary = reader::summary_of(content);
-    if nonblank > 8 && !summary.trim().is_empty() {
-        v.push(Line::raw(""));
-        v.push(header("Summary"));
-        v.extend(reader::render_markdown(&summary, w));
-        v.push(Line::from(Span::styled("─".repeat(w.min(48)), dim)));
-    }
-    let brief = r.brief.trim();
-    if !brief.is_empty() {
-        v.push(Line::raw(""));
-        v.push(header("What it was asked"));
-        let mut b = reader::render_markdown(brief, w);
-        if b.len() > 8 {
-            let more = b.len() - 8;
-            b.truncate(8);
-            b.push(Line::from(Span::styled(format!("… {more} more lines"), dim)));
-        }
-        v.extend(b.into_iter().map(|l| l.patch_style(Style::new().fg(Color::Gray))));
-    }
-    if !content.is_empty() {
-        v.push(Line::raw(""));
-        v.push(header(match r.kind {
-            office_core::ReportKind::Task => "The brief",
-            _ => "What it sent back",
-        }));
-        v.extend(reader::render_markdown(content, w));
-    }
-    if brief.is_empty() && content.is_empty() {
-        v.push(Line::raw(""));
-        v.push(Line::from(Span::styled("(no text captured: the brief is filled in when the report comes back)", dim)));
-    }
-    if margin > 0 {
-        for l in v.iter_mut() {
-            l.spans.insert(0, Span::raw(pad.clone()));
-        }
-    }
-    v
-}
-
 pub fn draw(f: &mut Frame, app: &mut App, scene: &Scene, office: &mut OfficeCtx, now_ms: u64) {
     let [header, body, footer] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
@@ -400,6 +339,7 @@ pub fn draw(f: &mut Frame, app: &mut App, scene: &Scene, office: &mut OfficeCtx,
             app.layout.agent_rows = Rect::default();
             app.layout.alert_rows = Rect::default();
             app.layout.alert_agent_ids.clear();
+            app.layout.side_tabs = Rect::default();
         }
     }
     draw_card(f, app, scene, office_area);
@@ -456,7 +396,42 @@ fn draw_header(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
     if app.demo {
         spans.push(Span::styled("  │ DEMO", Style::new().fg(Color::Yellow).bold()));
     }
+    let left_w: usize = spans.iter().map(|s| s.width()).sum();
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let strip = status_strip(app, scene);
+    let strip_w: usize = strip.iter().map(|s| s.width()).sum();
+    if area.width as usize >= left_w + strip_w + 3 {
+        let r = Rect::new(area.x + area.width - strip_w as u16 - 1, area.y, strip_w as u16, 1);
+        f.render_widget(Paragraph::new(Line::from(strip)), r);
+    }
+}
+
+/// The compact ROSSO status strip on the right of the header: "● 3 active · ✉ 2 · $4.12 · router 2/5".
+pub fn status_strip(app: &App, scene: &Scene) -> Vec<Span<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let active = panels::active_count(scene);
+    let unread = app.unread_count(scene);
+    let r = &scene.router;
+    let cap = r.capacity.or(r.max_concurrent);
+    let router = match cap {
+        Some(c) => format!("router {}/{}", r.busy_slots, c),
+        None => format!("router {}/?", r.busy_slots),
+    };
+    let rc = match cap {
+        Some(c) if c > 0 && r.busy_slots >= c => Color::LightRed,
+        Some(c) if c > 0 && r.busy_slots * 3 >= c * 2 => Color::Yellow,
+        _ => Color::Green,
+    };
+    vec![
+        Span::styled("● ", Style::new().fg(if active > 0 { Color::Green } else { Color::DarkGray })),
+        Span::styled(format!("{active} active"), Style::new().fg(Color::Gray)),
+        Span::styled(" · ", dim),
+        Span::styled(format!("✉ {unread}"), Style::new().fg(if unread > 0 { Color::Yellow } else { Color::DarkGray }).bold()),
+        Span::styled(" · ", dim),
+        Span::styled(fmt_cost(scene.total_cost_usd), Style::new().fg(Color::Gray)),
+        Span::styled(" · ", dim),
+        Span::styled(router, Style::new().fg(rc)),
+    ]
 }
 
 fn draw_footer(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
@@ -485,7 +460,7 @@ fn draw_footer(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
             spans.push(Span::styled("  o resume", Style::new().fg(Color::Cyan)));
         }
     }
-    spans.push(Span::styled("  Tab jump  r reports  t theme  [ ] cycle  T mix  v view  L labels  s side  ? help", dim));
+    spans.push(Span::styled("  1-4 tabs  Tab jump  r reports  t theme  [ ] cycle  T mix  v view  L labels  s side  ? help", dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -620,6 +595,44 @@ pub fn ctx_bar(pct: f32, width: usize) -> String {
 }
 
 fn draw_sidebar(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u64) {
+    let (bar, content) = if area.height >= 6 {
+        let [b, c] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        (b, c)
+    } else {
+        (Rect::default(), area)
+    };
+    app.layout.side_tabs = bar;
+    if bar.height > 0 {
+        draw_tab_bar(f, app, bar);
+    }
+    match app.side_tab {
+        SideTab::Agents => draw_agents_panel(f, app, scene, content, now_ms),
+        other => {
+            app.layout.row_ids.clear();
+            app.layout.agent_rows = Rect::default();
+            app.layout.alert_rows = Rect::default();
+            app.layout.alert_agent_ids.clear();
+            match other {
+                SideTab::Jobs => draw_jobs(f, app, scene, content, now_ms),
+                SideTab::Activity => draw_activity(f, app, scene, content, now_ms),
+                _ => draw_stats(f, app, scene, content),
+            }
+        }
+    }
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let titles: Vec<Line> = SideTab::ALL.iter().map(|t| Line::from(t.title())).collect();
+    let tabs = Tabs::new(titles)
+        .select(app.side_tab.index())
+        .padding("", "")
+        .divider(Span::styled("│", Style::new().fg(Color::DarkGray)))
+        .style(Style::new().fg(Color::Gray))
+        .highlight_style(Style::new().fg(Color::Black).bg(Color::Rgb(0xE0, 0x7A, 0x3F)).bold());
+    f.render_widget(tabs, area);
+}
+
+fn draw_agents_panel(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u64) {
     if area.height < 12 {
         app.layout.alert_rows = Rect::default();
         app.layout.alert_agent_ids.clear();
@@ -637,6 +650,223 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms:
         draw_agents(f, app, scene, agents, now_ms);
         draw_router(f, scene, router);
         draw_alerts(f, app, scene, alerts, now_ms);
+    }
+}
+
+/// Short chip text for narrow places.
+fn short_chip(v: reader::Verdict) -> Span<'static> {
+    reader::chip(&trunc(v.label(), 8), v.color())
+}
+
+fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
+    let rows = panels::jobs(scene);
+    let block = Block::bordered().title(format!(" Jobs ({}) ", rows.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width < 8 {
+        return;
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("No ROSSO jobs yet. They appear here when agents send ROSSO documents (memos, task cards, critiques...).")
+                .style(dim)
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let w = inner.width as usize;
+    let cap = (inner.height / 3).max(1) as usize;
+    let sel = app.jobs_sel.min(rows.len() - 1);
+    let offset = if sel >= cap { sel + 1 - cap } else { 0 };
+    for (k, j) in rows.iter().skip(offset).take(cap).enumerate() {
+        let y = inner.y + (k as u16) * 3;
+        if y + 2 > inner.y + inner.height {
+            break;
+        }
+        let h = 3.min(inner.y + inner.height - y);
+        let selected = offset + k == sel;
+        let bg = if selected { Style::new().bg(Color::Rgb(0x2a, 0x30, 0x40)) } else { Style::new() };
+        let block_area = Rect::new(inner.x, y, inner.width, h);
+        f.render_widget(Paragraph::new("").style(bg), block_area);
+        let mark = if selected { "▶ " } else { "  " };
+        let mut right: Vec<Span<'static>> = vec![Span::styled(j.status.label(), Style::new().fg(j.status.color()).bold())];
+        if let Some(v) = j.verdict {
+            right.push(Span::raw(" "));
+            right.push(short_chip(v));
+        }
+        right.push(Span::styled(format!(" {}", fmt_ago(now_ms, j.last_ms)), dim));
+        let right_w: usize = right.iter().map(|s| s.width()).sum();
+        let name = trunc(&j.name, w.saturating_sub(2 + right_w + 1));
+        let pad = w.saturating_sub(2 + name.chars().count() + right_w);
+        let mut l1 = vec![Span::styled(mark, Style::new().fg(Color::Yellow)), Span::styled(name, Style::new().bold()), Span::raw(" ".repeat(pad))];
+        l1.extend(right);
+        f.render_widget(Paragraph::new(Line::from(l1)).style(bg), Rect::new(inner.x, y, inner.width, 1));
+        if h >= 2 {
+            let meta = format!("{} · {} doc{} · {}", j.title, j.docs, if j.docs == 1 { "" } else { "s" }, j.flow);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("  {}", trunc(&meta, w.saturating_sub(2))), Style::new().fg(Color::Gray)))).style(bg),
+                Rect::new(inner.x, y + 1, inner.width, 1),
+            );
+        }
+        if h >= 3 {
+            let label = match j.stage {
+                Some(s) => format!("{}/{} {}", s + 1, panels::STAGES.len(), panels::STAGES[s]),
+                None => format!("0/{} no stage yet", panels::STAGES.len()),
+            };
+            let g = LineGauge::default()
+                .ratio(j.ratio.clamp(0.0, 1.0))
+                .label(Span::styled(format!("  {label} "), dim))
+                .filled_style(Style::new().fg(j.status.color()))
+                .unfilled_style(Style::new().fg(Color::Rgb(0x33, 0x36, 0x40)))
+                .style(bg);
+            f.render_widget(g, Rect::new(inner.x, y + 2, inner.width, 1));
+        }
+    }
+}
+
+fn draw_activity(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
+    let items = panels::feed(scene, &app.state_log, panels::FEED_MAX);
+    let block = Block::bordered().title(format!(" Activity ({}) ", items.len()));
+    let inner = block.inner(area);
+    if items.is_empty() {
+        f.render_widget(
+            Paragraph::new("Nothing yet. Hand-offs and agents needing you show up here.").style(Style::new().fg(Color::DarkGray)).wrap(Wrap { trim: true }).block(block),
+            area,
+        );
+        return;
+    }
+    let w = inner.width as usize;
+    let list: Vec<ListItem> = items
+        .iter()
+        .map(|it| {
+            let icon_w = Span::raw(it.icon).width();
+            let budget = w.saturating_sub(5 + icon_w + 1);
+            let text = if it.route.is_empty() { it.text.clone() } else { format!("{} · {}", it.route, it.text) };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:>4} ", fmt_ago(now_ms, it.at_ms)), Style::new().fg(Color::DarkGray)),
+                Span::styled(it.icon, Style::new().fg(it.color)),
+                Span::raw(" "),
+                Span::styled(trunc(&text, budget), Style::new().fg(Color::Gray)),
+            ]))
+        })
+        .collect();
+    let mut st = ListState::default().with_selected(Some(app.feed_sel.min(items.len() - 1)));
+    let l = List::new(list).block(block).highlight_style(Style::new().bg(Color::Rgb(0x2a, 0x30, 0x40)).add_modifier(Modifier::BOLD));
+    f.render_stateful_widget(l, area, &mut st);
+}
+
+fn draw_stats(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
+    let block = Block::bordered().title(" Stats ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width < 10 {
+        return;
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    let h = inner.height as usize;
+    let mut cons = vec![Constraint::Length(1); 4];
+    let mut used = 4;
+    let (mut has_cost, mut has_active, mut has_bars) = (false, false, false);
+    if h >= used + 2 {
+        cons.push(Constraint::Length(2));
+        has_cost = true;
+        used += 2;
+    }
+    if h >= used + 2 {
+        cons.push(Constraint::Length(2));
+        has_active = true;
+        used += 2;
+    }
+    if h >= used + 4 {
+        cons.push(Constraint::Min(4));
+        has_bars = true;
+    }
+    let areas = Layout::vertical(cons).split(inner);
+    let w = inner.width as usize;
+
+    // Router capacity gauge, coloured by how full it is.
+    let (label, ratio) = router_gauge_label(scene);
+    let color = if ratio >= 1.0 { Color::LightRed } else if ratio >= 0.67 { Color::Yellow } else { Color::Green };
+    f.render_widget(
+        Gauge::default().ratio(ratio).label(format!("router {label}")).gauge_style(Style::new().fg(color).bg(Color::Rgb(0x22, 0x22, 0x22))),
+        areas[0],
+    );
+    let (pl, pc) = pressure_label(scene.router.pressure);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("pressure "),
+            Span::styled(pl, Style::new().fg(pc).bold()),
+            Span::styled(trunc(&format!(" · queued {} · free {}", scene.router.queued, scene.router.free_mb.map(|v| format!("{v} MB")).unwrap_or_else(|| "?".into())), w.saturating_sub(12)), dim),
+        ])),
+        areas[1],
+    );
+    let (ai, aw, ac) = panels::alert_counts(scene);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("alerts "),
+            Span::styled(format!("info {ai}"), Style::new().fg(level_color(AlertLevel::Info))),
+            Span::raw(" · "),
+            Span::styled(format!("warn {aw}"), Style::new().fg(level_color(AlertLevel::Warn))),
+            Span::raw(" · "),
+            Span::styled(format!("crit {ac}"), Style::new().fg(if ac > 0 { Color::LightRed } else { Color::DarkGray })),
+        ])),
+        areas[2],
+    );
+    let (tin, tout) = panels::token_totals(scene);
+    f.render_widget(Paragraph::new(trunc(&format!("tokens in {} · out {}", fmt_tokens(tin), fmt_tokens(tout)), w)), areas[3]);
+
+    let mut next = 4;
+    if has_cost {
+        let a = areas[next];
+        next += 1;
+        let series = app.samples.cost_series(a.width as usize);
+        let delta = match (app.samples.cost.front(), app.samples.cost.back()) {
+            (Some(a0), Some(b0)) if app.samples.cost.len() > 1 => format!("  +{}", fmt_cost((b0 - a0).max(0.0))),
+            _ => "  collecting…".into(),
+        };
+        let [l, sp] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(a);
+        f.render_widget(Paragraph::new(trunc(&format!("cost 30m  now {}{delta}", fmt_cost(scene.total_cost_usd)), w)).style(Style::new().fg(Color::Gray)), l);
+        f.render_widget(Sparkline::default().data(&series).style(Style::new().fg(Color::Yellow)), sp);
+    }
+    if has_active {
+        let a = areas[next];
+        next += 1;
+        let series = app.samples.active_series(a.width as usize);
+        let peak = app.samples.active.iter().copied().max().unwrap_or(0);
+        let [l, sp] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(a);
+        f.render_widget(
+            Paragraph::new(trunc(&format!("active agents  now {} · peak {}", panels::active_count(scene), peak), w)).style(Style::new().fg(Color::Gray)),
+            l,
+        );
+        f.render_widget(Sparkline::default().data(&series).max(peak.max(1)).style(Style::new().fg(Color::Cyan)), sp);
+    }
+    if has_bars {
+        let a = areas[next];
+        let [l, chart] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(a);
+        f.render_widget(Paragraph::new("cost per session").style(Style::new().fg(Color::Gray)), l);
+        let costs = panels::session_costs(scene, (chart.height as usize).min(6));
+        let bars: Vec<Bar> = costs
+            .iter()
+            .map(|(label, c)| {
+                Bar::default()
+                    .label(Line::from(trunc(label, 10)))
+                    .value((c * 100.0).round() as u64)
+                    .text_value(format!("${c:.2}"))
+                    .style(Style::new().fg(Color::Rgb(0xE0, 0x7A, 0x3F)))
+                    .value_style(Style::new().fg(Color::Black).bg(Color::Rgb(0xE0, 0x7A, 0x3F)))
+            })
+            .collect();
+        f.render_widget(
+            BarChart::default()
+                .direction(Direction::Horizontal)
+                .bar_width(1)
+                .bar_gap(0)
+                .label_style(Style::new().fg(Color::Gray))
+                .data(BarGroup::default().bars(&bars)),
+            chart,
+        );
     }
 }
 
@@ -865,10 +1095,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Moving around",
         &[
-            ("↑ ↓ / j k", "pick an agent (or click one in the office or the list)"),
-            ("g / G", "jump to the first / last agent"),
+            ("↑ ↓ / j k", "pick an agent (or click one); g / G jump to first / last"),
             ("Tab", "jump to the next agent that needs attention"),
             ("enter", "open the selected agent's details (PgUp/PgDn scrolls)"),
+            ("1-4", "sidebar tabs: Agents, Jobs, Activity, Stats"),
         ],
     ),
     (
@@ -877,6 +1107,8 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("r", "reports: what agents were asked and sent back"),
             ("i", "inbox: results and plans addressed to you"),
             ("enter", "on the inbox card or in a list: read it in full"),
+            ("tab ← →", "in a report: Summary / Full / Brief / Raw"),
+            ("y / w", "in a report: copy the tab / save it as Markdown"),
         ],
     ),
     (
@@ -902,8 +1134,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Alerts & sound",
         &[
-            ("n", "desktop notifications on / off"),
-            ("m", "sound chimes on / off (plays a test chime when turned on)"),
+            ("n / m", "desktop notifications / sound chimes on or off"),
             ("c / C", "clear alerts / bring them back"),
         ],
     ),
@@ -1125,25 +1356,58 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             lines.push(Line::from(Span::styled("↑↓ select · enter open · a all · i inbox · esc close", Style::new().fg(Color::DarkGray))));
             f.render_widget(Paragraph::new(lines), inner);
         }
-        Popup::ReportView { id, .. } => {
+        Popup::ReportView { id, only, inbox } => {
             let Some(rep) = scene.reports.iter().find(|r| r.id == *id) else {
                 app.layout.popup = Rect::default();
                 return;
             };
             let r = centered(area, 104, max_h);
             app.layout.popup = r;
+            let list = crate::app::state::report_list_for(scene, only.as_deref(), *inbox);
+            let pos = list.iter().position(|x| x.id == *id).map(|i| format!(" {}/{} ", i + 1, list.len())).unwrap_or_default();
             let b = Block::bordered()
                 .borders(Borders::ALL)
-                .title(format!(" {} ", trunc(&rep.title, 60)))
-                .title_bottom(Line::from(" ↑↓ scroll · n/p next/prev · g go to sender · o resume · a/d approve/deny · esc back ").right_aligned())
+                .title(Line::from(vec![Span::styled(" report", Style::new().bold()), Span::styled(pos, Style::new().fg(Color::Yellow).bold())]))
+                .title_bottom(Line::from(" tab/←→ view · ↑↓ scroll · y copy · w save · n/p next/prev · g sender · esc back ").right_aligned())
                 .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
             let inner = b.inner(r);
-            let lines = report_lines(rep, now_ms, inner.width as usize);
-            app.layout.detail_max_scroll = (lines.len().min(u16::MAX as usize) as u16).saturating_sub(inner.height);
-            app.detail_scroll = app.detail_scroll.min(app.layout.detail_max_scroll);
             f.render_widget(Clear, r);
             f.render_widget(b, r);
-            f.render_widget(Paragraph::new(lines).scroll((app.detail_scroll, 0)), inner);
+            let card = reader::header_card(rep, scene, now_ms, (inner.width as usize).saturating_sub(2));
+            let card_h = (card.len() as u16).min(inner.height.saturating_sub(2));
+            let [card_a, tabs_a, body_a] =
+                Layout::vertical([Constraint::Length(card_h), Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+            let pad = |a: Rect| Rect::new(a.x + 1, a.y, a.width.saturating_sub(2), a.height);
+            f.render_widget(Paragraph::new(card), pad(card_a));
+            let titles: Vec<Line> = reader::ReaderTab::ALL.iter().map(|t| Line::from(t.label())).collect();
+            f.render_widget(
+                Tabs::new(titles)
+                    .select(app.reader_tab.index())
+                    .padding(" ", " ")
+                    .divider(Span::styled("│", Style::new().fg(Color::DarkGray)))
+                    .style(Style::new().fg(Color::Gray))
+                    .highlight_style(Style::new().fg(Color::Black).bg(Color::Yellow).bold()),
+                tabs_a,
+            );
+            let [text_a, bar_a] = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(body_a);
+            let text_w = (text_a.width as usize).saturating_sub(4);
+            let mut lines = reader::tab_lines(rep, app.reader_tab, text_w);
+            let margin = (text_a.width as usize).saturating_sub(text_w) / 2;
+            for l in lines.iter_mut() {
+                l.spans.insert(0, Span::raw(" ".repeat(margin)));
+            }
+            let total = lines.len();
+            app.layout.detail_max_scroll = (total.min(u16::MAX as usize) as u16).saturating_sub(text_a.height);
+            app.detail_scroll = app.detail_scroll.min(app.layout.detail_max_scroll);
+            f.render_widget(Paragraph::new(lines).scroll((app.detail_scroll, 0)), text_a);
+            if total > text_a.height as usize {
+                let mut sb = ScrollbarState::new(total).viewport_content_length(text_a.height as usize).position(app.detail_scroll as usize);
+                f.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight).style(Style::new().fg(Color::DarkGray)).begin_symbol(None).end_symbol(None),
+                    bar_a,
+                    &mut sb,
+                );
+            }
         }
         Popup::ConfirmCancel { label, pid, .. } => {
             let text = format!("Cancel {label} (pid {pid})? y/n");
@@ -1226,6 +1490,7 @@ mod tests {
     use super::*;
     use crate::app::testutil::*;
     use ratatui::{backend::TestBackend, Terminal};
+    use crate::app::panels::SideTab;
 
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
         let buf = t.backend().buffer();
@@ -1344,22 +1609,114 @@ mod tests {
         assert!(!s.contains("enter read ·"), "no card behind a popup");
     }
 
-    #[test]
-    fn report_view_is_friendly() {
-        let (mut app, mut scene) = test_app();
-        let body = "STATUS: OK\nMODEL: gemini-4-neon-xhigh\nROLE: council-architect\nDURATION_MS: 238000\nRESPONSE:\n# Plan\nFirst **bold** thing with `code`.\n- a\n- b\n";
+    fn reader_scene() -> (App, Scene) {
+        let (app, mut scene) = test_app();
+        let body = "STATUS: OK\nMODEL: gemini-4-neon-xhigh\nROLE: council-architect\nDURATION_MS: 238000\nRESPONSE:\n# Plan\nFirst **bold** thing with `code` in crates/x/y.rs:123 and https://example.com/a.\n\n## Findings\n- critical: lock is never released\n- minor typo in docs\n";
         scene.reports.push(office_core::Report {
             id: 1, at_ms: 60_000, kind: office_core::ReportKind::Result, from: "cc:dice".into(), from_label: "cc·DICE".into(),
-            to: None, to_label: "you".into(), title: "Plan".into(), body: body.into(), brief: "do it".into(),
+            to: None, to_label: "you".into(), title: "Review: Plan [APPROVE]".into(), body: body.into(), brief: "do it".into(),
         });
+        (app, scene)
+    }
+
+    #[test]
+    fn report_view_is_friendly() {
+        let (mut app, scene) = reader_scene();
         let mut office = OfficeCtx::new(None, None);
         app.popup = Popup::ReportView { id: 1, only: None, inbox: true };
+        // Summary tab (default): header card chips, status line, key list cards.
         let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("APPROVE") && s.contains("Review") && s.contains("result"), "{s}");
+        assert!(s.contains("cc·DICE → you") && s.contains("took 3 m 58 s") && s.contains("neon-xhigh"), "{s}");
+        assert!(s.contains("Summary") && s.contains("Full") && s.contains("Brief") && s.contains("Raw"), "{s}");
         assert!(s.contains("✓ OK · Chief Architect (neon-xhigh) · 3 m 58 s"), "{s}");
-        assert!(s.contains("What it was asked") && s.contains("What it sent back") && s.contains("• a"), "{s}");
+        assert!(s.contains("Findings") && s.contains("critical") && s.contains("minor"), "{s}");
+        assert!(s.contains("1/1"), "position: {s}");
         assert!(!s.contains("STATUS:") && !s.contains("**") && !s.contains("RESPONSE:"), "{s}");
-        let lines = report_lines(&scene.reports[0], 65_000, 100);
-        assert!(lines.iter().all(|l| l.width() <= 100));
+        // Full tab shows the rendered body.
+        app.reader_tab = reader::ReaderTab::Full;
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("• lock is never released") || s.contains("• critical: lock is never released"), "{s}");
+        assert!(s.contains("crates/x/y.rs:123"), "{s}");
+        // Brief and Raw.
+        app.reader_tab = reader::ReaderTab::Brief;
+        assert!(render(&mut app, &scene, &mut office, 120, 40).contains("do it"));
+        app.reader_tab = reader::ReaderTab::Raw;
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("STATUS: OK") && s.contains("**bold**"), "{s}");
+    }
+
+    #[test]
+    fn report_view_scrolls_with_a_scrollbar() {
+        let (mut app, mut scene) = reader_scene();
+        scene.reports[0].body = (0..80).map(|i| format!("line number {i}")).collect::<Vec<_>>().join("\n\n");
+        let mut office = OfficeCtx::new(None, None);
+        app.popup = Popup::ReportView { id: 1, only: None, inbox: true };
+        app.reader_tab = reader::ReaderTab::Full;
+        let s = render(&mut app, &scene, &mut office, 120, 30);
+        assert!(app.layout.detail_max_scroll > 50, "{}", app.layout.detail_max_scroll);
+        assert!(s.contains("█") || s.contains("║"), "scrollbar thumb: {s}");
+    }
+
+    #[test]
+    fn sidebar_tab_bar_and_stats_gauge_render() {
+        let (mut app, scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+        let s = render(&mut app, &scene, &mut office, 140, 40);
+        for needle in ["1 Agents", "2 Jobs", "3 Activity", "4 Stats", "Agents (4)"] {
+            assert!(s.contains(needle), "missing {needle:?}:\n{s}");
+        }
+        assert!(app.layout.side_tabs.width > 0);
+        app.side_tab = SideTab::Stats;
+        app.samples.sample(&scene, 1_000);
+        let s = render(&mut app, &scene, &mut office, 140, 40);
+        for needle in ["4 Stats", "router busy 2/3", "pressure warn", "alerts info 1 · warn 1 · crit 0", "tokens in 14.1k · out 1.0k", "cost 30m", "active agents", "cost per session", "cc·DICE", "$1.00"] {
+            assert!(s.contains(needle), "missing {needle:?}:\n{s}");
+        }
+        assert!(!s.contains("Agents (4)"));
+        assert!(app.layout.row_ids.is_empty(), "no agent rows on the stats tab");
+        // Narrow sidebar (34 cols) still shows the bar and the gauge.
+        let s = render(&mut app, &scene, &mut office, 90, 24);
+        assert!(s.contains("4 Stats") && s.contains("router busy 2/3"), "{s}");
+    }
+
+    #[test]
+    fn jobs_and_activity_tabs_render() {
+        let (mut app, mut scene) = test_app();
+        for (id, at, title, from, to) in [
+            (1u64, 20_000u64, "Memo: Add login", "Chief of Staff", "Chief Architect"),
+            (2, 40_000, "Critique: Add login [REVISE]", "Review Seat", "Chief of Staff"),
+        ] {
+            scene.reports.push(office_core::Report {
+                id, at_ms: at, kind: if id == 1 { office_core::ReportKind::Task } else { office_core::ReportKind::Report },
+                from: format!("rosso:{from}"), from_label: from.into(), to: Some(format!("rosso:{to}")), to_label: to.into(),
+                title: title.into(), body: "x".into(), brief: String::new(),
+            });
+            scene.report_jobs.insert(id, "job-login".into());
+        }
+        let mut office = OfficeCtx::new(None, None);
+        app.side_tab = SideTab::Jobs;
+        let s = render(&mut app, &scene, &mut office, 140, 40);
+        for needle in ["Jobs (1)", "job-login", "Add login", "2 docs", "REVISE", "3/7 critique"] {
+            assert!(s.contains(needle), "missing {needle:?}:\n{s}");
+        }
+        app.side_tab = SideTab::Activity;
+        let s = render(&mut app, &scene, &mut office, 140, 40);
+        assert!(s.contains("Activity (2)") && s.contains("✉") && s.contains("Review Seat → Chief of Staff"), "{s}");
+        app.side_tab = SideTab::Jobs;
+        scene.reports.clear();
+        scene.report_jobs.clear();
+        assert!(render(&mut app, &scene, &mut office, 140, 40).contains("No ROSSO jobs yet"));
+    }
+
+    #[test]
+    fn header_status_strip_shows_when_wide() {
+        let (mut app, scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+        let s = render(&mut app, &scene, &mut office, 180, 30);
+        assert!(s.contains("● 3 active · ✉ 0 · $1.23 · router 2/3"), "{s}");
+        let s = render(&mut app, &scene, &mut office, 120, 30);
+        assert!(!s.contains("router 2/3"), "too narrow for the strip:\n{s}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::model::{AgentId, AgentKind, AgentState, Alert, ReportKind, RouterStatus};
+use crate::model::{AgentId, AgentKind, AgentState, Alert, FailureInfo, ReportKind, RouterExtra, RouterStatus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +62,18 @@ pub enum EventKind {
     PermissionResolved { id: AgentId, request_id: String },
     Gone { id: AgentId },
     Router(RouterStatus),
+    /// Extra `--status` fields (orphans, reserved RAM, role models).
+    RouterExtra(RouterExtra),
+    /// agy-guard (Security Desk) decision; only denials are emitted by the source.
+    GuardDecision { agent: String, tool: String, reason: String, deny: bool },
+    /// An agent's latest verdict (from the router audit log).
+    Verdict { id: AgentId, verdict: String },
+    /// A failed agy call attributed to an agent.
+    Failure { id: AgentId, info: FailureInfo },
+    /// Claude session entrypoint ("claude-desktop" | "cli").
+    Entrypoint { id: AgentId, entrypoint: String },
+    /// Count of documents in a ROSSO desk's received/ tray (desk slug -> ROSSO title match).
+    InTray { slug: String, count: u32 },
     Alert(Alert),
     /// A document handed from one agent to another. `to: None` means "whoever asked": the
     /// sender's parent, or you (the boss) for a top-level session.

@@ -76,5 +76,13 @@ pub fn claude_dir() -> PathBuf {
 }
 
 pub fn agy_run_dir() -> PathBuf {
-    claude_dir().join("run")
+    run_dir()
+}
+
+/// `$OFFICE_RUN_DIR`, else `~/.claude/run`.
+pub fn run_dir() -> PathBuf {
+    match std::env::var_os("OFFICE_RUN_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => claude_dir().join("run"),
+    }
 }

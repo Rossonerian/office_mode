@@ -55,6 +55,74 @@ pub fn agent_type_for(title: &str) -> Option<&'static str> {
     }
 }
 
+/// ROSSO desk directory name for an office title: "Chief Inspector" -> "chief-inspector".
+pub fn slug(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// Council round step of a ROSSO document type: Task Card 0, Critique 1, Rebuttal 2, Decision Record 3.
+pub fn council_step(doc_type: &str) -> Option<usize> {
+    match doc_type {
+        "Task Card" => Some(0),
+        "Critique" => Some(1),
+        "Rebuttal" => Some(2),
+        "Decision Record" => Some(3),
+        _ => None,
+    }
+}
+
+/// The council round of the most recent ROSSO job that produced council documents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CouncilRound {
+    pub job: String,
+    /// Which of the four steps have a document (Task Card, Critique, Rebuttal, Decision Record).
+    pub reached: [bool; 4],
+}
+
+impl CouncilRound {
+    /// Highest step reached.
+    pub fn current(&self) -> usize {
+        (0..4).rev().find(|i| self.reached[*i]).unwrap_or(0)
+    }
+}
+
+pub fn council_round(scene: &crate::model::Scene) -> Option<CouncilRound> {
+    let mut latest: Option<(u64, &str)> = None;
+    for r in &scene.reports {
+        let (Some(job), Some(ty)) = (scene.report_jobs.get(&r.id), scene.report_types.get(&r.id)) else { continue };
+        if council_step(ty).is_some() && latest.map_or(true, |(id, _)| r.id > id) {
+            latest = Some((r.id, job.as_str()));
+        }
+    }
+    let (_, job) = latest?;
+    let mut reached = [false; 4];
+    for r in &scene.reports {
+        if scene.report_jobs.get(&r.id).map(String::as_str) == Some(job) {
+            if let Some(step) = scene.report_types.get(&r.id).and_then(|t| council_step(t)) {
+                reached[step] = true;
+            }
+        }
+    }
+    Some(CouncilRound { job: job.to_string(), reached })
+}
+
+/// Verdict colour class: 0 = good (green), 1 = needs work (amber), 2 = bad (red).
+pub fn verdict_class(v: &str) -> u8 {
+    match v {
+        "APPROVE" | "PASS" | "SUPPORT" => 0,
+        "FAIL" | "OBJECT" => 2,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime};
 
 const POLL_EVERY: Duration = Duration::from_secs(2);
+const TRAY_EVERY: Duration = Duration::from_secs(5);
 const MAX_JOB_AGE: Duration = Duration::from_secs(2 * 3600);
 const MAX_BODY_CHARS: usize = 16_000;
 
@@ -26,8 +27,14 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
     std::thread::Builder::new().name("rosso".into()).spawn(move || {
         let mut tails = Tails::default();
         let mut initial = true;
+        let mut last_trays: Option<std::time::Instant> = None;
         loop {
-            for k in poll(&dir, &mut tails, initial) {
+            let mut evs = poll(&dir, &mut tails, initial);
+            if last_trays.map_or(true, |t| t.elapsed() >= TRAY_EVERY) {
+                last_trays = Some(std::time::Instant::now());
+                evs.extend(scan_in_trays(&dir).into_iter().map(|(slug, count)| EventKind::InTray { slug, count }));
+            }
+            for k in evs {
                 if tx.send(Event::now(SourceKind::Rosso, k)).is_err() {
                     return;
                 }
@@ -81,6 +88,33 @@ pub fn poll(dir: &Path, tails: &mut Tails, initial: bool) -> Vec<EventKind> {
         }
     }
     out
+}
+
+/// In-tray counts: files in `<job>/desks/<slug>/received/` of every job updated within the last
+/// two hours. When several jobs have a desk with the same slug, the freshest job wins. Slugs that
+/// had a tray but are empty now report 0, so a badge clears.
+pub fn scan_in_trays(dir: &Path) -> Vec<(String, u32)> {
+    let mut best: HashMap<String, (SystemTime, u32)> = HashMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    for e in rd.flatten() {
+        let jd = e.path();
+        let Some(mtime) = std::fs::metadata(jd.join("job.json")).and_then(|m| m.modified()).ok() else { continue };
+        if SystemTime::now().duration_since(mtime).map(|a| a > MAX_JOB_AGE).unwrap_or(false) {
+            continue;
+        }
+        let Ok(desks) = std::fs::read_dir(jd.join("desks")) else { continue };
+        for d in desks.flatten().take(64) {
+            let slug = d.file_name().to_string_lossy().into_owned();
+            // read_dir follows nothing: symlink entries inside received/ are counted as entries
+            let n = std::fs::read_dir(d.path().join("received")).map(|r| r.flatten().count().min(99) as u32).unwrap_or(0);
+            if best.get(&slug).map_or(true, |(t, _)| mtime > *t) {
+                best.insert(slug, (mtime, n));
+            }
+        }
+    }
+    let mut v: Vec<(String, u32)> = best.into_iter().map(|(k, (_, n))| (k, n)).collect();
+    v.sort();
+    v
 }
 
 fn new_lines(path: &Path, tails: &mut Tails, initial: bool) -> Vec<String> {
@@ -216,6 +250,32 @@ mod tests {
         }
         assert_eq!(seen, 3);
         assert!(poll(&d, &mut t, false).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn counts_in_tray_per_desk_freshest_job_wins() {
+        let d = std::env::temp_dir().join(format!("office-trays-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let j = d.join("job-a");
+        for (slug, n) in [("chief-inspector", 3), ("technician", 0)] {
+            let r = j.join("desks").join(slug).join("received");
+            std::fs::create_dir_all(&r).unwrap();
+            for i in 0..n {
+                std::fs::write(r.join(format!("doc{i}.md")), "x").unwrap();
+            }
+        }
+        std::fs::create_dir_all(j.join("desks/chief-of-staff/authored")).unwrap();
+        std::fs::write(j.join("job.json"), "{}").unwrap();
+        // a stale job is ignored
+        let old = d.join("old");
+        std::fs::create_dir_all(old.join("desks/ghost/received")).unwrap();
+        std::fs::write(old.join("desks/ghost/received/x"), "x").unwrap();
+        std::fs::write(old.join("job.json"), "{}").unwrap();
+        let f = std::fs::File::options().write(true).open(old.join("job.json")).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(3 * 3600)).unwrap();
+        let v = scan_in_trays(&d);
+        assert_eq!(v, vec![("chief-inspector".to_string(), 3), ("chief-of-staff".to_string(), 0), ("technician".to_string(), 0)]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

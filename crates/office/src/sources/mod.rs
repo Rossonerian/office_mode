@@ -3,12 +3,14 @@ use office_core::model::{Alert, AlertLevel};
 use office_core::{config::Config, Event, EventKind, SourceKind};
 use std::sync::mpsc::Sender;
 
+pub mod agy_guard;
 pub mod agy_router;
 pub mod claude_transcripts;
 pub mod control;
 pub mod hook_socket;
 pub mod reports;
 pub mod rosso;
+pub mod sessions;
 
 /// Start every source on its own thread(s): hook socket listener, Claude transcript tailer, agy router scanner.
 /// Must never panic the caller; source failures become Alert events.
@@ -28,6 +30,12 @@ pub fn spawn_all(cfg: &Config, tx: Sender<Event>) -> Option<hook_socket::SocketG
     }
     if let Err(e) = rosso::spawn(cfg, tx.clone()) {
         source_alert(&tx, SourceKind::Rosso, "rosso", format!("rosso watcher failed: {e}"));
+    }
+    if let Err(e) = agy_guard::spawn(cfg, tx.clone()) {
+        source_alert(&tx, SourceKind::AgyRouter, "agy_guard", format!("security desk watcher failed: {e}"));
+    }
+    if let Err(e) = sessions::spawn(cfg, tx.clone()) {
+        source_alert(&tx, SourceKind::ClaudeHook, "sessions", format!("session metadata watcher failed: {e}"));
     }
     guard
 }

@@ -1,8 +1,10 @@
 //! Workstream C. TUI: event loop, office widget (ratatui-image), sidebar, keys, control actions, notifications.
 pub mod chime;
 pub mod demo;
+pub mod export;
 pub mod fmt;
 pub mod kitty;
+pub mod panels;
 pub mod reader;
 pub mod state;
 pub mod ui;
@@ -268,6 +270,12 @@ impl Control for RealControl {
         use chime::SoundPlayer;
         let _ = guarded(|| chime::AfPlayer.play(chime));
     }
+    fn copy_text(&mut self, text: &str) -> anyhow::Result<()> {
+        guarded(|| export::copy_to_clipboard(text)).map_err(not_ready)?
+    }
+    fn save_file(&mut self, name: &str, content: &str) -> anyhow::Result<String> {
+        guarded(|| export::save_to_downloads(name, content)).map_err(not_ready)?
+    }
 }
 
 /// Demo control: never touches real processes; answers with synthetic events.
@@ -308,6 +316,12 @@ impl Control for DemoControl {
     fn play_sound(&mut self, chime: chime::Chime) {
         use chime::SoundPlayer;
         let _ = guarded(|| chime::AfPlayer.play(chime));
+    }
+    fn copy_text(&mut self, text: &str) -> anyhow::Result<()> {
+        guarded(|| export::copy_to_clipboard(text)).map_err(not_ready)?
+    }
+    fn save_file(&mut self, name: &str, content: &str) -> anyhow::Result<String> {
+        guarded(|| export::save_to_downloads(name, content)).map_err(not_ready)?
     }
 }
 
@@ -451,6 +465,7 @@ fn event_loop(
             if app.expire_toasts(t) {
                 app.dirty = true;
             }
+            app.tick(reducer.scene(), t);
             let bg: Vec<String> = BG_PANICS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
             for p in bg {
                 app.toast(format!("source crashed: {p}"), AlertLevel::Critical, t);
@@ -711,6 +726,8 @@ pub mod testutil {
         pub notes: Vec<(String, String)>,
         pub sounds: Vec<chime::Chime>,
         pub fail: bool,
+        pub clipboard: Vec<String>,
+        pub saved: Vec<(String, String)>,
     }
     impl Control for FakeControl {
         fn cancel_agy(&mut self, _a: &Agent, pid: u32) -> anyhow::Result<()> {
@@ -739,6 +756,20 @@ pub mod testutil {
         }
         fn play_sound(&mut self, chime: chime::Chime) {
             self.sounds.push(chime);
+        }
+        fn copy_text(&mut self, text: &str) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.clipboard.push(text.to_string());
+            Ok(())
+        }
+        fn save_file(&mut self, name: &str, content: &str) -> anyhow::Result<String> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.saved.push((name.to_string(), content.to_string()));
+            Ok(format!("~/Downloads/{name}"))
         }
     }
 }

@@ -1,7 +1,7 @@
 //! agy-route watcher: `ps` scan of live routers (1 s), slot/worker lock files, dry-run capacity (5 s),
 //! and the audit log tail (~/.claude/run/agy-route.log.jsonl) for failed calls.
 use super::basename;
-use office_core::model::{AgentKind, AgentState, Alert, AlertLevel, ReportKind, RouterStatus};
+use office_core::model::{AgentKind, AgentState, Alert, AlertLevel, FailureInfo, ReportKind, RouterExtra, RouterStatus};
 use office_core::{config::Config, paths, Event, EventKind, SourceKind};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -48,6 +48,10 @@ struct Shared {
     queued: u32,
     /// (role, cwd) -> agent id of live/recent routers, to attribute audit alerts.
     recent: HashMap<(String, String), String>,
+    /// role -> model from `--status` ROLE_MODELS.
+    role_models: HashMap<String, String>,
+    /// Last orphan count alerted on.
+    orphans_alerted: u32,
 }
 
 pub fn spawn(cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
@@ -65,8 +69,20 @@ pub fn spawn(cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
                 if let Some(text) = run_dry(&route) {
                     let mut st = parse_dry_run(&text);
                     st.queued = shared.lock().map(|s| s.queued).unwrap_or(0);
-                    if tx.send(Event::now(SourceKind::AgyRouter, EventKind::Router(st))).is_err() {
-                        return;
+                    let extra = parse_router_extra(&text);
+                    let mut evs = vec![EventKind::Router(st)];
+                    if let Ok(mut sh) = shared.lock() {
+                        sh.role_models = extra.role_models.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        if let Some(a) = orphan_alert(extra.orphans, sh.orphans_alerted, paths::now_ms()) {
+                            evs.push(EventKind::Alert(a));
+                        }
+                        sh.orphans_alerted = extra.orphans;
+                    }
+                    evs.push(EventKind::RouterExtra(extra));
+                    for k in evs {
+                        if tx.send(Event::now(SourceKind::AgyRouter, k)).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -230,11 +246,15 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                 let slots = read_slots(&run_dir);
                 let mut evs = Vec::new();
                 let mut queued = 0;
-                let models = shared.lock().map(|s| s.models.clone()).unwrap_or_default();
+                let (models, role_models) = shared.lock().map(|s| (s.models.clone(), s.role_models.clone())).unwrap_or_default();
                 for r in &routers {
                     let id = format!("agy:{}", r.pid);
                     let slot = slots.get(&r.pid).copied();
-                    let model = models.get(&r.role).cloned().or_else(|| cfg.agy_models.get(&r.role).cloned());
+                    let model = models
+                        .get(&r.role)
+                        .cloned()
+                        .or_else(|| cfg.agy_models.get(&r.role).cloned())
+                        .or_else(|| role_models.get(&r.role).cloned());
                     let running = slot.is_some() || r.rss_mb > 0;
                     if !running {
                         queued += 1;
@@ -373,10 +393,53 @@ pub fn parse_dry_run(text: &str) -> RouterStatus {
     st
 }
 
+/// Parse ORPHAN_AGY / RESERVED_MB / WOULD_START / ROLE_MODELS (`role=model/300s role=model/120s`).
+pub fn parse_router_extra(text: &str) -> RouterExtra {
+    let mut x = RouterExtra::default();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let v = v.trim();
+        match k.trim() {
+            "ORPHAN_AGY" => x.orphans = first_num(v).unwrap_or(0),
+            "RESERVED_MB" => x.reserved_mb = first_num(v),
+            "WOULD_START" => x.would_start = Some(v.to_ascii_lowercase().starts_with("yes") || v.starts_with("true")),
+            "ROLE_MODELS" => {
+                for tok in v.split_whitespace() {
+                    let Some((role, rest)) = tok.split_once('=') else { continue };
+                    let model = rest.split('/').next().unwrap_or("");
+                    if !role.is_empty() && !model.is_empty() && x.role_models.len() < 32 {
+                        x.role_models.insert(role.to_string(), model.to_string());
+                    }
+                }
+            }
+            "RESPONSE" => break,
+            _ => {}
+        }
+    }
+    x
+}
+
+/// Warn when the orphan count rises above what was last alerted on.
+pub fn orphan_alert(orphans: u32, last: u32, now: u64) -> Option<Alert> {
+    (orphans > 0 && orphans > last).then(|| Alert {
+        at_ms: now,
+        level: AlertLevel::Warn,
+        agent: None,
+        code: "orphan_agy".into(),
+        message: format!("{orphans} orphan agy process(es) running without a router"),
+    })
+}
+
 // ---------------------------------------------------------------- audit log
 
 /// Turn one audit line into an alert (failed calls / needs input). Also returns (role, model).
+#[cfg(test)]
 pub fn audit_alert(v: &Value, agent: Option<String>, now: u64) -> Option<Alert> {
+    audit_alert_hint(v, agent, now, None)
+}
+
+/// `audit_alert` with the failure hint ("stalled: retry once") appended when known.
+pub fn audit_alert_hint(v: &Value, agent: Option<String>, now: u64, hint: Option<&str>) -> Option<Alert> {
     let role = v.get("role").and_then(Value::as_str).unwrap_or("?");
     let cwd = v.get("cwd").and_then(Value::as_str).map(basename).unwrap_or_default();
     let who = format!("agy {role}{}", if cwd.is_empty() { String::new() } else { format!(" ({cwd})") });
@@ -386,14 +449,101 @@ pub fn audit_alert(v: &Value, agent: Option<String>, now: u64) -> Option<Alert> 
             "TIMEOUT" => ("timeout", AlertLevel::Critical, "timed out"),
             "EMPTY_RESPONSE" => ("empty_response", AlertLevel::Warn, "empty response"),
             "BUSY" => ("router_busy", AlertLevel::Warn, "router busy (queued too long)"),
+            "PROVIDER_ERROR" => ("provider_error", AlertLevel::Warn, "provider error"),
+            "INTERRUPTED" => ("interrupted", AlertLevel::Warn, "interrupted"),
+            "BLOCKED" => ("blocked", AlertLevel::Warn, "blocked"),
             _ => ("agy_error", AlertLevel::Warn, code),
         };
-        return Some(Alert { at_ms: now, level, agent, code: c.into(), message: format!("{who}: {what}") });
+        let message = match hint.filter(|h| !h.is_empty()) {
+            Some(h) => format!("{who}: {what} ({h})"),
+            None => format!("{who}: {what}"),
+        };
+        return Some(Alert { at_ms: now, level, agent, code: c.into(), message });
     }
     if v.get("needsInput").and_then(Value::as_bool) == Some(true) {
         return Some(Alert { at_ms: now, level: AlertLevel::Warn, agent, code: "needs_you".into(), message: format!("{who}: NEEDS_USER_INPUT") });
     }
     None
+}
+
+/// Idle seconds from which a timeout counts as a stall (no activity) rather than a too-big task.
+const STALL_IDLE_S: f64 = 90.0;
+
+/// Diagnose a failed call from the audit line and (optionally) its failure file.
+/// Returns None when the call did not fail.
+pub fn failure_info(audit: &Value, file: Option<&Value>, now: u64) -> Option<FailureInfo> {
+    let code = audit.get("errorCode").and_then(Value::as_str).unwrap_or("");
+    let has_file = audit.get("failureFile").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    if code.is_empty() && !has_file && file.is_none() {
+        return None;
+    }
+    let outcome = file
+        .and_then(|f| f.get("outcome").and_then(Value::as_str))
+        .filter(|o| !o.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| if code.is_empty() { "ERROR".into() } else { code.to_string() });
+    let timeout = outcome.contains("TIMEOUT") || code == "TIMEOUT";
+    let explicit = file.and_then(|f| f.get("TIMEOUT_DIAGNOSIS")).and_then(|d| match d {
+        Value::String(s) => Some(s.to_ascii_uppercase()),
+        Value::Object(o) => o.values().find_map(|x| x.as_str().map(str::to_ascii_uppercase)),
+        _ => None,
+    });
+    let idle = file.and_then(|f| f.get("idleS")).or_else(|| audit.get("idleS")).and_then(Value::as_f64);
+    let diagnosis = if let Some(d) = explicit.filter(|d| d.contains("STALL") || d.contains("ACTIVE") || d.contains("BIG")) {
+        if d.contains("STALL") { "STALLED" } else { "ACTIVE_TOO_BIG" }.to_string()
+    } else if timeout {
+        match idle {
+            Some(i) if i >= STALL_IDLE_S => "STALLED".to_string(),
+            _ => "ACTIVE_TOO_BIG".to_string(),
+        }
+    } else {
+        String::new()
+    };
+    let hint = match diagnosis.as_str() {
+        "STALLED" => "stalled: retry once",
+        "ACTIVE_TOO_BIG" => "too big: split the task",
+        _ => "failed: see the run log",
+    };
+    Some(FailureInfo { at_ms: now, outcome, diagnosis, hint: hint.to_string() })
+}
+
+/// Read the failure file named by an audit line (bounded, JSON only).
+fn read_failure_file(audit: &Value) -> Option<Value> {
+    let p = audit.get("failureFile").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let f = std::fs::File::open(p).ok()?;
+    let mut buf = Vec::new();
+    f.take(512 * 1024).read_to_end(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Verdict, failure and alert events for one audit line. `agent` is the agent the call belongs to
+/// (Verdict/Failure need it; the alert does not).
+pub fn audit_events(v: &Value, agent: Option<String>, now: u64, failure_file: Option<&Value>) -> Vec<EventKind> {
+    let mut out = Vec::new();
+    if let (Some(id), Some(verdict)) = (agent.clone(), v.get("verdict").and_then(Value::as_str).filter(|s| !s.is_empty())) {
+        out.push(EventKind::Verdict { id, verdict: verdict.to_string() });
+    }
+    let fail = failure_info(v, failure_file, now);
+    if let (Some(id), Some(info)) = (agent.clone(), fail.clone()) {
+        out.push(EventKind::Failure { id, info });
+    }
+    let hint = fail.as_ref().map(|f| f.hint.as_str());
+    match audit_alert_hint(v, agent.clone(), now, hint) {
+        Some(a) => out.push(EventKind::Alert(a)),
+        None => {
+            if let Some(f) = &fail {
+                let role = v.get("role").and_then(Value::as_str).unwrap_or("?");
+                out.push(EventKind::Alert(Alert {
+                    at_ms: now,
+                    level: AlertLevel::Warn,
+                    agent,
+                    code: "agy_failure".into(),
+                    message: format!("agy {role}: call failed ({})", f.hint),
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// A finished agy call's result, handed back to the relay that started it. The full response
@@ -464,8 +614,9 @@ fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
                                     return;
                                 }
                             }
-                            if let Some(a) = audit_alert(&v, agent, paths::now_ms()) {
-                                if tx.send(Event::now(SourceKind::AgyRouter, EventKind::Alert(a))).is_err() {
+                            let ff = read_failure_file(&v);
+                            for k in audit_events(&v, agent, paths::now_ms(), ff.as_ref()) {
+                                if tx.send(Event::now(SourceKind::AgyRouter, k)).is_err() {
                                     return;
                                 }
                             }
@@ -548,5 +699,53 @@ mod tests {
         assert_eq!(m.get(&4242), Some(&2));
         assert_eq!(m.len(), 1);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn status_extras_parse_and_orphans_alert() {
+        let t = "STATUS: OK\nRESERVED_MB: 640\nORPHAN_AGY: 2\nWOULD_START: yes\nROLE_MODELS: architect=gemini-4-neon-high/360s worker=gemini-4-hydrogen-low/540s odd\nDOMAINS: a\n";
+        let x = parse_router_extra(t);
+        assert_eq!((x.orphans, x.reserved_mb, x.would_start), (2, Some(640), Some(true)));
+        assert_eq!(x.role_models.get("worker").map(String::as_str), Some("gemini-4-hydrogen-low"));
+        assert_eq!(x.role_models.len(), 2);
+        assert!(parse_router_extra("WOULD_START: no (low RAM)\n").would_start == Some(false));
+        let a = orphan_alert(2, 0, 9).unwrap();
+        assert_eq!((a.code.as_str(), a.level), ("orphan_agy", AlertLevel::Warn));
+        assert!(orphan_alert(2, 2, 9).is_none());
+        assert!(orphan_alert(0, 1, 9).is_none());
+        // a real status block parses without clobbering the plain router fields
+        assert_eq!(parse_dry_run("CAPACITY: 3\nORPHAN_AGY: 1\n").capacity, Some(3));
+    }
+
+    #[test]
+    fn provider_errors_and_failures_get_alerts_hints_and_verdicts() {
+        for (code, expect) in [("PROVIDER_ERROR", "provider_error"), ("INTERRUPTED", "interrupted"), ("BLOCKED", "blocked")] {
+            let v: Value = serde_json::from_str(&format!(r#"{{"role":"worker","cwd":"/p/X","errorCode":"{code}"}}"#)).unwrap();
+            assert_eq!(audit_alert(&v, None, 1).unwrap().code, expect);
+        }
+        let audit: Value = serde_json::from_str(r#"{"role":"tester","cwd":"/p/X","errorCode":"TIMEOUT","failureFile":"/nonexistent/f.json","verdict":"FAIL"}"#).unwrap();
+        let stalled: Value = serde_json::from_str(r#"{"outcome":"ERROR/TIMEOUT","idleS":240}"#).unwrap();
+        let big: Value = serde_json::from_str(r#"{"outcome":"ERROR/TIMEOUT","idleS":3}"#).unwrap();
+        let explicit: Value = serde_json::from_str(r#"{"outcome":"TIMEOUT","TIMEOUT_DIAGNOSIS":"ACTIVE_TOO_BIG","idleS":900}"#).unwrap();
+        assert_eq!(failure_info(&audit, Some(&stalled), 1).unwrap().hint, "stalled: retry once");
+        assert_eq!(failure_info(&audit, Some(&big), 1).unwrap().diagnosis, "ACTIVE_TOO_BIG");
+        assert_eq!(failure_info(&audit, Some(&explicit), 1).unwrap().hint, "too big: split the task");
+        let ok: Value = serde_json::from_str(r#"{"role":"tester","errorCode":null,"verdict":"PASS"}"#).unwrap();
+        assert!(failure_info(&ok, None, 1).is_none());
+        let evs = audit_events(&audit, Some("agy:7".into()), 5, Some(&stalled));
+        assert!(matches!(&evs[0], EventKind::Verdict { id, verdict } if id == "agy:7" && verdict == "FAIL"));
+        assert!(matches!(&evs[1], EventKind::Failure { info, .. } if info.diagnosis == "STALLED"));
+        match &evs[2] {
+            EventKind::Alert(a) => {
+                assert_eq!(a.code, "timeout");
+                assert!(a.message.contains("stalled: retry once"));
+            }
+            k => panic!("{k:?}"),
+        }
+        // a PASS with no failure: verdict only
+        let evs = audit_events(&ok, Some("agy:7".into()), 5, None);
+        assert_eq!(evs.len(), 1);
+        // verdict without an attributed agent is dropped
+        assert!(audit_events(&ok, None, 5, None).is_empty());
     }
 }

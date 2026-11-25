@@ -11,5 +11,5 @@ pub mod paths;
 pub mod rosso;
 
 pub use event::{Event, EventKind, SourceKind};
-pub use model::{Agent, AgentId, AgentState, Alert, AlertLevel, Report, ReportKind, RouterStatus, Scene};
+pub use model::{Agent, AgentId, AgentState, Alert, AlertLevel, FailureInfo, GuardStats, Report, ReportKind, RouterExtra, RouterStatus, Scene};
 pub use reducer::Reducer;

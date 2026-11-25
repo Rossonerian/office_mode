@@ -297,6 +297,7 @@ impl Reducer {
     fn rosso_mail(
         &mut self,
         at: u64,
+        job: String,
         from_title: String,
         to_titles: Vec<String>,
         doc_type: String,
@@ -305,6 +306,7 @@ impl Reducer {
         escalation: bool,
         body: String,
     ) {
+        let first_id = self.next_report_id;
         let mut title = format!("{doc_type}: {subject}");
         if let Some(v) = verdict.as_deref().filter(|v| !v.is_empty()) {
             title.push_str(&format!(" [{v}]"));
@@ -343,6 +345,9 @@ impl Reducer {
                 boss,
             );
         }
+        if let Some(v) = verdict.as_deref().filter(|v| !v.is_empty()) {
+            self.set_verdict(&from, v);
+        }
         let needs_input = to_ceo && (subject.contains("NEEDS_USER_INPUT") || body.contains("NEEDS_USER_INPUT"));
         if (escalation || needs_input) && !cos_result_sent {
             if let Some(cos) = self.chief_of_staff() {
@@ -359,6 +364,64 @@ impl Reducer {
                 );
             }
         }
+        let ids: Vec<u64> = self.scene.reports.iter().map(|r| r.id).filter(|id| *id > first_id).collect();
+        for id in ids {
+            if !job.is_empty() {
+                self.scene.report_jobs.insert(id, job.clone());
+            }
+            self.scene.report_types.insert(id, doc_type.clone());
+        }
+        let oldest = self.scene.reports.first().map(|r| r.id).unwrap_or(0);
+        self.scene.report_jobs.retain(|id, _| *id >= oldest);
+        self.scene.report_types.retain(|id, _| *id >= oldest);
+    }
+
+    /// Record a Security Desk denial (bounded tallies).
+    fn guard_deny(&mut self, at: u64, agent: String, tool: String, reason: String) {
+        let g = &mut self.scene.guard;
+        g.deny_total = g.deny_total.saturating_add(1);
+        g.last_deny_ms = at;
+        g.last_agent = agent;
+        g.last_tool = tool;
+        let key: String = reason.chars().take(80).collect();
+        if !g.by_reason.contains_key(&key) && g.by_reason.len() >= crate::model::MAX_GUARD_REASONS {
+            // drop the rarest reason to stay bounded
+            if let Some(rare) = g.by_reason.iter().min_by_key(|(_, n)| **n).map(|(k, _)| k.clone()) {
+                g.by_reason.remove(&rare);
+            }
+        }
+        *g.by_reason.entry(key).or_insert(0) += 1;
+    }
+
+    /// Set an agent's last verdict. Returns true when it changed.
+    fn set_verdict(&mut self, id: &str, verdict: &str) -> bool {
+        let v = verdict.trim().to_ascii_uppercase();
+        if v.is_empty() || !self.scene.agents.contains_key(id) {
+            return false;
+        }
+        if self.scene.verdicts.get(id) == Some(&v) {
+            return false;
+        }
+        self.scene.verdicts.insert(id.to_string(), v);
+        true
+    }
+
+    /// The live agent that plays the ROSSO desk `slug` ("chief-inspector", "security-seat", ...).
+    fn agent_for_slug(&self, slug: &str) -> Option<AgentId> {
+        if slug == "chief-of-staff" {
+            return self.chief_of_staff();
+        }
+        self.scene
+            .agents
+            .values()
+            .filter(|a| a.state != AgentState::Leaving)
+            .filter(|a| match a.kind {
+                AgentKind::Agy => crate::rosso::slug(a.label.split('\u{b7}').next().unwrap_or("")) == slug,
+                AgentKind::ClaudeSub => crate::rosso::slug(&a.label) == slug,
+                _ => false,
+            })
+            .max_by_key(|a| a.last_event_ms)
+            .map(|a| a.id.clone())
     }
 
     fn canon(&self, cwd: &str) -> String {
@@ -445,6 +508,8 @@ impl Reducer {
             | EventKind::Resources { id, .. }
             | EventKind::PermissionRequested { id, .. }
             | EventKind::PermissionResolved { id, .. }
+            | EventKind::Verdict { id, .. }
+            | EventKind::Failure { id, .. }
             | EventKind::Gone { id } => Some(id),
             _ => None,
         };
@@ -844,12 +909,50 @@ impl Reducer {
                 true
             }
             EventKind::Alert(_) => false, // already passed through by the Detector
+            EventKind::RouterExtra(x) => {
+                let changed = self.scene.router_extra != x;
+                self.scene.router_extra = x;
+                changed
+            }
+            EventKind::GuardDecision { agent, tool, reason, deny } => {
+                if deny {
+                    self.guard_deny(at, agent, tool, reason);
+                }
+                deny
+            }
+            EventKind::Verdict { id, verdict } => self.set_verdict(&id, &verdict),
+            EventKind::Failure { id, info } => {
+                if self.scene.agents.contains_key(&id) {
+                    self.scene.failures.insert(id, info);
+                    true
+                } else {
+                    false
+                }
+            }
+            EventKind::Entrypoint { id, entrypoint } => {
+                if self.scene.agents.contains_key(&id) && self.scene.entrypoints.get(&id) != Some(&entrypoint) {
+                    self.scene.entrypoints.insert(id, entrypoint);
+                    true
+                } else {
+                    false
+                }
+            }
+            EventKind::InTray { slug, count } => match self.agent_for_slug(&slug) {
+                Some(id) => {
+                    if count == 0 {
+                        self.scene.in_trays.remove(&id).is_some()
+                    } else {
+                        self.scene.in_trays.insert(id, count) != Some(count)
+                    }
+                }
+                None => false,
+            },
             EventKind::Handoff { from, to, kind, title, body, brief } => {
                 self.push_report(at, kind, from, to, title, body, brief);
                 true
             }
-            EventKind::RossoMail { from_title, to_titles, doc_type, verdict, subject, escalation, body, .. } => {
-                self.rosso_mail(at, from_title, to_titles, doc_type, verdict, subject, escalation, body);
+            EventKind::RossoMail { job, from_title, to_titles, doc_type, verdict, subject, escalation, body, .. } => {
+                self.rosso_mail(at, job, from_title, to_titles, doc_type, verdict, subject, escalation, body);
                 true
             }
         };
@@ -920,6 +1023,10 @@ impl Reducer {
                 self.retired_cost += a.cost_usd;
             }
             self.cascade_leaving(&id, now_ms);
+            self.scene.verdicts.remove(&id);
+            self.scene.failures.remove(&id);
+            self.scene.entrypoints.remove(&id);
+            self.scene.in_trays.remove(&id);
             self.retire_agent(id.clone(), now_ms);
             self.leaving_since.remove(&id);
             changed = true;
@@ -1541,6 +1648,20 @@ mod tests {
     }
 
     #[test]
+    fn rosso_mail_records_the_job_of_each_report() {
+        let mut r = Reducer::new();
+        r.apply(ev(1, mail("Chief of Staff", &["Chief Architect", "Test Inspector"], "Memo", "x", false, "b")));
+        let reps = &r.scene().reports;
+        assert_eq!(reps.len(), 2);
+        for rep in reps {
+            assert_eq!(r.scene().report_jobs.get(&rep.id).map(String::as_str), Some("j"), "{rep:?}");
+        }
+        r.apply(ev(2, EventKind::Handoff { from: "a".into(), to: None, kind: ReportKind::Report, title: "t".into(), body: String::new(), brief: String::new() }));
+        let last = r.scene().reports.last().unwrap().id;
+        assert!(!r.scene().report_jobs.contains_key(&last), "plain hand-offs have no job");
+    }
+
+    #[test]
     fn rosso_mail_resolves_titles_to_agents() {
         let mut r = Reducer::new();
         r.apply(ev(0, seen("cc:s", None, None)));
@@ -1656,5 +1777,109 @@ mod tests {
         }
         assert_eq!(r.scene().agents["cc-sub:p/1"].label, "Explore");
         assert_eq!(r.scene().agents["cc-sub:p/2"].label, "Explore#2");
+    }
+
+    fn mail_v(job: &str, from: &str, to: &[&str], ty: &str, verdict: Option<&str>) -> EventKind {
+        EventKind::RossoMail {
+            job: job.into(),
+            from_title: from.into(),
+            to_titles: to.iter().map(|s| s.to_string()).collect(),
+            doc_type: ty.into(),
+            verdict: verdict.map(Into::into),
+            subject: "s".into(),
+            doc_path: None,
+            escalation: false,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn guard_denials_are_tallied_and_bounded() {
+        let mut r = Reducer::new();
+        let d = |reason: &str, deny| EventKind::GuardDecision { agent: "agy-tester".into(), tool: "Bash".into(), reason: reason.into(), deny };
+        assert!(r.apply(ev(100, d("not on allowlist", true))));
+        assert!(!r.apply(ev(101, d("ignored", false))));
+        r.apply(ev(200, d("not on allowlist", true)));
+        let g = &r.scene().guard;
+        assert_eq!((g.deny_total, g.last_deny_ms, g.by_reason["not on allowlist"]), (2, 200, 2));
+        assert_eq!(g.last_agent, "agy-tester");
+        for i in 0..100 {
+            r.apply(ev(300 + i, d(&format!("reason {i}"), true)));
+        }
+        assert!(r.scene().guard.by_reason.len() <= crate::model::MAX_GUARD_REASONS);
+        assert_eq!(r.scene().guard.deny_total, 102);
+    }
+
+    #[test]
+    fn verdicts_from_audit_and_rosso_mail_and_pruned_on_removal() {
+        let mut r = Reducer::new();
+        r.apply(ev(0, seen("cc:s", None, None)));
+        r.apply(ev(1, rosso_agent("agy:2", AgentKind::Agy, "Correctness Seat\u{b7}neon-high", Some("council-advisor"))));
+        r.apply(ev(2, EventKind::Verdict { id: "agy:2".into(), verdict: "approve".into() }));
+        assert_eq!(r.scene().verdicts["agy:2"], "APPROVE");
+        assert!(!r.apply(ev(3, EventKind::Verdict { id: "agy:2".into(), verdict: "APPROVE".into() })));
+        assert!(!r.apply(ev(3, EventKind::Verdict { id: "agy:nope".into(), verdict: "PASS".into() })));
+        r.apply(ev(4, mail_v("j", "Correctness Seat", &["Chief of Staff"], "Critique", Some("OBJECT"))));
+        assert_eq!(r.scene().verdicts["agy:2"], "OBJECT");
+        r.apply(ev(5, mail_v("j", "Correctness Seat", &["Chief of Staff"], "Critique", None)));
+        assert_eq!(r.scene().verdicts["agy:2"], "OBJECT", "no verdict keeps the last one");
+        r.apply(ev(10, EventKind::Gone { id: "agy:2".into() }));
+        r.sweep(10 + LEAVE_MS + 10);
+        r.sweep(10 + 2 * LEAVE_MS + 20);
+        assert!(!r.scene().agents.contains_key("agy:2"));
+        assert!(r.scene().verdicts.is_empty());
+    }
+
+    #[test]
+    fn failure_entrypoint_intray_and_router_extra() {
+        use crate::model::{FailureInfo, RouterExtra};
+        let mut r = Reducer::new();
+        r.apply(ev(0, seen("cc:s", None, None)));
+        r.apply(ev(1, rosso_agent("agy:1", AgentKind::Agy, "Chief Inspector\u{b7}neon-medium", Some("supervisor"))));
+        let info = FailureInfo { at_ms: 5, outcome: "ERROR/TIMEOUT".into(), diagnosis: "STALLED".into(), hint: "stalled: retry once".into() };
+        assert!(r.apply(ev(2, EventKind::Failure { id: "agy:1".into(), info: info.clone() })));
+        assert_eq!(r.scene().failures["agy:1"], info);
+        assert!(!r.apply(ev(2, EventKind::Failure { id: "agy:gone".into(), info })));
+        assert!(r.apply(ev(3, EventKind::Entrypoint { id: "cc:s".into(), entrypoint: "claude-desktop".into() })));
+        assert!(!r.apply(ev(4, EventKind::Entrypoint { id: "cc:s".into(), entrypoint: "claude-desktop".into() })));
+        assert!(!r.apply(ev(4, EventKind::Entrypoint { id: "cc:zzz".into(), entrypoint: "cli".into() })));
+        assert_eq!(r.scene().entrypoints["cc:s"], "claude-desktop");
+        assert!(r.apply(ev(5, EventKind::InTray { slug: "chief-inspector".into(), count: 3 })));
+        assert_eq!(r.scene().in_trays["agy:1"], 3);
+        assert!(!r.apply(ev(5, EventKind::InTray { slug: "chief-inspector".into(), count: 3 })));
+        assert!(!r.apply(ev(5, EventKind::InTray { slug: "nobody".into(), count: 3 })));
+        assert!(r.apply(ev(6, EventKind::InTray { slug: "chief-inspector".into(), count: 0 })));
+        assert!(r.scene().in_trays.is_empty());
+        let x = RouterExtra { orphans: 2, reserved_mb: Some(10), would_start: Some(false), role_models: Default::default() };
+        assert!(r.apply(ev(7, EventKind::RouterExtra(x.clone()))));
+        assert!(!r.apply(ev(8, EventKind::RouterExtra(x))));
+        assert_eq!(r.scene().router_extra.orphans, 2);
+    }
+
+    #[test]
+    fn document_types_are_kept_and_council_round_follows_the_latest_job() {
+        let mut r = Reducer::new();
+        r.apply(ev(0, seen("cc:s", None, None)));
+        r.apply(ev(1, rosso_agent("agy:1", AgentKind::Agy, "Chief Architect\u{b7}x", Some("council-architect"))));
+        r.apply(ev(2, rosso_agent("agy:2", AgentKind::Agy, "Security Seat\u{b7}x", Some("council-advisor"))));
+        r.apply(ev(3, mail_v("old", "Chief Architect", &["Security Seat"], "Task Card", None)));
+        r.apply(ev(4, mail_v("old", "Security Seat", &["Chief Architect"], "Critique", Some("REVISE"))));
+        r.apply(ev(5, mail_v("new", "Chief Architect", &["Security Seat"], "Task Card", None)));
+        let last = r.scene().reports.last().unwrap().id;
+        assert_eq!(r.scene().report_types[&last], "Task Card");
+        let round = crate::rosso::council_round(r.scene()).unwrap();
+        assert_eq!((round.job.as_str(), round.reached, round.current()), ("new", [true, false, false, false], 0));
+        r.apply(ev(6, mail_v("new", "Security Seat", &["Chief Architect"], "Critique", Some("OBJECT"))));
+        r.apply(ev(7, mail_v("new", "Chief Architect", &["Security Seat"], "Rebuttal", None)));
+        r.apply(ev(8, mail_v("new", "Chief of Staff", &["CEO"], "Memo", None)));
+        let round = crate::rosso::council_round(r.scene()).unwrap();
+        assert_eq!((round.reached, round.current()), ([true, true, true, false], 2));
+        r.apply(ev(9, mail_v("new", "Chief Architect", &["CEO"], "Decision Record", None)));
+        assert_eq!(crate::rosso::council_round(r.scene()).unwrap().current(), 3);
+        assert_eq!(crate::rosso::council_round(&Scene::default()), None);
+        assert_eq!(crate::rosso::slug("Client Intent Seat"), "client-intent-seat");
+        assert_eq!(crate::rosso::verdict_class("APPROVE_WITH_CONDITIONS"), 1);
+        assert_eq!(crate::rosso::verdict_class("OBJECT"), 2);
+        assert_eq!(crate::rosso::verdict_class("SUPPORT"), 0);
     }
 }
