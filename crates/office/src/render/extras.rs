@@ -7,6 +7,7 @@ use super::font;
 use super::theme::Theme;
 use image::RgbaImage;
 use office_core::rosso::verdict_class;
+use office_core::{DispatchMode, QueueTicket, WaveState};
 
 /// How long the guard keeps his hand up after a denial.
 pub const GUARD_ALERT_MS: u64 = 6_000;
@@ -260,9 +261,161 @@ pub fn draw_council_steps(img: &mut RgbaImage, th: &Theme, sx: i32, sy: i32, rea
     fill(img, sx + 28, sy + 9, (n * 11 / 4).max(if n > 0 { 1 } else { 0 }), 1, f(0x5fd35f));
 }
 
+/// Compact FIFO queue chip label: `#<pos> BUSY` when repo-blocked, else `#<pos>`.
+pub fn queue_chip_text(t: &QueueTicket) -> String {
+    if t.repo_busy {
+        format!("#{} BUSY", t.pos)
+    } else {
+        format!("#{}", t.pos)
+    }
+}
+
+/// Pixel width a queue chip adds after a name tag (1 px gap + text + padding).
+pub fn queue_chip_width(t: &QueueTicket) -> i32 {
+    font::text_width(&queue_chip_text(t)) + 4
+}
+
+/// Draw a FIFO queue chip whose left edge (incl. the 1 px gap) is `x`, in a name tag of height `h`.
+pub fn draw_queue_chip(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, h: i32, t: &QueueTicket) {
+    let txt = queue_chip_text(t);
+    let bg = if t.repo_busy {
+        rgb(0xe67e22)
+    } else if t.pos == 1 {
+        rgb(0xffd23f)
+    } else {
+        rgb(0xf2b134)
+    };
+    let w = font::text_width(&txt) + 3;
+    fill(img, x + 1, y, w, h, th.fx.apply(bg));
+    font::draw_text(img, x + 3, y + 1, &txt, th.fx.apply(rgb(0x1b1d22)));
+}
+
+fn wave_call_color(c: &office_core::WaveCall, t: u64) -> Col {
+    if c.relay {
+        if (t / 350) % 2 == 0 {
+            rgb(0x4dd0e1)
+        } else {
+            rgb(0x2b7a8c)
+        }
+    } else if c.status.eq_ignore_ascii_case("OK") {
+        match c.verdict.as_deref() {
+            None => rgb(0x3fae6a),
+            Some(v) => match verdict_class(v) {
+                0 => rgb(0x3fae6a),
+                2 => rgb(0xe03c3c),
+                _ => rgb(0xf2b134),
+            },
+        }
+    } else {
+        rgb(0xe03c3c)
+    }
+}
+
+/// Wave progress strip in the back-wall decor strip, centered horizontally around `cx` at top `y`
+/// (clamped `>= 2`). Returns its `[x, y, w, 11]` rect for overlay collision avoidance.
+pub fn draw_wave_strip(img: &mut RgbaImage, th: &Theme, cx: i32, y: i32, wave: &WaveState, t: u64) -> [i32; 4] {
+    let total = (wave.done + wave.relay_inflight + wave.pending).max(wave.done + wave.relay_inflight);
+    let mut txt = format!("WAVE {}/{}", wave.done, total);
+    if wave.relay_inflight > 0 {
+        txt.push_str(&format!(" +{} RLY", wave.relay_inflight));
+    }
+    let shown_calls = wave.calls.len().min(8);
+    let shown_pending = (wave.pending as usize).min(8 - shown_calls);
+    let n_blocks = shown_calls + shown_pending;
+    let tw = font::text_width(&txt);
+    let blocks_w = if n_blocks > 0 { n_blocks as i32 * 4 - 1 } else { 0 };
+    let gap = if n_blocks > 0 { 4 } else { 0 };
+    let w = 4 + tw + gap + blocks_w + 4;
+    let h = 11;
+    let y = y.max(2);
+    let max_x = (img.width() as i32 - w - 2).max(2);
+    let x = (cx - w / 2).clamp(2, max_x);
+    let f = |c: Col| th.fx.apply(c);
+    fill(img, x, y, w, h, f(rgb(0x181c24)));
+    outline(img, x, y, w, h, f(rgb(0x3a4354)));
+    font::draw_text(img, x + 4, y + 3, &txt, f(rgb(0xfbfaf5)));
+    let mut bx = x + 4 + tw + gap;
+    for c in wave.calls.iter().take(8) {
+        fill(img, bx, y + 3, 3, 5, f(wave_call_color(c, t)));
+        bx += 4;
+    }
+    for _ in 0..shown_pending {
+        fill(img, bx, y + 3, 3, 5, f(rgb(0x333c4d)));
+        bx += 4;
+    }
+    [x, y, w, h]
+}
+
+/// Dispatch route tag (`DIRECT`, `RELAY`, `DIR+RLY`) centered at `cx` with top `y`.
+pub fn draw_dispatch_tag(img: &mut RgbaImage, th: &Theme, cx: i32, y: i32, mode: DispatchMode) {
+    let (txt, bg) = match mode {
+        DispatchMode::Direct => ("DIRECT", rgb(0x2dd4bf)),
+        DispatchMode::Relay => ("RELAY", rgb(0xc084fc)),
+        DispatchMode::Hybrid => ("DIR+RLY", rgb(0xf59e0b)),
+    };
+    let w = font::text_width(txt) + 4;
+    let h = font::GLYPH_H + 2;
+    let x = cx - w / 2;
+    fill(img, x, y, w, h, th.fx.apply(bg));
+    font::draw_text(img, x + 2, y + 1, txt, th.fx.apply(rgb(0x14171c)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_chip_text_formats_position_and_busy() {
+        let q1 = QueueTicket { pos: 1, since_ms: 100, repo_busy: false };
+        let q2 = QueueTicket { pos: 2, since_ms: 200, repo_busy: true };
+        assert_eq!(queue_chip_text(&q1), "#1");
+        assert_eq!(queue_chip_text(&q2), "#2 BUSY");
+        assert!(queue_chip_width(&q2) > queue_chip_width(&q1));
+    }
+
+    #[test]
+    fn wave_strip_draws_pill_and_clamps_y() {
+        let mut img = RgbaImage::new(240, 40);
+        let th = super::super::theme::procedural();
+        let wave = WaveState {
+            job: "j1".into(),
+            plan: "council-r2".into(),
+            updated_ms: 1_000,
+            done: 2,
+            relay_inflight: 1,
+            pending: 1,
+            calls: vec![
+                office_core::WaveCall { title: "Reliability Seat".into(), status: "OK".into(), verdict: Some("SUPPORT".into()), relay: false },
+                office_core::WaveCall { title: "Security Seat".into(), status: "OK".into(), verdict: Some("REVISE".into()), relay: false },
+                office_core::WaveCall { title: "Chief Inspector".into(), status: "RUNNING".into(), verdict: None, relay: true },
+            ],
+        };
+        let rect = draw_wave_strip(&mut img, &th, 120, 0, &wave, 0);
+        assert_eq!(rect[1], 2);
+        assert_eq!(rect[3], 11);
+        assert!(rect[2] > 60);
+        assert_eq!(img.get_pixel(rect[0] as u32, rect[1] as u32).0, rgb(0x3a4354));
+        assert_eq!(img.get_pixel((rect[0] + 1) as u32, (rect[1] + 1) as u32).0, rgb(0x181c24));
+        // 4 blocks (3 calls + 1 pending) at the right end of the pill
+        let b0 = rect[0] + rect[2] - 4 - (4 * 4 - 1);
+        assert_eq!(img.get_pixel(b0 as u32, (rect[1] + 3) as u32).0, rgb(0x3fae6a));
+        assert_eq!(img.get_pixel((b0 + 4) as u32, (rect[1] + 3) as u32).0, rgb(0xf2b134));
+        assert_eq!(img.get_pixel((b0 + 8) as u32, (rect[1] + 3) as u32).0, rgb(0x4dd0e1));
+        assert_eq!(img.get_pixel((b0 + 12) as u32, (rect[1] + 3) as u32).0, rgb(0x333c4d));
+    }
+
+    #[test]
+    fn dispatch_tag_draws_expected_colors() {
+        let mut img = RgbaImage::new(80, 20);
+        let th = super::super::theme::procedural();
+        draw_dispatch_tag(&mut img, &th, 40, 2, DispatchMode::Direct);
+        let w = font::text_width("DIRECT") + 4;
+        assert_eq!(img.get_pixel((40 - w / 2) as u32, 2).0, rgb(0x2dd4bf));
+
+        draw_dispatch_tag(&mut img, &th, 40, 10, DispatchMode::Hybrid);
+        let hw = font::text_width("DIR+RLY") + 4;
+        assert_eq!(img.get_pixel((40 - hw / 2) as u32, 10).0, rgb(0xf59e0b));
+    }
 
     #[test]
     fn titles_abbreviate_only_when_they_must() {

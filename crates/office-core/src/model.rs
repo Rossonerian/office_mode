@@ -181,6 +181,15 @@ pub struct Scene {
     /// Extra agy-route --status fields (orphans, reserved RAM, role models).
     #[serde(default)]
     pub router_extra: RouterExtra,
+    /// Per-agent queue position and wait timestamp when `Queued` in agy-route.
+    #[serde(default)]
+    pub queue_tickets: BTreeMap<AgentId, QueueTicket>,
+    /// Active/recent ROSSO wave progress, keyed by job name.
+    #[serde(default)]
+    pub waves: BTreeMap<String, WaveState>,
+    /// Explicit dispatch mode per top-level session id.
+    #[serde(default)]
+    pub dispatch_modes: BTreeMap<AgentId, DispatchMode>,
     pub alerts: Vec<Alert>,
     pub router: RouterStatus,
     pub total_tokens: u64,
@@ -222,4 +231,41 @@ pub struct RouterExtra {
     pub would_start: Option<bool>,
     /// role -> model (ROLE_MODELS).
     pub role_models: BTreeMap<String, String>,
+}
+
+/// Queue position and wait timestamp for an agent waiting in `agy-route`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueTicket {
+    pub pos: u32,
+    pub since_ms: u64,
+    pub repo_busy: bool,
+}
+
+/// One call within a ROSSO wave.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaveCall {
+    pub title: String,
+    pub status: String,
+    pub verdict: Option<String>,
+    pub relay: bool,
+}
+
+/// Progress snapshot of a ROSSO wave (by job).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaveState {
+    pub job: String,
+    pub plan: String,
+    pub updated_ms: u64,
+    pub done: u32,
+    pub relay_inflight: u32,
+    pub pending: u32,
+    pub calls: Vec<WaveCall>,
+}
+
+/// How a top-level Claude session is dispatching ROSSO/agy work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DispatchMode {
+    Direct,
+    Relay,
+    Hybrid,
 }

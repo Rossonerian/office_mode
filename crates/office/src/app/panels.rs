@@ -123,6 +123,7 @@ pub struct JobRow {
     pub ratio: f64,
     /// Report id of the newest document (what Enter opens).
     pub last_report: u64,
+    pub wave: Option<office_core::WaveState>,
 }
 
 /// One row per ROSSO job seen in the scene's hand-offs, most recently active first.
@@ -134,10 +135,10 @@ pub fn jobs(scene: &Scene) -> Vec<JobRow> {
         }
     }
     let mut rows: Vec<JobRow> = Vec::new();
-    for (name, reps) in by_job {
+    for (name, reps) in &by_job {
         // One document can be delivered to several recipients: count it once.
         let mut docs: Vec<&Report> = Vec::new();
-        for r in reps {
+        for &r in reps {
             if !docs.iter().any(|d| d.title == r.title && d.from_label == r.from_label && d.at_ms == r.at_ms) {
                 docs.push(r);
             }
@@ -162,7 +163,7 @@ pub fn jobs(scene: &Scene) -> Vec<JobRow> {
         };
         let subject = reader::subject_of(&first.title);
         rows.push(JobRow {
-            name: name.to_string(),
+            name: (*name).to_string(),
             title: if subject.is_empty() { first.title.clone() } else { subject },
             flow: format!("{} → {}", last.from_label, last.to_label),
             status,
@@ -172,6 +173,28 @@ pub fn jobs(scene: &Scene) -> Vec<JobRow> {
             stage,
             ratio: stage.map(|s| (s + 1) as f64 / STAGES.len() as f64).unwrap_or(0.0),
             last_report: last.id,
+            wave: scene.waves.get(*name).cloned(),
+        });
+    }
+    for (name, w) in &scene.waves {
+        if by_job.contains_key(name.as_str()) {
+            continue;
+        }
+        let tot = w.done + w.relay_inflight + w.pending;
+        rows.push(JobRow {
+            name: name.clone(),
+            title: format!("wave {}", w.plan),
+            flow: format!("{} done · {} relay", w.done, w.relay_inflight),
+            status: if w.relay_inflight > 0 || w.pending > 0 { JobStatus::Active } else { JobStatus::Done },
+            docs: w.done as usize,
+            verdict: w.calls.iter().rev().find_map(|c| {
+                c.verdict.as_deref().and_then(|s| Verdict::from_word(&s.trim().to_ascii_uppercase(), false))
+            }),
+            last_ms: w.updated_ms,
+            stage: None,
+            ratio: if tot > 0 { w.done as f64 / tot as f64 } else { 0.0 },
+            last_report: 0,
+            wave: Some(w.clone()),
         });
     }
     rows.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then_with(|| a.name.cmp(&b.name)));
@@ -433,6 +456,75 @@ mod tests {
         s.reports.push(rep(11, 99_900, ReportKind::Result, "Chief of Staff", "CEO", "\u{26a0} Escalation: R-1", "?"));
         s.report_jobs.insert(11, "j-cache".into());
         assert_eq!(jobs(&s)[0].status, JobStatus::Blocked);
+    }
+
+    #[test]
+    fn jobs_attach_wave_and_synthesize_wave_only_jobs() {
+        use office_core::{WaveCall, WaveState};
+        let mut s = job_scene();
+        s.waves.insert(
+            "j-login".into(),
+            WaveState {
+                job: "j-login".into(),
+                plan: "council-r2".into(),
+                updated_ms: 80_000,
+                done: 1,
+                relay_inflight: 1,
+                pending: 2,
+                calls: vec![WaveCall { title: "Security Seat".into(), status: "OK".into(), verdict: Some("APPROVE".into()), relay: false }],
+            },
+        );
+        s.waves.insert(
+            "j-wave-only".into(),
+            WaveState {
+                job: "j-wave-only".into(),
+                plan: "inspect".into(),
+                updated_ms: 98_000,
+                done: 2,
+                relay_inflight: 1,
+                pending: 1,
+                calls: vec![
+                    WaveCall { title: "Test Inspector".into(), status: "OK".into(), verdict: Some("PASS".into()), relay: false },
+                    WaveCall { title: "Chief Inspector".into(), status: "RELAY".into(), verdict: None, relay: true },
+                ],
+            },
+        );
+        s.waves.insert(
+            "j-wave-done".into(),
+            WaveState {
+                job: "j-wave-done".into(),
+                plan: "council-r1".into(),
+                updated_ms: 15_000,
+                done: 3,
+                relay_inflight: 0,
+                pending: 0,
+                calls: vec![WaveCall { title: "Review Seat".into(), status: "OK".into(), verdict: Some("REVISE".into()), relay: false }],
+            },
+        );
+
+        let js = jobs(&s);
+        assert_eq!(js.len(), 4);
+        let wave_only = &js[0];
+        assert_eq!(wave_only.name, "j-wave-only");
+        assert_eq!(wave_only.title, "wave inspect");
+        assert_eq!(wave_only.flow, "2 done · 1 relay");
+        assert_eq!(wave_only.status, JobStatus::Active);
+        assert_eq!(wave_only.docs, 2);
+        assert_eq!(wave_only.verdict, Some(Verdict::Pass));
+        assert_eq!(wave_only.last_ms, 98_000);
+        assert_eq!(wave_only.stage, None);
+        assert!((wave_only.ratio - 0.5).abs() < 1e-9);
+        assert_eq!(wave_only.last_report, 0);
+        assert_eq!(wave_only.wave.as_ref().map(|w| w.plan.as_str()), Some("inspect"));
+
+        let cache = js.iter().find(|j| j.name == "j-cache").unwrap();
+        assert_eq!(cache.wave, None);
+        let login = js.iter().find(|j| j.name == "j-login").unwrap();
+        assert_eq!(login.wave.as_ref().map(|w| w.plan.as_str()), Some("council-r2"));
+        let wave_done = js.iter().find(|j| j.name == "j-wave-done").unwrap();
+        assert_eq!(wave_done.status, JobStatus::Done);
+        assert_eq!(wave_done.verdict, Some(Verdict::Revise));
+        assert!((wave_done.ratio - 1.0).abs() < 1e-9);
     }
 
     #[test]

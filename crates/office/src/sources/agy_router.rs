@@ -1,8 +1,8 @@
 //! agy-route watcher: `ps` scan of live routers (1 s), slot/worker lock files, dry-run capacity (5 s),
 //! and the audit log tail (~/.claude/run/agy-route.log.jsonl) for failed calls.
 use super::basename;
-use office_core::model::{AgentKind, AgentState, Alert, AlertLevel, FailureInfo, ReportKind, RouterExtra, RouterStatus};
-use office_core::{config::Config, paths, Event, EventKind, SourceKind};
+use office_core::model::{AgentKind, AgentState, Alert, AlertLevel, FailureInfo, QueueTicket, ReportKind, RouterExtra, RouterStatus};
+use office_core::{config::Config, paths, AgentId, Event, EventKind, SourceKind};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -193,21 +193,92 @@ pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
         .collect()
 }
 
-/// pid -> slot index from agy-route.slot<i>.lock (each holds the router pid).
+/// Parse the first whitespace token on line 1 of a lock file as a PID.
+fn parse_first_pid(path: &Path) -> Option<u32> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut s = String::new();
+    f.take(4096).read_to_string(&mut s).ok()?;
+    s.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|p| p.parse().ok())
+}
+
+/// pid -> slot index from agy-route.slot<i>.lock (line 1 starts with the router pid).
 pub fn read_slots(run_dir: &Path) -> HashMap<u32, u32> {
     let mut m = HashMap::new();
     let Ok(rd) = std::fs::read_dir(run_dir) else { return m };
-    for e in rd.flatten() {
+    for e in rd.flatten().take(16_384) {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(i) = name.strip_prefix("agy-route.slot").and_then(|r| r.strip_suffix(".lock")).and_then(|n| n.parse().ok())
         else {
             continue;
         };
-        if let Some(pid) = std::fs::read_to_string(e.path()).ok().and_then(|s| s.trim().parse().ok()) {
+        if let Some(pid) = parse_first_pid(&e.path()) {
             m.insert(pid, i);
         }
     }
     m
+}
+
+fn parse_ticket_name(name: &str) -> Option<(u64, u32)> {
+    let (ms_part, pid_part) = name.split_once('-')?;
+    if ms_part.len() < 13
+        || pid_part.is_empty()
+        || !ms_part.bytes().all(|b| b.is_ascii_digit())
+        || !pid_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((ms_part.parse().ok()?, pid_part.parse().ok()?))
+}
+
+/// Read FIFO queue ticket files `<run_dir>/queue/<13+-digit-ms>-<pid>`, sorted ascending by `(ms, pid)`.
+pub fn read_queue_tickets(run_dir: &Path) -> Vec<(u64, u32)> {
+    let Ok(rd) = std::fs::read_dir(run_dir.join("queue")) else { return Vec::new() };
+    let mut out: Vec<(u64, u32)> = rd
+        .flatten()
+        .take(4096)
+        .filter_map(|e| parse_ticket_name(&e.file_name().to_string_lossy()))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Read PIDs from `<run_dir>/agy-route.worker-*.lock` (first whitespace token on line 1).
+pub fn read_worker_locks(run_dir: &Path) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let Ok(rd) = std::fs::read_dir(run_dir) else { return out };
+    for e in rd.flatten().take(16_384) {
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with("agy-route.worker-") && s.ends_with(".lock") {
+            if let Some(pid) = parse_first_pid(&e.path()) {
+                out.insert(pid);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a queued worker router is waiting on the same repo as another running/locked worker.
+pub fn is_repo_busy(r: &RouterProc, routers: &[RouterProc], slots: &HashMap<u32, u32>, worker_locks: &HashSet<u32>) -> bool {
+    if r.role != "worker" {
+        return false;
+    }
+    if let Some(my_cwd) = r.cwd.as_deref().filter(|c| !c.is_empty()).map(canon_cwd) {
+        let same_repo_running = routers.iter().any(|other| {
+            other.pid != r.pid
+                && other.role == "worker"
+                && (slots.contains_key(&other.pid) || other.rss_mb > 0)
+                && other.cwd.as_deref().filter(|c| !c.is_empty()).map(canon_cwd).as_deref() == Some(my_cwd.as_str())
+        });
+        if same_repo_running {
+            return true;
+        }
+    }
+    slots.get(&r.pid).is_none()
+        && worker_locks.iter().any(|&p| p != r.pid && routers.iter().any(|o| o.pid == p && o.role == "worker"))
 }
 
 /// "gemini-4-hydrogen-low" -> "hydrogen-low", "gemini-3.8-flash-medium" -> "flash-medium".
@@ -220,21 +291,38 @@ pub fn short_model(m: &str) -> String {
 }
 
 fn has_any_lock(run_dir: &Path) -> bool {
-    let Ok(rd) = std::fs::read_dir(run_dir) else { return false };
-    rd.flatten().any(|e| {
-        let n = e.file_name();
-        let s = n.to_string_lossy();
-        s.starts_with("agy-route.") && s.ends_with(".lock")
-    })
+    let has_lock = std::fs::read_dir(run_dir).ok().is_some_and(|rd| {
+        rd.flatten().take(16_384).any(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.starts_with("agy-route.") && s.ends_with(".lock")
+        })
+    });
+    if has_lock {
+        return true;
+    }
+    std::fs::read_dir(run_dir.join("queue"))
+        .ok()
+        .is_some_and(|rd| rd.flatten().take(4096).any(|e| parse_ticket_name(&e.file_name().to_string_lossy()).is_some()))
 }
 
 fn canon_cwd(p: &str) -> String {
     std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string())
 }
 
+#[derive(Clone, PartialEq)]
+struct LiveRouter {
+    slot: Option<u32>,
+    rss_mb: u32,
+    running: bool,
+    model: Option<String>,
+    queue_key: Option<(u32, bool)>,
+}
+
 fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir: PathBuf) {
-    // pid -> (slot, rss_mb, running)
-    let mut live: BTreeMap<u32, (Option<u32>, u32, bool, Option<String>)> = BTreeMap::new();
+    let mut live: BTreeMap<u32, LiveRouter> = BTreeMap::new();
+    let mut fallback_since: HashMap<u32, u64> = HashMap::new();
+    let mut last_tickets: BTreeMap<AgentId, QueueTicket> = BTreeMap::new();
     let mut tick: u64 = 0;
     loop {
         let idle = live.is_empty() && !has_any_lock(&run_dir);
@@ -244,8 +332,41 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                 let procs = parse_ps(&String::from_utf8_lossy(&out.stdout));
                 let routers = find_routers(&procs);
                 let slots = read_slots(&run_dir);
+                let tickets = read_queue_tickets(&run_dir);
+                let worker_locks = read_worker_locks(&run_dir);
+                let mut ticket_by_pid: HashMap<u32, u64> = HashMap::new();
+                for (ms, pid) in tickets {
+                    ticket_by_pid.entry(pid).or_insert(ms);
+                }
+
+                let mut queued_routers: Vec<(u64, u32, &RouterProc)> = routers
+                    .iter()
+                    .filter(|r| !slots.contains_key(&r.pid) && r.rss_mb == 0)
+                    .map(|r| (ticket_by_pid.get(&r.pid).copied().unwrap_or(u64::MAX), r.pid, r))
+                    .collect();
+                queued_routers.sort_unstable_by_key(|&(ms, pid, _)| (ms, pid));
+
+                let mut queue_tickets: BTreeMap<AgentId, QueueTicket> = BTreeMap::new();
+                let mut queued_by_pid: HashMap<u32, QueueTicket> = HashMap::new();
+                for (idx, (ticket_ms, pid, r)) in queued_routers.into_iter().enumerate() {
+                    let since_ms = if ticket_ms == u64::MAX {
+                        *fallback_since.entry(pid).or_insert_with(paths::now_ms)
+                    } else {
+                        fallback_since.remove(&pid);
+                        ticket_ms
+                    };
+                    let qt = QueueTicket {
+                        pos: (idx + 1) as u32,
+                        since_ms,
+                        repo_busy: is_repo_busy(r, &routers, &slots, &worker_locks),
+                    };
+                    queue_tickets.insert(format!("agy:{pid}"), qt.clone());
+                    queued_by_pid.insert(pid, qt);
+                }
+                fallback_since.retain(|pid, _| queued_by_pid.contains_key(pid));
+
                 let mut evs = Vec::new();
-                let mut queued = 0;
+                let queued = queued_by_pid.len() as u32;
                 let (models, role_models) = shared.lock().map(|s| (s.models.clone(), s.role_models.clone())).unwrap_or_default();
                 for r in &routers {
                     let id = format!("agy:{}", r.pid);
@@ -256,15 +377,17 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                         .or_else(|| cfg.agy_models.get(&r.role).cloned())
                         .or_else(|| role_models.get(&r.role).cloned());
                     let running = slot.is_some() || r.rss_mb > 0;
-                    if !running {
-                        queued += 1;
-                    }
-                    let prev = live.get(&r.pid).cloned();
-                    if prev.as_ref().map(|p| (&p.0, &p.2, &p.3)) != Some((&slot, &running, &model)) {
-                        let who = match &r.domain {
-                            Some(d) => format!("{}:{}", r.role, d),
-                            None => r.role.clone(),
-                        };
+                    let qt = queued_by_pid.get(&r.pid);
+                    let queue_key = qt.map(|q| (q.pos, q.repo_busy));
+                    let prev = live.get(&r.pid);
+                    let identity_changed = prev.map(|p| (&p.slot, p.running, &p.model)) != Some((&slot, running, &model));
+                    let state_changed = prev.map(|p| (p.slot, p.running, p.queue_key)) != Some((slot, running, queue_key));
+                    let who = match &r.domain {
+                        Some(d) => format!("{}:{}", r.role, d),
+                        None => r.role.clone(),
+                    };
+                    let job_note = r.rosso_job.as_deref().map(|j| format!(" · job {j}")).unwrap_or_default();
+                    if identity_changed {
                         let name = r
                             .rosso_as
                             .clone()
@@ -274,7 +397,6 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                             Some(m) => format!("{}·{}", name, short_model(m)),
                             None => name,
                         };
-                        let job_note = r.rosso_job.as_deref().map(|j| format!(" · job {j}")).unwrap_or_default();
                         evs.push(EventKind::AgentSeen {
                             id: id.clone(),
                             kind: AgentKind::Agy,
@@ -287,28 +409,39 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                             pid: Some(r.pid),
                             resume_id: None,
                         });
-                        if prev.as_ref().map(|p| (p.0, p.2)) != Some((slot, running)) {
-                            let (state, act) = if !running {
-                                (AgentState::Queued, "waiting for a slot".to_string())
-                            } else if r.role == "worker" {
-                                (AgentState::Typing, format!("editing {}{job_note}", r.cwd.as_deref().map(basename).unwrap_or_default()))
-                            } else {
-                                (AgentState::Thinking, format!("{} {}{job_note}", who, r.cwd.as_deref().map(basename).unwrap_or_default()))
-                            };
-                            evs.push(EventKind::State { id: id.clone(), state, activity: Some(act.trim().to_string()) });
-                        }
                         if let (Ok(mut s), Some(c)) = (shared.lock(), &r.cwd) {
                             s.recent.insert((r.role.clone(), canon_cwd(c)), id.clone());
                         }
                     }
+                    if state_changed {
+                        let (state, act) = if let Some(q) = qt {
+                            let act = if q.repo_busy {
+                                format!("repo busy (#{})", q.pos)
+                            } else {
+                                format!("queued #{}", q.pos)
+                            };
+                            (AgentState::Queued, act)
+                        } else if !running {
+                            (AgentState::Queued, "waiting for a slot".to_string())
+                        } else if r.role == "worker" {
+                            (AgentState::Typing, format!("editing {}{job_note}", r.cwd.as_deref().map(basename).unwrap_or_default()))
+                        } else {
+                            (AgentState::Thinking, format!("{} {}{job_note}", who, r.cwd.as_deref().map(basename).unwrap_or_default()))
+                        };
+                        evs.push(EventKind::State { id: id.clone(), state, activity: Some(act.trim().to_string()) });
+                    }
                     // Emit Resources each scan for live routers as heartbeat.
                     evs.push(EventKind::Resources { id: id.clone(), rss_mb: r.rss_mb });
-                    live.insert(r.pid, (slot, r.rss_mb, running, model));
+                    live.insert(r.pid, LiveRouter { slot, rss_mb: r.rss_mb, running, model, queue_key });
                 }
                 let gone: Vec<u32> = live.keys().filter(|p| !routers.iter().any(|r| r.pid == **p)).copied().collect();
                 for pid in gone {
                     live.remove(&pid);
                     evs.push(EventKind::Gone { id: format!("agy:{pid}") });
+                }
+                if queue_tickets != last_tickets {
+                    last_tickets = queue_tickets.clone();
+                    evs.push(EventKind::QueueTickets(queue_tickets));
                 }
                 if let Ok(mut s) = shared.lock() {
                     s.queued = queued;
@@ -692,13 +825,90 @@ mod tests {
     #[test]
     fn reads_slot_locks() {
         let d = std::env::temp_dir().join(format!("office-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("agy-route.slot2.lock"), "4242").unwrap();
+        std::fs::write(d.join("agy-route.slot3.lock"), "5150 5140 1700000000\n{\"role\":\"worker\"}").unwrap();
         std::fs::write(d.join("agy-route.worker-abc.lock"), "4242").unwrap();
         let m = read_slots(&d);
         assert_eq!(m.get(&4242), Some(&2));
-        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&5150), Some(&3));
+        assert_eq!(m.len(), 2);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reads_queue_tickets_fifo_and_worker_locks() {
+        let d = std::env::temp_dir().join(format!("office-queue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("queue")).unwrap();
+        // Valid tickets out of order, plus tie-break on pid, plus invalid filenames
+        for name in [
+            "1700000000200-30",
+            "1700000000100-50",
+            "1700000000100-20",
+            "123456789012-99",   // 12 digits (< 13) -> ignored
+            "1700000000100-abc", // non-digit pid -> ignored
+            "not-a-ticket",
+            "1700000000100-+10", // '+' sign -> ignored
+        ] {
+            std::fs::write(d.join("queue").join(name), "").unwrap();
+        }
+        assert!(has_any_lock(&d));
+        assert_eq!(
+            read_queue_tickets(&d),
+            vec![
+                (1_700_000_000_100, 20),
+                (1_700_000_000_100, 50),
+                (1_700_000_000_200, 30),
+            ]
+        );
+
+        std::fs::write(d.join("agy-route.worker-repo1.lock"), "701 700 12345\n{}").unwrap();
+        std::fs::write(d.join("agy-route.worker-repo2.lock"), "702").unwrap();
+        std::fs::write(d.join("agy-route.slot0.lock"), "999").unwrap();
+        let locks = read_worker_locks(&d);
+        assert_eq!(locks, HashSet::from([701, 702]));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detects_repo_busy_for_workers() {
+        let proc = |pid: u32, role: &str, cwd: Option<&str>, rss_mb: u32| RouterProc {
+            pid,
+            role: role.into(),
+            domain: None,
+            cwd: cwd.map(str::to_string),
+            rss_mb,
+            rosso_job: None,
+            rosso_as: None,
+        };
+        let queued_worker = proc(10, "worker", Some("/p/repo-a"), 0);
+        let running_same_repo = proc(11, "worker", Some("/p/repo-a"), 120);
+        let running_other_repo = proc(12, "worker", Some("/p/repo-b"), 120);
+        let queued_advisor = proc(13, "council-advisor", Some("/p/repo-a"), 0);
+
+        let slots = HashMap::new();
+        let locks = HashSet::new();
+
+        // Same-repo running worker marks queued worker as busy, but not non-worker
+        let routers = vec![queued_worker.clone(), running_same_repo.clone(), queued_advisor.clone()];
+        assert!(is_repo_busy(&queued_worker, &routers, &slots, &locks));
+        assert!(!is_repo_busy(&queued_advisor, &routers, &slots, &locks));
+
+        // Different-repo running worker does not mark queued worker as busy
+        let routers_diff = vec![queued_worker.clone(), running_other_repo.clone()];
+        assert!(!is_repo_busy(&queued_worker, &routers_diff, &slots, &locks));
+
+        // Another live worker holding a worker lock marks unslotted worker as busy
+        let other_worker_idle_rss = proc(14, "worker", Some("/p/repo-c"), 0);
+        let locks_other = HashSet::from([14]);
+        let routers_locked = vec![queued_worker.clone(), other_worker_idle_rss];
+        assert!(is_repo_busy(&queued_worker, &routers_locked, &slots, &locks_other));
+
+        // If the worker itself holds a slot and no same-repo worker is running, worker lock alone doesn't trigger
+        let slots_self = HashMap::from([(10, 0)]);
+        assert!(!is_repo_busy(&queued_worker, &routers_locked, &slots_self, &locks_other));
     }
 
     #[test]

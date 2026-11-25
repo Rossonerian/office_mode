@@ -1,13 +1,13 @@
 //! ROSSO watcher: tails every recent job's `logbook.jsonl` (deliveries) and `mailroom.jsonl`
 //! (escalations, refusals) under `~/.claude/run/rosso/` and emits `EventKind::RossoMail`.
-use office_core::model::{Alert, AlertLevel};
+use office_core::model::{Alert, AlertLevel, WaveCall, WaveState};
 use office_core::{config::Config, paths, Event, EventKind, SourceKind};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const POLL_EVERY: Duration = Duration::from_secs(2);
 const TRAY_EVERY: Duration = Duration::from_secs(5);
@@ -28,11 +28,17 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
         let mut tails = Tails::default();
         let mut initial = true;
         let mut last_trays: Option<std::time::Instant> = None;
+        let mut last_waves: BTreeMap<String, WaveState> = BTreeMap::new();
         loop {
             let mut evs = poll(&dir, &mut tails, initial);
             if last_trays.map_or(true, |t| t.elapsed() >= TRAY_EVERY) {
                 last_trays = Some(std::time::Instant::now());
                 evs.extend(scan_in_trays(&dir).into_iter().map(|(slug, count)| EventKind::InTray { slug, count }));
+                let waves = scan_waves(&dir, paths::now_ms());
+                if waves != last_waves {
+                    last_waves = waves.clone();
+                    evs.push(EventKind::Waves(waves));
+                }
             }
             for k in evs {
                 if tx.send(Event::now(SourceKind::Rosso, k)).is_err() {
@@ -115,6 +121,224 @@ pub fn scan_in_trays(dir: &Path) -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = best.into_iter().map(|(k, (_, n))| (k, n)).collect();
     v.sort();
     v
+}
+
+const RELAY_TTL_MS: u64 = 900_000;
+
+fn is_leap_year(y: u32) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+fn days_in_month(y: u32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Days since 1970-01-01 using Howard Hinnant's civil-from-days / days-from-civil integer math.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m_adj = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * m_adj as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse an ISO-8601 UTC timestamp (`"YYYY-MM-DDTHH:MM:SS(.fff)Z"`) into epoch milliseconds.
+pub fn parse_iso_ms(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || (b[10] != b'T' && b[10] != b't')
+        || b[13] != b':'
+        || b[16] != b':'
+        || (*b.last()? != b'Z' && *b.last()? != b'z')
+    {
+        return None;
+    }
+    let parse_u = |slice: &str| -> Option<u32> {
+        if !slice.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        slice.parse().ok()
+    };
+    let year = parse_u(&s[0..4])?;
+    let month = parse_u(&s[5..7])?;
+    let day = parse_u(&s[8..10])?;
+    let hour = parse_u(&s[11..13])?;
+    let min = parse_u(&s[14..16])?;
+    let sec = parse_u(&s[17..19])?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    let tail = &s[19..s.len() - 1];
+    let ms: u64 = if tail.is_empty() {
+        0
+    } else if let Some(frac) = tail.strip_prefix('.') {
+        if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut mul = 100u64;
+        let mut acc = 0u64;
+        for ch in frac.bytes().take(3) {
+            acc += (ch - b'0') as u64 * mul;
+            mul /= 10;
+        }
+        acc
+    } else {
+        return None;
+    };
+    let days = days_from_civil(year as i64, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400_000 + (hour as u64 * 3600 + min as u64 * 60 + sec as u64) * 1000 + ms)
+}
+
+fn is_fresh_time(t: SystemTime) -> bool {
+    SystemTime::now().duration_since(t).map(|age| age <= MAX_JOB_AGE).unwrap_or(false)
+}
+
+fn mtime_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn read_json_bounded(path: &Path) -> Option<Value> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(1 << 20).read_to_end(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+fn clean_verdict(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    if v.is_empty() || v == "-" || v.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Scan active ROSSO job directories under `dir` and return the freshest wave snapshot per job.
+pub fn scan_waves(dir: &Path, now_ms: u64) -> BTreeMap<String, WaveState> {
+    let mut out = BTreeMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten().take(256) {
+        let jd = e.path();
+        if !jd.is_dir() {
+            continue;
+        }
+        let job_json_path = jd.join("job.json");
+        let job_fresh = std::fs::metadata(&job_json_path).and_then(|m| m.modified()).ok().is_some_and(is_fresh_time);
+        let runs_dir = jd.join("runs");
+        let Ok(runs_rd) = std::fs::read_dir(&runs_dir) else { continue };
+
+        let mut any_state_fresh = false;
+        let mut best: Option<(u64, u64, String, Value)> = None;
+        for re in runs_rd.flatten().take(256) {
+            let fname = re.file_name().to_string_lossy().into_owned();
+            let Some(plan) = fname.strip_suffix(".state.json").filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let Ok(mtime) = std::fs::metadata(re.path()).and_then(|m| m.modified()) else { continue };
+            if is_fresh_time(mtime) {
+                any_state_fresh = true;
+            }
+            let Some(state_val) = read_json_bounded(&re.path()) else { continue };
+            let fm_ms = mtime_ms(mtime);
+            let updated_ms = state_val
+                .get("updated")
+                .and_then(|u| u.as_u64().or_else(|| u.as_str().and_then(parse_iso_ms)))
+                .unwrap_or(fm_ms);
+            let replace = best.as_ref().is_none_or(|(bu, bf, _, _)| (updated_ms, fm_ms) > (*bu, *bf));
+            if replace {
+                best = Some((updated_ms, fm_ms, plan.to_string(), state_val));
+            }
+        }
+
+        if !(job_fresh || any_state_fresh) {
+            continue;
+        }
+        let Some((updated_ms, _, plan, state_val)) = best else { continue };
+
+        let mut calls = Vec::new();
+        let done_obj = state_val.get("done").and_then(Value::as_object);
+        let done = done_obj.map(|m| m.len() as u32).unwrap_or(0);
+        if let Some(m) = done_obj {
+            for (title, entry) in m {
+                calls.push(WaveCall {
+                    title: title.clone(),
+                    status: s(entry, "status").unwrap_or("OK").to_string(),
+                    verdict: clean_verdict(s(entry, "verdict")),
+                    relay: false,
+                });
+            }
+        }
+
+        let mut relay_inflight = 0u32;
+        if let Some(relay_obj) = state_val.get("relay").and_then(Value::as_object) {
+            for (title, entry) in relay_obj {
+                if done_obj.is_some_and(|d| d.contains_key(title)) {
+                    continue;
+                }
+                let Some(issued_ms) = s(entry, "issued").and_then(parse_iso_ms) else { continue };
+                if now_ms.saturating_sub(issued_ms) < RELAY_TTL_MS {
+                    calls.push(WaveCall {
+                        title: title.clone(),
+                        status: "RELAY".into(),
+                        verdict: None,
+                        relay: true,
+                    });
+                    relay_inflight += 1;
+                }
+            }
+        }
+
+        let accounted = done.saturating_add(relay_inflight);
+        let sibling_total = read_json_bounded(&runs_dir.join(format!("{plan}.json")))
+            .and_then(|v| v.get("calls").and_then(Value::as_array).map(|a| a.len() as u32));
+        let pending = if let Some(total) = sibling_total {
+            total.saturating_sub(accounted)
+        } else if plan == "council-r2" {
+            let seats = read_json_bounded(&job_json_path)
+                .and_then(|v| {
+                    v.get("participants").and_then(Value::as_array).map(|arr| {
+                        arr.iter().filter(|x| x.as_str().is_some_and(|p| p.ends_with(" Seat"))).count() as u32
+                    })
+                })
+                .unwrap_or(0);
+            seats.saturating_sub(accounted)
+        } else if plan == "inspect" {
+            2u32.saturating_sub(accounted)
+        } else {
+            0
+        };
+
+        calls.sort_by(|a, b| b.relay.cmp(&a.relay).then_with(|| a.title.cmp(&b.title)));
+        calls.truncate(16);
+
+        let job = e.file_name().to_string_lossy().into_owned();
+        out.insert(
+            job.clone(),
+            WaveState {
+                job,
+                plan,
+                updated_ms,
+                done,
+                relay_inflight,
+                pending,
+                calls,
+            },
+        );
+    }
+    out
 }
 
 fn new_lines(path: &Path, tails: &mut Tails, initial: bool) -> Vec<String> {
@@ -276,6 +500,112 @@ mod tests {
         f.set_modified(SystemTime::now() - Duration::from_secs(3 * 3600)).unwrap();
         let v = scan_in_trays(&d);
         assert_eq!(v, vec![("chief-inspector".to_string(), 3), ("chief-of-staff".to_string(), 0), ("technician".to_string(), 0)]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn parses_iso_utc_timestamps() {
+        assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso_ms("1970-01-01T00:00:01.25Z"), Some(1250));
+        assert_eq!(parse_iso_ms("1970-01-02T03:04:05.006Z"), Some(86_400_000 + (3 * 3600 + 4 * 60 + 5) * 1000 + 6));
+        // 2020-02-29 leap day is valid; 2021-02-29 is invalid
+        assert_eq!(parse_iso_ms("2020-02-29T12:00:00Z"), Some(18_321 * 86_400_000 + 12 * 3600 * 1000));
+        assert_eq!(parse_iso_ms("2021-02-29T12:00:00Z"), None);
+        assert_eq!(parse_iso_ms("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso_ms("2026-01-01T00:00:00"), None);
+        assert_eq!(parse_iso_ms("2026-01-01T00:00:00.Z"), None);
+        assert_eq!(parse_iso_ms("1969-12-31T23:59:59Z"), None);
+    }
+
+    #[test]
+    fn scans_waves_verdicts_relays_pending_and_freshest_plan() {
+        let d = std::env::temp_dir().join(format!("office-waves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+
+        // Job 1: freshest .state.json wins, verdicts stripped, active vs expired relay, sibling <plan>.json pending
+        let j1 = d.join("job-sibling");
+        std::fs::create_dir_all(j1.join("runs")).unwrap();
+        std::fs::write(j1.join("job.json"), "{}").unwrap();
+        std::fs::write(
+            j1.join("runs/old-plan.state.json"),
+            r#"{"updated":"2026-11-25T15:00:00Z","done":{"Old":{"status":"OK"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            j1.join("runs/smoke-plan.json"),
+            r#"{"calls":[{},{},{},{},{}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            j1.join("runs/smoke-plan.state.json"),
+            r#"{
+                "updated":"2026-11-25T15:10:00Z",
+                "done":{
+                    "Technician":{"status":"OK","verdict":"PASS"},
+                    "Reviewer":{"status":"OK","verdict":"-"},
+                    "Auditor":{"status":"OK","verdict":"none"},
+                    "DoneAlready":{"status":"OK","verdict":""}
+                },
+                "relay":{
+                    "ActiveRelay":{"issued":"2026-11-25T15:05:00Z"},
+                    "ExpiredRelay":{"issued":"2026-11-25T14:50:00Z"},
+                    "DoneAlready":{"issued":"2026-11-25T15:08:00Z"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Job 2: council-r2 uses job.json participants ending with " Seat"
+        let j2 = d.join("job-council");
+        std::fs::create_dir_all(j2.join("runs")).unwrap();
+        std::fs::write(
+            j2.join("job.json"),
+            r#"{"participants":["Chief of Staff","Security Seat","Reliability Seat","Product Seat"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            j2.join("runs/council-r2.state.json"),
+            r#"{"updated":"2026-11-25T15:09:00Z","done":{"Security Seat":{"status":"OK","verdict":"APPROVE"}}}"#,
+        )
+        .unwrap();
+
+        // Job 3: stale job is ignored
+        let j3 = d.join("job-stale");
+        std::fs::create_dir_all(j3.join("runs")).unwrap();
+        std::fs::write(j3.join("job.json"), "{}").unwrap();
+        std::fs::write(j3.join("runs/inspect.state.json"), r#"{"done":{}}"#).unwrap();
+        for p in [j3.join("job.json"), j3.join("runs/inspect.state.json")] {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(3 * 3600)).unwrap();
+        }
+
+        let now_ms = parse_iso_ms("2026-11-25T15:11:00Z").unwrap();
+        let waves = scan_waves(&d, now_ms);
+        assert_eq!(waves.len(), 2);
+
+        let w1 = waves.get("job-sibling").unwrap();
+        assert_eq!(w1.plan, "smoke-plan");
+        assert_eq!(w1.updated_ms, parse_iso_ms("2026-11-25T15:10:00Z").unwrap());
+        assert_eq!(w1.done, 4);
+        assert_eq!(w1.relay_inflight, 1);
+        assert_eq!(w1.pending, 0); // 5 calls - (4 done + 1 relay_inflight) = 0
+        // Relay call sorted first, then done calls sorted by title
+        assert!(w1.calls[0].relay);
+        assert_eq!(w1.calls[0].title, "ActiveRelay");
+        assert_eq!(w1.calls[0].status, "RELAY");
+        let by_title: HashMap<&str, &WaveCall> = w1.calls.iter().map(|c| (c.title.as_str(), c)).collect();
+        assert_eq!(by_title["Technician"].verdict.as_deref(), Some("PASS"));
+        assert_eq!(by_title["Reviewer"].verdict, None);
+        assert_eq!(by_title["Auditor"].verdict, None);
+        assert_eq!(by_title["DoneAlready"].verdict, None);
+        assert!(!by_title.contains_key("ExpiredRelay"));
+
+        let w2 = waves.get("job-council").unwrap();
+        assert_eq!(w2.plan, "council-r2");
+        assert_eq!(w2.done, 1);
+        assert_eq!(w2.relay_inflight, 0);
+        assert_eq!(w2.pending, 2); // 3 Seat participants - 1 done = 2
+
         let _ = std::fs::remove_dir_all(&d);
     }
 }

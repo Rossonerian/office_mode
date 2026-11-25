@@ -1,5 +1,9 @@
-use crate::model::{AgentId, AgentKind, AgentState, Alert, FailureInfo, ReportKind, RouterExtra, RouterStatus};
+use crate::model::{
+    AgentId, AgentKind, AgentState, Alert, DispatchMode, FailureInfo, QueueTicket, ReportKind, RouterExtra,
+    RouterStatus, WaveState,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceKind {
@@ -74,6 +78,12 @@ pub enum EventKind {
     Entrypoint { id: AgentId, entrypoint: String },
     /// Count of documents in a ROSSO desk's received/ tray (desk slug -> ROSSO title match).
     InTray { slug: String, count: u32 },
+    /// Live queue tickets for agents waiting in agy-route.
+    QueueTickets(BTreeMap<AgentId, QueueTicket>),
+    /// Active/recent ROSSO waves keyed by job name.
+    Waves(BTreeMap<String, WaveState>),
+    /// Explicit dispatch mode overrides per top-level session id.
+    DispatchModes(BTreeMap<AgentId, DispatchMode>),
     Alert(Alert),
     /// A document handed from one agent to another. `to: None` means "whoever asked": the
     /// sender's parent, or you (the boss) for a top-level session.

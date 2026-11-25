@@ -104,10 +104,12 @@ fn main() -> anyhow::Result<()> {
         println!("busy-vote   {}", p.display());
         r.set_hover(None);
     }
-    // ROSSO extras: guard deny, verdict chips on council seats, a failure, a council round, in-tray badges
+    // ROSSO extras: guard deny, verdict chips on council seats, a failure, a council round, in-tray badges,
+    // FIFO queue chips, active wave strip, and Chief of Staff dispatch route tag
     {
         use office_core::model::{AgentKind, AgentState};
-        use office_core::{Event, EventKind, Reducer, SourceKind};
+        use office_core::{Event, EventKind, QueueTicket, Reducer, SourceKind, WaveCall, WaveState};
+        use std::collections::BTreeMap;
         let mut red = Reducer::new();
         let mut ev = |k: EventKind| {
             red.apply(Event { at_ms: now - 5_000, source: SourceKind::Demo, kind: k });
@@ -118,9 +120,33 @@ fn main() -> anyhow::Result<()> {
         };
         ev(seen("cc:a", AgentKind::Claude, "cc:a", None, None, Some("/tmp/a")));
         ev(seen("agy:1", AgentKind::Agy, "Chief Inspector\u{b7}neon-medium", None, Some("supervisor"), Some("/tmp/a")));
+        ev(seen("agy:q1", AgentKind::Agy, "Technician", None, Some("worker"), Some("/tmp/a")));
+        ev(seen("agy:q2", AgentKind::Agy, "Test Inspector", None, Some("tester"), Some("/tmp/a")));
         for (i, (role, label)) in [("agy-council-architect", "Chief Architect"), ("agy-council-advisor", "Security Seat"), ("agy-council-advisor", "Correctness Seat"), ("agy-council-advisor", "Reliability Seat")].iter().enumerate() {
             ev(seen(&format!("cc-sub:a/c{i}"), AgentKind::ClaudeSub, label, Some("cc:a"), Some(role), None));
         }
+        let mut tickets = BTreeMap::new();
+        tickets.insert("agy:q1".into(), QueueTicket { pos: 1, since_ms: now - 4_000, repo_busy: false });
+        tickets.insert("agy:q2".into(), QueueTicket { pos: 2, since_ms: now - 2_000, repo_busy: true });
+        ev(EventKind::QueueTickets(tickets));
+        let mut waves = BTreeMap::new();
+        waves.insert(
+            "j1".into(),
+            WaveState {
+                job: "j1".into(),
+                plan: "council-r2".into(),
+                updated_ms: now - 1_000,
+                done: 2,
+                relay_inflight: 1,
+                pending: 1,
+                calls: vec![
+                    WaveCall { title: "Reliability Seat".into(), status: "OK".into(), verdict: Some("SUPPORT".into()), relay: false },
+                    WaveCall { title: "Chief Inspector".into(), status: "OK".into(), verdict: Some("APPROVE".into()), relay: false },
+                    WaveCall { title: "Security Seat".into(), status: "RUNNING".into(), verdict: None, relay: true },
+                ],
+            },
+        );
+        ev(EventKind::Waves(waves));
         let mail = |from: &str, to: &str, ty: &str, v: Option<&str>| EventKind::RossoMail {
             job: "j1".into(), from_title: from.into(), to_titles: vec![to.into()], doc_type: ty.into(),
             verdict: v.map(Into::into), subject: "x".into(), doc_path: None, escalation: false, body: String::new(),
@@ -139,8 +165,13 @@ fn main() -> anyhow::Result<()> {
         ev(EventKind::GuardDecision { agent: "agy-tester".into(), tool: "Bash".into(), reason: "not allowed".into(), deny: true });
         let mut s = red.scene().clone();
         for a in s.agents.values_mut() {
-            a.state = AgentState::Running;
-            a.activity = "Bash cargo test --workspace -- --nocapture to verify the render".into();
+            if matches!(a.id.as_str(), "agy:q1" | "agy:q2") {
+                a.state = AgentState::Queued;
+                a.activity = "waiting for slot".into();
+            } else {
+                a.state = AgentState::Running;
+                a.activity = "Bash cargo test --workspace -- --nocapture to verify the render".into();
+            }
             a.started_ms = 0;
             a.last_event_ms = now - 500;
         }

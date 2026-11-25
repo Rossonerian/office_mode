@@ -677,16 +677,28 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
         return;
     }
     let w = inner.width as usize;
-    let cap = (inner.height / 3).max(1) as usize;
+    let row_h = |j: &panels::JobRow| -> u16 { if j.wave.is_some() { 4 } else { 3 } };
     let sel = app.jobs_sel.min(rows.len() - 1);
-    let offset = if sel >= cap { sel + 1 - cap } else { 0 };
-    for (k, j) in rows.iter().skip(offset).take(cap).enumerate() {
-        let y = inner.y + (k as u16) * 3;
-        if y + 2 > inner.y + inner.height {
+    let mut offset = 0usize;
+    let mut span: u16 = rows[..=sel].iter().map(row_h).sum();
+    while offset < sel && span > inner.height {
+        span = span.saturating_sub(row_h(&rows[offset]));
+        offset += 1;
+    }
+    let mut cur_y = inner.y;
+    let max_y = inner.y + inner.height;
+    for (idx, j) in rows.iter().enumerate().skip(offset) {
+        if cur_y >= max_y {
             break;
         }
-        let h = 3.min(inner.y + inner.height - y);
-        let selected = offset + k == sel;
+        let avail = max_y - cur_y;
+        if avail < 2 {
+            break;
+        }
+        let h = row_h(j).min(avail);
+        let y = cur_y;
+        cur_y += h;
+        let selected = idx == sel;
         let bg = if selected { Style::new().bg(Color::Rgb(0x2a, 0x30, 0x40)) } else { Style::new() };
         let block_area = Rect::new(inner.x, y, inner.width, h);
         f.render_widget(Paragraph::new("").style(bg), block_area);
@@ -722,6 +734,51 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
                 .unfilled_style(Style::new().fg(Color::Rgb(0x33, 0x36, 0x40)))
                 .style(bg);
             f.render_widget(g, Rect::new(inner.x, y + 2, inner.width, 1));
+        }
+        if h >= 4 {
+            if let Some(wave) = &j.wave {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let plan_max = w.saturating_sub(18).max(4);
+                let plan = trunc(&wave.plan, plan_max);
+                let prefix = format!("  wave {plan}: ");
+                let mut used = prefix.chars().count();
+                spans.push(Span::styled(prefix, dim));
+
+                let done_tok = format!("{}✓", wave.done);
+                used += done_tok.chars().count();
+                spans.push(Span::styled(done_tok, Style::new().fg(Color::Green)));
+
+                if wave.relay_inflight > 0 {
+                    let r_tok = format!(" {}⟳", wave.relay_inflight);
+                    if used + r_tok.chars().count() <= w {
+                        used += r_tok.chars().count();
+                        spans.push(Span::styled(r_tok, Style::new().fg(Color::Cyan)));
+                    }
+                }
+                if wave.pending > 0 {
+                    let p_tok = format!(" {}·", wave.pending);
+                    if used + p_tok.chars().count() <= w {
+                        used += p_tok.chars().count();
+                        spans.push(Span::styled(p_tok, dim));
+                    }
+                }
+                for c in &wave.calls {
+                    let Some(raw) = c.verdict.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    let (tok, col) = match reader::Verdict::from_word(&raw.to_ascii_uppercase(), false) {
+                        Some(v) => (trunc(v.label(), 8), v.color()),
+                        None => (trunc(raw, 8), Color::Gray),
+                    };
+                    if used + 1 + tok.chars().count() > w {
+                        break;
+                    }
+                    used += 1 + tok.chars().count();
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(tok, Style::new().fg(col).bold()));
+                }
+                f.render_widget(Paragraph::new(Line::from(spans)).style(bg), Rect::new(inner.x, y + 3, inner.width, 1));
+            }
         }
     }
 }
@@ -965,6 +1022,13 @@ fn draw_agents(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: 
     if let (true, Some(a)) = (inspector_h >= 2, selected_ag) {
         let insp_area = Rect::new(inner.x, inner.y + table_area.height, inner.width, inspector_h);
         let w = inner.width as usize;
+        let dispatch = office_core::rosso::dispatch_mode(scene, &a.id);
+        let queue = scene.queue_tickets.get(&a.id);
+        let meta_style = if a.context_pct.is_some_and(|p| p >= 85.0) {
+            Style::new().fg(Color::Yellow)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
         if inspector_h >= 3 {
             let line1 = Line::from(vec![
                 Span::styled("▸ ", Style::new().fg(Color::DarkGray)),
@@ -977,12 +1041,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: 
                 inspector_state_tool(a, w),
                 Style::new().fg(state_color(a.state)),
             ));
-            let meta_style = if a.context_pct.is_some_and(|p| p >= 85.0) {
-                Style::new().fg(Color::Yellow)
-            } else {
-                Style::new().fg(Color::DarkGray)
-            };
-            let line3 = Line::from(Span::styled(inspector_metrics(a, w), meta_style));
+            let line3 = inspector_metrics_line(inspector_metrics(a, w), meta_style, dispatch, queue, w);
             f.render_widget(Paragraph::new(vec![line1, line2, line3]), insp_area);
         } else {
             let act = if a.activity.is_empty() { state_name(a.state) } else { a.activity.as_str() };
@@ -1008,15 +1067,76 @@ fn draw_agents(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: 
                 parts.push(r.clone());
             }
             let meta = if parts.is_empty() { "no metrics".to_string() } else { parts.join(" · ") };
-            let meta_style = if a.context_pct.is_some_and(|p| p >= 85.0) {
-                Style::new().fg(Color::Yellow)
-            } else {
-                Style::new().fg(Color::DarkGray)
-            };
-            let line2 = Line::from(Span::styled(trunc(&meta, w), meta_style));
+            let line2 = inspector_metrics_line(meta, meta_style, dispatch, queue, w);
             f.render_widget(Paragraph::new(vec![line1, line2]), insp_area);
         }
     }
+}
+
+fn dispatch_tag(mode: office_core::DispatchMode) -> (&'static str, Color) {
+    match mode {
+        office_core::DispatchMode::Direct => ("DIRECT", Color::Cyan),
+        office_core::DispatchMode::Relay => ("RELAY", Color::Magenta),
+        office_core::DispatchMode::Hybrid => ("DIR+RLY", Color::Yellow),
+    }
+}
+
+fn queue_label(qt: &office_core::QueueTicket) -> (String, Option<Color>) {
+    if qt.repo_busy {
+        (format!("queue #{} (repo busy)", qt.pos), Some(Color::Rgb(0xFF, 0x8C, 0x1A)))
+    } else {
+        (format!("queue #{}", qt.pos), None)
+    }
+}
+
+fn inspector_metrics_line(
+    base: String,
+    meta_style: Style,
+    dispatch: Option<office_core::DispatchMode>,
+    queue: Option<&office_core::QueueTicket>,
+    w: usize,
+) -> Line<'static> {
+    if dispatch.is_none() && queue.is_none() {
+        return Line::from(Span::styled(trunc(&base, w), meta_style));
+    }
+    let mut extras: Vec<(String, Style)> = Vec::new();
+    if let Some(mode) = dispatch {
+        let (tag, col) = dispatch_tag(mode);
+        extras.push((tag.to_string(), Style::new().fg(col).bold()));
+    }
+    if let Some(qt) = queue {
+        let (txt, col) = queue_label(qt);
+        let st = col.map(|c| Style::new().fg(c).bold()).unwrap_or(meta_style);
+        extras.push((txt, st));
+    }
+    let extra_chars: usize = extras.iter().map(|(s, _)| s.chars().count()).sum::<usize>()
+        + extras.len().saturating_sub(1) * 3;
+    let has_base = !base.is_empty() && base != "no metrics";
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if has_base {
+        let budget = w.saturating_sub(extra_chars + 3);
+        if budget > 0 {
+            spans.push(Span::styled(trunc(&base, budget), meta_style));
+            spans.push(Span::styled(" · ", meta_style));
+        }
+    }
+    let mut used: usize = spans.iter().map(|s| s.width()).sum();
+    for (i, (txt, st)) in extras.into_iter().enumerate() {
+        if i > 0 {
+            if used + 3 >= w {
+                break;
+            }
+            spans.push(Span::styled(" · ", meta_style));
+            used += 3;
+        }
+        let piece = trunc(&txt, w.saturating_sub(used));
+        if piece.is_empty() {
+            break;
+        }
+        used += piece.chars().count();
+        spans.push(Span::styled(piece, st));
+    }
+    Line::from(spans)
 }
 
 /// Router text lines (without the gauge), for the sidebar and tests.
@@ -1024,15 +1144,31 @@ pub fn router_lines(scene: &Scene, width: usize) -> Vec<Line<'static>> {
     let r = &scene.router;
     let free = r.free_mb.map(|v| format!("{v} MB")).unwrap_or_else(|| "?".into());
     let per = r.per_proc_mb.map(|v| format!("{v} MB")).unwrap_or_else(|| "?".into());
+    let rsv = scene
+        .router_extra
+        .reserved_mb
+        .filter(|&v| v > 0)
+        .map(|v| format!(" · rsv {v}M"))
+        .unwrap_or_default();
     let (pl, pc) = pressure_label(r.pressure);
     let limit = r.limit_text.clone().unwrap_or_else(|| "none".into());
+    let base_w = "pressure ".len() + pl.len();
+    let q_txt = format!(" · queued {}", r.queued);
+    let mut p_spans = vec![
+        Span::raw("pressure "),
+        Span::styled(pl, Style::new().fg(pc).bold()),
+        Span::raw(trunc(&q_txt, width.saturating_sub(base_w))),
+    ];
+    if scene.router_extra.orphans > 0 {
+        let rem = width.saturating_sub(base_w + q_txt.chars().count());
+        if rem > 0 {
+            let orph = format!(" · {} orphan", scene.router_extra.orphans);
+            p_spans.push(Span::styled(trunc(&orph, rem), Style::new().fg(Color::Yellow)));
+        }
+    }
     vec![
-        Line::raw(trunc(&format!("free RAM {free} · per agy {per}"), width)),
-        Line::from(vec![
-            Span::raw("pressure "),
-            Span::styled(pl, Style::new().fg(pc).bold()),
-            Span::raw(format!(" · queued {}", r.queued)),
-        ]),
+        Line::raw(trunc(&format!("free RAM {free} · per agy {per}{rsv}"), width)),
+        Line::from(p_spans),
         Line::from(Span::styled(trunc(&format!("LIMIT {limit}"), width), Style::new().fg(Color::DarkGray))),
     ]
 }
@@ -1217,9 +1353,24 @@ pub fn detail_lines(app: &App, a: &Agent, scene: &Scene, now_ms: u64) -> Vec<Lin
         kv("tools", format!("{} calls · {} failed", a.tool_calls, a.tool_failures)),
         kv("resume id", opt(&a.resume_id)),
         kv("permission", opt(&a.pending_permission)),
-        Line::raw(""),
-        Line::from(Span::styled("recent activity", Style::new().bold())),
     ];
+    if let Some(mode) = office_core::rosso::dispatch_mode(scene, &a.id) {
+        let (tag, col) = dispatch_tag(mode);
+        v.push(Line::from(vec![
+            Span::styled(format!("{:<12}", "dispatch"), Style::new().fg(Color::DarkGray)),
+            Span::styled(tag, Style::new().fg(col).bold()),
+        ]));
+    }
+    if let Some(qt) = scene.queue_tickets.get(&a.id) {
+        let (txt, col) = queue_label(qt);
+        let st = col.map(|c| Style::new().fg(c).bold()).unwrap_or_default();
+        v.push(Line::from(vec![
+            Span::styled(format!("{:<12}", "queue"), Style::new().fg(Color::DarkGray)),
+            Span::styled(txt, st),
+        ]));
+    }
+    v.push(Line::raw(""));
+    v.push(Line::from(Span::styled("recent activity", Style::new().bold())));
     match app.history.get(&a.id) {
         Some(h) if !h.is_empty() => {
             for (t, text) in h.iter().rev() {
@@ -1772,5 +1923,127 @@ mod tests {
         let popped = render(&mut app, &scene, &mut office, 120, 40);
         assert!(popped.contains("[██████░░░░] 62%"), "{popped}");
         assert!(app.layout.popup.width > 0 && app.layout.popup.height > 0);
+    }
+
+    #[test]
+    fn jobs_tab_renders_wave_progress_row() {
+        let (mut app, mut scene) = test_app();
+        scene.reports.push(office_core::Report {
+            id: 1,
+            at_ms: 40_000,
+            kind: office_core::ReportKind::Task,
+            from: "rosso:Chief of Staff".into(),
+            from_label: "Chief of Staff".into(),
+            to: Some("rosso:Chief Architect".into()),
+            to_label: "Chief Architect".into(),
+            title: "Memo: Add login".into(),
+            body: "x".into(),
+            brief: String::new(),
+        });
+        scene.report_jobs.insert(1, "job-login".into());
+        scene.waves.insert(
+            "job-login".into(),
+            office_core::WaveState {
+                job: "job-login".into(),
+                plan: "council-r2".into(),
+                updated_ms: 55_000,
+                done: 2,
+                relay_inflight: 1,
+                pending: 1,
+                calls: vec![
+                    office_core::WaveCall { title: "Security Seat".into(), status: "OK".into(), verdict: Some("APPROVE".into()), relay: false },
+                    office_core::WaveCall { title: "Review Seat".into(), status: "OK".into(), verdict: Some("REVISE".into()), relay: false },
+                ],
+            },
+        );
+        scene.waves.insert(
+            "job-wave-only".into(),
+            office_core::WaveState {
+                job: "job-wave-only".into(),
+                plan: "inspect".into(),
+                updated_ms: 50_000,
+                done: 1,
+                relay_inflight: 0,
+                pending: 1,
+                calls: vec![office_core::WaveCall { title: "Tester".into(), status: "OK".into(), verdict: Some("PASS".into()), relay: false }],
+            },
+        );
+
+        let mut office = OfficeCtx::new(None, None);
+        app.side_tab = SideTab::Jobs;
+        let s = render(&mut app, &scene, &mut office, 140, 40);
+        assert!(s.contains("Jobs (2)"), "{s}");
+        assert!(s.contains("wave council-r2: 2✓ 1⟳ 1·"), "{s}");
+        assert!(s.contains("APPROVE"), "{s}");
+        assert!(s.contains("wave inspect: 1✓ 1· PASS"), "{s}");
+    }
+
+    #[test]
+    fn inspector_and_detail_show_dispatch_mode_and_queue_ticket() {
+        let (mut app, mut scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+
+        // Dispatch modes on a top-level Claude session
+        scene.dispatch_modes.insert("cc:dice".into(), office_core::DispatchMode::Direct);
+        select(&mut app, "cc:dice");
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("DIRECT"), "{s}");
+        app.popup = Popup::Detail("cc:dice".into());
+        let d = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(d.contains("dispatch") && d.contains("DIRECT"), "{d}");
+
+        app.popup = Popup::None;
+        scene.dispatch_modes.insert("cc:dice".into(), office_core::DispatchMode::Relay);
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("RELAY"), "{s}");
+
+        scene.dispatch_modes.insert("cc:dice".into(), office_core::DispatchMode::Hybrid);
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("DIR+RLY"), "{s}");
+
+        // Queue ticket on queued agy worker with repo_busy
+        scene.queue_tickets.insert(
+            "agy:4242".into(),
+            office_core::QueueTicket { pos: 1, since_ms: 10_000, repo_busy: true },
+        );
+        select(&mut app, "agy:4242");
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("queue #1 (repo busy)"), "{s}");
+        app.popup = Popup::Detail("agy:4242".into());
+        let d = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(d.contains("queue") && d.contains("queue #1 (repo busy)"), "{d}");
+
+        // Non-busy queue ticket omits "(repo busy)"
+        app.popup = Popup::None;
+        scene.queue_tickets.insert(
+            "agy:4242".into(),
+            office_core::QueueTicket { pos: 2, since_ms: 10_000, repo_busy: false },
+        );
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("queue #2") && !s.contains("repo busy"), "{s}");
+    }
+
+    #[test]
+    fn router_lines_show_rsv_and_orphans_only_when_present() {
+        let (_, mut scene) = test_app();
+        let line_text = |lines: Vec<Line<'static>>| -> String {
+            lines.into_iter().map(|l| l.spans.into_iter().map(|s| s.content.into_owned()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+
+        let base = line_text(router_lines(&scene, 60));
+        assert!(base.contains("free RAM 1800 MB · per agy 280 MB"), "{base}");
+        assert!(base.contains("pressure warn · queued 1"), "{base}");
+        assert!(base.contains("LIMIT capacity 3 reached"), "{base}");
+        assert!(!base.contains("rsv") && !base.contains("orphan"), "{base}");
+
+        scene.router_extra.reserved_mb = Some(0);
+        let zero_rsv = line_text(router_lines(&scene, 60));
+        assert!(!zero_rsv.contains("rsv"), "{zero_rsv}");
+
+        scene.router_extra.reserved_mb = Some(512);
+        scene.router_extra.orphans = 2;
+        let extra = line_text(router_lines(&scene, 60));
+        assert!(extra.contains("free RAM 1800 MB · per agy 280 MB · rsv 512M"), "{extra}");
+        assert!(extra.contains("pressure warn · queued 1 · 2 orphan"), "{extra}");
     }
 }

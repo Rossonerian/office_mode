@@ -827,7 +827,13 @@ impl Renderer {
 
         // queue order for Queued agents
         let mut queued: Vec<&Agent> = scene.agents.values().filter(|a| a.state == AgentState::Queued).collect();
-        queued.sort_by_key(|a| (a.started_ms, a.id.clone()));
+        queued.sort_by_key(|a| {
+            (
+                scene.queue_tickets.get(&a.id).map(|q| (q.pos, q.since_ms)).unwrap_or((u32::MAX, a.started_ms)),
+                a.started_ms,
+                a.id.clone(),
+            )
+        });
         let queue_pos: HashMap<&AgentId, usize> = queued.into_iter().enumerate().map(|(i, a)| (&a.id, i)).collect();
         let trips: HashMap<&AgentId, BossTrip> =
             scene.agents.values().filter_map(|a| self.boss_trip(a, scene, lay, t).map(|tr| (&a.id, tr))).collect();
@@ -987,6 +993,11 @@ impl Renderer {
                 if let Some(n) = at_desk.and_then(|(a, _)| scene.in_trays.get(&a.id)).filter(|n| **n > 0) {
                     extras::draw_in_tray(img, furn_t, desk_left + desk_w - 11, desk_top + 3, *n);
                 }
+                if let Some((a, _)) = at_desk.filter(|(a, _)| a.kind == AgentKind::Claude && a.parent.is_none()) {
+                    if let Some(mode) = office_core::rosso::dispatch_mode(scene, &a.id) {
+                        extras::draw_dispatch_tag(img, furn_t, desk_left + desk_w / 2, oy + 41, mode);
+                    }
+                }
             }
         }
         while free_idx < free.len() {
@@ -1059,6 +1070,13 @@ impl Renderer {
             blit(img, &buf, st.x - cat::BOX_W / 2 - 4, st.y - cat::BOX_H - 2);
             hits.push(([st.x - cat::BOX_W / 2 - 1, st.y - cat::BOX_H - 1, cat::BOX_W + 2, cat::BOX_H + 2], CAT_ID.to_string()));
             cat_at = Some(st);
+        }
+
+        if self.show.ambient {
+            if let Some(w) = office_core::rosso::latest_wave(scene) {
+                let wr = extras::draw_wave_strip(img, furn_t, lay.w / 2, WALL_H + 2, w, t);
+                reserved.push(wr);
+            }
         }
 
         // overlays: priority-ordered rect collision resolver so no two badges or speech bubbles overlap
@@ -1186,7 +1204,7 @@ impl Renderer {
             })
             .collect();
         // Plan high-priority rects first so critical/selected overlays ALWAYS win space, then draw low-to-high.
-        order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.started_ms.cmp(&b.0.started_ms)));
+        order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.started_ms.cmp(&b.0.started_ms)).then(a.0.id.cmp(&b.0.id)));
 
         struct Planned<'a> {
             a: &'a Agent,
@@ -1198,6 +1216,7 @@ impl Renderer {
             name: String,
             name_w: i32,
             verdict: Option<&'a str>,
+            queue: Option<&'a office_core::QueueTicket>,
             name_rect: [i32; 4],
             bubble: Option<(String, [i32; 4], Col, Col)>,
             icon: Option<(AgentState, i32, i32)>,
@@ -1252,7 +1271,20 @@ impl Renderer {
                 guard_ov = Some((tag, icon));
             }
         }
-        // Nameplates (and the boss's ballot) are never covered, even by must-show overlays.
+        // council seats (member -> seat index, pod origin) and the conference tables/AGENDA screens labels must not cover
+        let mut council_seat: HashMap<&AgentId, (usize, i32, i32)> = HashMap::new();
+        let mut table_rects: Vec<[i32; 4]> = Vec::new();
+        for pod in lay.pods.iter().filter(|p| p.kind == layout::PodKind::Council) {
+            let [tx, ty, tw, th] = layout::COUNCIL_TABLE;
+            table_rects.push([pod.x + tx, pod.y + ty, tw, th]);
+            placed.push([pod.x + layout::POD_W / 2 - 22, pod.y + 3, 44, 10]);
+            for (d, id) in pod.desks.iter().enumerate() {
+                if let Some(id) = id {
+                    council_seat.insert(id, (d, pod.x, pod.y));
+                }
+            }
+        }
+        // Nameplates, reserved strips, council AGENDA screens, and the boss's ballot are never covered, even by must-show overlays.
         let plates: Vec<[i32; 4]> = placed.clone();
         let best_spot = |cands: &[[i32; 4]], placed: &[[i32; 4]]| -> Option<[i32; 4]> {
             cands
@@ -1261,19 +1293,6 @@ impl Renderer {
                 .filter(|r| !plates.iter().any(|p| rects_overlap(*r, *p)))
                 .min_by_key(|r| placed.iter().filter(|p| rects_overlap(*r, **p)).count())
         };
-
-        // council seats (member -> seat index, pod origin) and the conference tables labels must not cover
-        let mut council_seat: HashMap<&AgentId, (usize, i32, i32)> = HashMap::new();
-        let mut table_rects: Vec<[i32; 4]> = Vec::new();
-        for pod in lay.pods.iter().filter(|p| p.kind == layout::PodKind::Council) {
-            let [tx, ty, tw, th] = layout::COUNCIL_TABLE;
-            table_rects.push([pod.x + tx, pod.y + ty, tw, th]);
-            for (d, id) in pod.desks.iter().enumerate() {
-                if let Some(id) = id {
-                    council_seat.insert(id, (d, pod.x, pod.y));
-                }
-            }
-        }
 
         for (a, _prio) in &order {
             let is_sel = selected == Some(&a.id);
@@ -1288,6 +1307,7 @@ impl Renderer {
             };
             let max_name = if is_sel || is_hov { 120 } else { CELL_W - 4 };
             let verdict = scene.verdicts.get(&a.id).map(String::as_str);
+            let queue = (a.state == AgentState::Queued).then(|| scene.queue_tickets.get(&a.id)).flatten();
             // ROSSO titles abbreviate ("SEC SEAT") before they would be cut, and the verdict chip keeps its room
             let name_budget = if verdict.is_some() && !(is_sel || is_hov) {
                 max_name + 12 - verdict.map(extras::chip_width).unwrap_or(0)
@@ -1296,7 +1316,9 @@ impl Renderer {
             };
             let name = extras::tag_name(&a.label, name_budget);
             let name_w = font::text_width(&name) + 5; // +2px pip +1px gap +2px pad
-            let nw = name_w + verdict.map(extras::chip_width).unwrap_or(0);
+            let nw = name_w
+                + verdict.map(extras::chip_width).unwrap_or(0)
+                + queue.map(extras::queue_chip_width).unwrap_or(0);
             let nh = font::GLYPH_H + 2;
             let nx = (cx - nw / 2).clamp(bounds[0], (bounds[0] + bounds[2] - nw).max(bounds[0]));
             let ny = (head_y - 10).clamp(bounds[1], (bounds[1] + bounds[3] - nh).max(bounds[1]));
@@ -1315,6 +1337,8 @@ impl Renderer {
                 [nx, (ny - nh - 2).max(min_y), nw, nh],
                 [nx, (ny - (nh + 2) * 2).max(min_y), nw, nh],
                 [nx, (ny + nh + 2).min(max_y), nw, nh],
+                [nx, (head_y + 26).min(max_y), nw, nh],
+                [nx, (ny - (nh + 2) * 3).max(min_y), nw, nh],
             ];
             // Council members: far side labels sit above the heads, near side labels below the chair
             // (under the glass front wall, then inside the cabin behind the chair); never over the table.
@@ -1426,7 +1450,7 @@ impl Renderer {
                 placed.push([ix, iy, 9, 11]);
             }
 
-            planned.push(Planned { a, cx, head_y, is_sel, is_hov, show_name, name, name_w, verdict, name_rect, bubble: bubble_op, icon });
+            planned.push(Planned { a, cx, head_y, is_sel, is_hov, show_name, name, name_w, verdict, queue, name_rect, bubble: bubble_op, icon });
         }
 
         for p in planned.into_iter().rev() {
@@ -1444,8 +1468,13 @@ impl Renderer {
                 fill(img, nx, ny, 2, nh, f(kind_color(p.a.kind)));
                 font::draw_text(img, nx + 3, ny + 1, &p.name, f(PAPER));
             }
+            let mut chip_x = nx + p.name_w;
             if let (true, Some(v)) = (p.show_name, p.verdict) {
-                extras::draw_chip(img, char_t, nx + p.name_w, ny, nh, v, t);
+                extras::draw_chip(img, char_t, chip_x, ny, nh, v, t);
+                chip_x += extras::chip_width(v);
+            }
+            if let (true, Some(qt)) = (p.show_name, p.queue) {
+                extras::draw_queue_chip(img, char_t, chip_x, ny, nh, qt);
             }
             if let Some((text, [bx, by, bw, bh], fg, bg)) = p.bubble {
                 let border = f(INK);

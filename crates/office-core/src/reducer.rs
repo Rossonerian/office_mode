@@ -16,6 +16,9 @@ pub const RETIRED_TTL_MS: u64 = 5 * 60 * 1_000;
 /// Max alerts kept in Scene.alerts (oldest dropped first; newest last).
 pub const MAX_ALERTS: usize = 200;
 const MAX_RETIRED: usize = 512;
+const MAX_QUEUE_TICKETS: usize = 64;
+const MAX_WAVES: usize = 16;
+const MAX_DISPATCH_MODES: usize = 32;
 
 /// Tool name -> character state (shared by every source).
 pub fn state_for_tool(tool: &str) -> AgentState {
@@ -575,6 +578,9 @@ impl Reducer {
     }
 
     fn set_state(&mut self, id: &str, state: AgentState, at: u64) {
+        if state != AgentState::Queued {
+            self.scene.queue_tickets.remove(id);
+        }
         if let Some(a) = self.scene.agents.get_mut(id) {
             a.state = state;
             if state == AgentState::Leaving {
@@ -901,7 +907,8 @@ impl Reducer {
                     refresh_target = Some(id);
                     true
                 } else {
-                    self.cascade_leaving(&id, at)
+                    let ticket_removed = self.scene.queue_tickets.remove(&id).is_some();
+                    self.cascade_leaving(&id, at) || ticket_removed
                 }
             }
             EventKind::Router(status) => {
@@ -947,6 +954,34 @@ impl Reducer {
                 }
                 None => false,
             },
+            EventKind::QueueTickets(mut m) => {
+                while m.len() > MAX_QUEUE_TICKETS {
+                    m.pop_last();
+                }
+                let changed = self.scene.queue_tickets != m;
+                self.scene.queue_tickets = m;
+                changed
+            }
+            EventKind::Waves(mut m) => {
+                while m.len() > MAX_WAVES {
+                    if let Some(oldest) = m.iter().min_by_key(|(_, w)| w.updated_ms).map(|(k, _)| k.clone()) {
+                        m.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                let changed = self.scene.waves != m;
+                self.scene.waves = m;
+                changed
+            }
+            EventKind::DispatchModes(mut m) => {
+                while m.len() > MAX_DISPATCH_MODES {
+                    m.pop_last();
+                }
+                let changed = self.scene.dispatch_modes != m;
+                self.scene.dispatch_modes = m;
+                changed
+            }
             EventKind::Handoff { from, to, kind, title, body, brief } => {
                 self.push_report(at, kind, from, to, title, body, brief);
                 true
@@ -1004,6 +1039,7 @@ impl Reducer {
             changed = true;
         }
         for id in to_leave {
+            self.scene.queue_tickets.remove(&id);
             if let Some(a) = self.scene.agents.get_mut(&id) {
                 a.state = AgentState::Leaving;
                 a.last_event_ms = a.last_event_ms.max(now_ms);
@@ -1027,6 +1063,8 @@ impl Reducer {
             self.scene.failures.remove(&id);
             self.scene.entrypoints.remove(&id);
             self.scene.in_trays.remove(&id);
+            self.scene.queue_tickets.remove(&id);
+            self.scene.dispatch_modes.remove(&id);
             self.retire_agent(id.clone(), now_ms);
             self.leaving_since.remove(&id);
             changed = true;
@@ -1881,5 +1919,106 @@ mod tests {
         assert_eq!(crate::rosso::verdict_class("APPROVE_WITH_CONDITIONS"), 1);
         assert_eq!(crate::rosso::verdict_class("OBJECT"), 2);
         assert_eq!(crate::rosso::verdict_class("SUPPORT"), 0);
+    }
+
+    #[test]
+    fn queue_tickets_bounded_and_pruned_when_leaving_queued() {
+        use crate::model::QueueTicket;
+
+        let mut r = Reducer::new();
+        r.apply(ev(0, seen("agy:a", Some("a"), None)));
+        r.apply(ev(0, seen("agy:b", Some("b"), None)));
+        r.apply(ev(0, seen("agy:c", Some("c"), None)));
+        for id in ["agy:a", "agy:b", "agy:c"] {
+            r.apply(ev(1, EventKind::State { id: id.into(), state: AgentState::Queued, activity: None }));
+        }
+
+        let mut tickets = BTreeMap::new();
+        tickets.insert("agy:a".into(), QueueTicket { pos: 1, since_ms: 100, repo_busy: false });
+        tickets.insert("agy:b".into(), QueueTicket { pos: 2, since_ms: 200, repo_busy: true });
+        tickets.insert("agy:c".into(), QueueTicket { pos: 3, since_ms: 300, repo_busy: false });
+        assert!(r.apply(ev(2, EventKind::QueueTickets(tickets.clone()))));
+        assert!(!r.apply(ev(3, EventKind::QueueTickets(tickets))));
+        assert_eq!(r.scene().queue_tickets.len(), 3);
+
+        // Staying Queued preserves ticket
+        r.apply(ev(4, EventKind::State { id: "agy:a".into(), state: AgentState::Queued, activity: Some("wait".into()) }));
+        assert!(r.scene().queue_tickets.contains_key("agy:a"));
+
+        // Transitioning out of Queued via State, ToolStart, and Gone removes tickets
+        r.apply(ev(5, EventKind::State { id: "agy:a".into(), state: AgentState::Running, activity: None }));
+        assert!(!r.scene().queue_tickets.contains_key("agy:a"));
+        r.apply(ev(6, EventKind::ToolStart { id: "agy:b".into(), tool: "Read".into(), summary: "x".into() }));
+        assert!(!r.scene().queue_tickets.contains_key("agy:b"));
+        r.apply(ev(7, EventKind::Gone { id: "agy:c".into() }));
+        assert!(!r.scene().queue_tickets.contains_key("agy:c"));
+
+        // Truncated to at most 64 entries
+        let many: BTreeMap<AgentId, QueueTicket> = (0..80)
+            .map(|i| (format!("agy:q{i:02}"), QueueTicket { pos: i, since_ms: 1, repo_busy: false }))
+            .collect();
+        assert!(r.apply(ev(8, EventKind::QueueTickets(many))));
+        assert_eq!(r.scene().queue_tickets.len(), MAX_QUEUE_TICKETS);
+    }
+
+    #[test]
+    fn waves_bounded_keeping_freshest_by_updated_ms() {
+        use crate::model::{WaveCall, WaveState};
+
+        let mut r = Reducer::new();
+        let mut waves = BTreeMap::new();
+        for i in 0..24u64 {
+            let job = format!("job-{i:02}");
+            waves.insert(
+                job.clone(),
+                WaveState {
+                    job,
+                    plan: "plan".into(),
+                    updated_ms: 1_000 + i * 10,
+                    done: 1,
+                    relay_inflight: 0,
+                    pending: 0,
+                    calls: vec![WaveCall { title: "Technician".into(), status: "done".into(), verdict: Some("PASS".into()), relay: false }],
+                },
+            );
+        }
+        assert!(r.apply(ev(2_000, EventKind::Waves(waves))));
+        assert_eq!(r.scene().waves.len(), MAX_WAVES);
+        for i in 0..8 {
+            assert!(!r.scene().waves.contains_key(&format!("job-{i:02}")));
+        }
+        for i in 8..24 {
+            assert!(r.scene().waves.contains_key(&format!("job-{i:02}")));
+        }
+        let current = r.scene().waves.clone();
+        assert!(!r.apply(ev(2_001, EventKind::Waves(current))));
+    }
+
+    #[test]
+    fn dispatch_modes_bounded_and_pruned_on_agent_removal() {
+        use crate::model::DispatchMode;
+
+        let mut r = Reducer::new();
+        r.apply(ev(0, seen("cc:s1", None, None)));
+        r.apply(ev(0, seen("cc:s2", None, None)));
+
+        let mut modes = BTreeMap::new();
+        modes.insert("cc:s1".into(), DispatchMode::Direct);
+        modes.insert("cc:s2".into(), DispatchMode::Hybrid);
+        assert!(r.apply(ev(1, EventKind::DispatchModes(modes.clone()))));
+        assert!(!r.apply(ev(2, EventKind::DispatchModes(modes))));
+        assert_eq!(r.scene().dispatch_modes.get("cc:s1"), Some(&DispatchMode::Direct));
+
+        r.apply(ev(10, EventKind::Gone { id: "cc:s1".into() }));
+        r.sweep(10 + LEAVE_MS);
+        assert!(!r.scene().agents.contains_key("cc:s1"));
+        assert!(!r.scene().dispatch_modes.contains_key("cc:s1"));
+        assert_eq!(r.scene().dispatch_modes.get("cc:s2"), Some(&DispatchMode::Hybrid));
+
+        let many: BTreeMap<AgentId, DispatchMode> = (0..40)
+            .map(|i| (format!("cc:m{i:02}"), DispatchMode::Relay))
+            .collect();
+        assert!(r.apply(ev(20_000, EventKind::DispatchModes(many))));
+        assert_eq!(r.scene().dispatch_modes.len(), MAX_DISPATCH_MODES);
     }
 }
