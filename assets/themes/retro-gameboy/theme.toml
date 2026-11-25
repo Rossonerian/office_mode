@@ -1,0 +1,31 @@
+# retro-gameboy: four-shade handheld-LCD look. Kenney "1-Bit Pack" (CC0, vendored, coloured sheet) remapped through a luminance palette;
+# Tiny Town (CC0) trees show through the windows, remapped by the same palette.
+[sheets]
+ob = { file = "../../vendor/kenney-1-bit-pack/colored-transparent_packed.png", tile = 16 }
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+door = { sheet = "ob", col = 3, row = 9 }
+chair = { sheet = "ob", col = 11, row = 9 }
+sofa = { sheet = "ob", tiles = [[14, 9], [15, 9]] }
+plant = { sheet = "ob", col = 6, row = 1 }
+cooler = { sheet = "ob", col = 5, row = 6 }
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
+[fx]
+palette = ["#0f380f", "#306230", "#8bac0f", "#9bbc0f"]
+floor_bg = "#0f380f"
+wall_bg = "#0f380f"
+
+[colors]
+backdrop = "#0f380f"
+floor_style = "plain"
+floor_a = "#0f380f"
+floor_b = "#8bac0f"
+wall = "#306230"
+wall_trim = "#8bac0f"
+rug = "#0f380f"
+rug_trim = "#8bac0f"
+sky = "#0f380f"

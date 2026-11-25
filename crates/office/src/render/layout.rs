@@ -19,6 +19,11 @@ pub const DECOR_H: i32 = 38;
 pub const BOTTOM_H: i32 = 46;
 pub const MIN_W: i32 = 272;
 pub const DESKS_PER_POD: usize = 4;
+/// Council cabin: y of the far-side seats and the gap to the near-side seats (relative to the pod).
+pub const COUNCIL_ROW0: i32 = 12;
+pub const COUNCIL_ROW_DY: i32 = 58;
+/// The conference table [x, y, w, h] relative to the pod origin (surface + front edge).
+pub const COUNCIL_TABLE: [i32; 4] = [12, 42, 72, 36];
 /// The CEO's corner office (top-right, below the decor strip).
 pub const CEO_W: i32 = 72;
 pub const CEO_H: i32 = 64;
@@ -28,11 +33,13 @@ pub const CEO_H: i32 = 64;
 pub struct Extras {
     /// Reserve the CEO corner office.
     pub ceo: bool,
+    /// Council members get a glass cabin; when false they sit at ordinary desks.
+    pub council: bool,
 }
 
 impl Default for Extras {
     fn default() -> Self {
-        Extras { ceo: true }
+        Extras { ceo: true, council: true }
     }
 }
 
@@ -111,6 +118,10 @@ pub struct Zone {
 impl Pod {
     /// Top-left of desk cell `i` (0 TL, 1 TR, 2 BL, 3 BR).
     pub fn cell(&self, i: usize) -> (i32, i32) {
+        if self.kind == PodKind::Council {
+            // two seats per long side of the conference table: far side (0, 1), near side (2, 3)
+            return (self.x - 2 + (i as i32 % 2) * CELL_W, self.y + COUNCIL_ROW0 + (i as i32 / 2) * COUNCIL_ROW_DY);
+        }
         (self.x + (i as i32 % 2) * CELL_W, self.y + (i as i32 / 2) * CELL_H)
     }
 }
@@ -280,7 +291,7 @@ pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
     for (g, (host, ids)) in groups(scene).into_iter().enumerate() {
         let lab = host.is_empty();
         group_hosts.push((!lab).then(|| host.clone()));
-        let (council, desks): (Vec<AgentId>, Vec<AgentId>) = if lab {
+        let (council, desks): (Vec<AgentId>, Vec<AgentId>) = if lab || !ex.council {
             (Vec::new(), ids)
         } else {
             ids.into_iter().partition(|id| scene.agents.get(id).is_some_and(is_council))
@@ -432,9 +443,21 @@ impl Layout {
     pub fn obstacles(&self) -> Vec<Obstacle> {
         let mut v = Vec::new();
         for (pi, pod) in self.pods.iter().enumerate() {
+            if pod.kind == PodKind::Council {
+                // the table (the cat may hop onto either half from the far-side seats' spots)
+                let [tx, ty, tw, th] = COUNCIL_TABLE;
+                v.push(Obstacle { spot: Some(SpotKind::Desk(pi, 0)), rect: [pod.x + tx, pod.y + ty, tw / 2, th] });
+                v.push(Obstacle { spot: Some(SpotKind::Desk(pi, 1)), rect: [pod.x + tx + tw / 2, pod.y + ty, tw - tw / 2, th] });
+                continue;
+            }
             for d in 0..DESKS_PER_POD {
                 let (ox, oy) = pod.cell(d);
                 v.push(Obstacle { spot: Some(SpotKind::Desk(pi, d)), rect: desk_rect(ox, oy) });
+            }
+            // the bench joint + frosted privacy panel between the two seats of each row
+            for r in 0..2 {
+                let (ox, oy) = pod.cell(r * 2);
+                v.push(Obstacle { spot: None, rect: [ox + CELL_W - 4, oy + 22, 8, 26] });
             }
         }
         if let Some(r) = self.ceo_desk_rect() {
@@ -451,18 +474,22 @@ impl Layout {
     /// the wall corridor (the CEO desk from behind, so the cat never crosses the nameplate).
     pub fn access(&self, s: &Spot) -> (i32, i32) {
         match s.kind {
-            SpotKind::Desk(..) => (s.x, aisle_below(s.y - 34)),
+            SpotKind::Desk(pi, _) => match self.pods.get(pi) {
+                // council seats: reached from the floor in front of the cabin's door line
+                Some(p) if p.kind == PodKind::Council => (s.x, p.y + POD_H - 8),
+                _ => (s.x, aisle_below(s.y - 34)),
+            },
             SpotKind::Floor => (s.x, s.y),
             SpotKind::Sofa | SpotKind::Sill | SpotKind::CeoDesk => (s.x, self.aisle_top()),
         }
     }
 
-    /// Vertical aisles: left of each pod column, between a pod's two desk columns, and right of
-    /// the last column (all left of the CEO corner).
+    /// Vertical aisles: left and right of each pod column (the privacy partitions close the gap
+    /// between a pod's two desk columns), all left of the CEO corner.
     pub fn aisles_x(&self) -> Vec<i32> {
         let mut xs: Vec<i32> = Vec::new();
         for p in &self.pods {
-            xs.extend([p.x - GAP_X / 2, p.x + CELL_W, p.x + POD_W + GAP_X / 2]);
+            xs.extend([p.x - GAP_X / 2, p.x + POD_W + GAP_X / 2]);
         }
         if xs.is_empty() {
             xs.push(MARGIN / 2);
@@ -487,6 +514,14 @@ impl Layout {
         xs
     }
 
+    /// Where a seat's owner enters/leaves: the aisle in front of the desk, or the council cabin's door.
+    pub fn seat_aisle(&self, s: &Seat) -> (i32, i32) {
+        match self.pods.get(s.pod) {
+            Some(p) if p.kind == PodKind::Council => (p.x + POD_W / 2, p.y + POD_H + 1),
+            _ => (s.x + 26, s.y + CELL_H - 3),
+        }
+    }
+
     /// Manhattan aisle route for walking agents (never cuts diagonally through desks).
     pub fn walk_route(&self, from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
         if (from.1 - to.1).abs() <= 4 {
@@ -499,6 +534,34 @@ impl Layout {
             .unwrap_or(from.0);
         let mut pts = vec![from, (xv, from.1), (xv, to.1), to];
         pts.dedup();
+        self.avoid_council_tables(pts)
+    }
+
+    /// Re-route any horizontal leg that would cut through a council cabin's table: step down to
+    /// the floor in front of the table, cross the cabin there and step back up.
+    fn avoid_council_tables(&self, mut pts: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
+        if !self.pods.iter().any(|p| p.kind == PodKind::Council) {
+            return pts;
+        }
+        let [_, ty, _, th] = COUNCIL_TABLE;
+        for _ in 0..16 {
+            let hit = pts.windows(2).enumerate().find_map(|(i, w)| {
+                if w[0].1 != w[1].1 || w[0].0 == w[1].0 {
+                    return None;
+                }
+                let y = w[0].1;
+                let (lo, hi) = (w[0].0.min(w[1].0), w[0].0.max(w[1].0));
+                self.pods
+                    .iter()
+                    .filter(|p| p.kind == PodKind::Council && y >= p.y + ty - 3 && y < p.y + ty + th + 3 && hi > p.x && lo < p.x + POD_W)
+                    .map(|p| (i, p.y + ty + th + 5))
+                    .next()
+            });
+            let Some((i, y2)) = hit else { break };
+            let (a, b) = (pts[i], pts[i + 1]);
+            pts.splice(i + 1..i + 1, [(a.0, y2), (b.0, y2)]);
+            pts.dedup();
+        }
         pts
     }
 
@@ -524,7 +587,7 @@ impl Layout {
         pts.push(b);
         pts.push((to.x, to.y));
         pts.dedup();
-        pts
+        self.avoid_council_tables(pts)
     }
 }
 
@@ -648,7 +711,7 @@ mod tests {
                 assert!(l.spots.iter().any(|s| s.kind == SpotKind::Sofa));
             }
         }
-        let off = build_with(&Scene::default(), 640, 360, Extras { ceo: false });
+        let off = build_with(&Scene::default(), 640, 360, Extras { ceo: false, council: true });
         assert!(off.ceo.is_none() && !off.spots.iter().any(|s| s.kind == SpotKind::CeoDesk));
     }
 
@@ -714,4 +777,69 @@ mod tests {
         }
     }
 
+
+    fn council_scene() -> Scene {
+        let mut v = vec![
+            agent("cc:a", AgentKind::Claude, None, Some("/p/a"), 1),
+            agent("cc:b", AgentKind::Claude, None, Some("/p/b"), 2),
+            agent("cc-sub:a/1", AgentKind::ClaudeSub, Some("cc:a"), None, 3),
+        ];
+        for (i, role) in ["agy-council-architect", "agy-council-advisor", "agy-council-advisor", "agy-council-advisor"].iter().enumerate() {
+            let mut a = agent(&format!("cc-sub:a/c{i}"), AgentKind::ClaudeSub, Some("cc:a"), None, 10 + i as u64);
+            a.role = Some((*role).into());
+            v.push(a);
+        }
+        scene(v)
+    }
+
+    #[test]
+    fn council_seats_sit_two_per_side_of_a_centred_table() {
+        let l = build(&council_scene(), 1280, 720);
+        let pod = l.pods.iter().find(|p| p.kind == PodKind::Council).expect("council pod");
+        let [tx, ty, tw, th] = COUNCIL_TABLE;
+        let cells: Vec<(i32, i32)> = (0..DESKS_PER_POD).map(|d| pod.cell(d)).collect();
+        // far side above the table, near side below it, symmetric about the table centre
+        assert!(cells[0].1 + 30 <= pod.y + ty + 1 && cells[1].1 == cells[0].1);
+        assert!(cells[2].1 + 13 + 2 >= pod.y + ty + th && cells[3].1 == cells[2].1);
+        let centre = pod.x + tx + tw / 2;
+        assert_eq!((cells[0].0 + 26) + (cells[1].0 + 26), centre * 2);
+        // every council agent has a seat in the cabin
+        assert_eq!(pod.desks.iter().flatten().count(), 4);
+    }
+
+    #[test]
+    fn walking_routes_avoid_the_council_table_and_desk_partitions() {
+        let s = council_scene();
+        for (pw, ph) in [(640, 360), (1280, 720), (1920, 1080)] {
+            let l = build(&s, pw, ph);
+            let obstacles = l.obstacles();
+            let mut spots = l.spots.clone();
+            for (pi, p) in l.pods.iter().enumerate() {
+                if p.kind == PodKind::Council {
+                    for d in 0..2 {
+                        let (ox, oy) = p.cell(d);
+                        let (x, y) = desk_top(ox, oy);
+                        spots.push(Spot { kind: SpotKind::Desk(pi, d), x, y });
+                    }
+                }
+            }
+            for from in &spots {
+                for to in &spots {
+                    let pts = l.route(from, to);
+                                        for (si, w) in pts.windows(2).enumerate() {
+                        // the first and last legs are the deliberate hops off/onto a desk
+                        if si == 0 || si + 1 == pts.len() - 1 {
+                            continue;
+                        }
+                        let n = ((w[1].0 - w[0].0).abs() + (w[1].1 - w[0].1).abs()).max(1);
+                        for k in 0..=n {
+                            let x = w[0].0 + (w[1].0 - w[0].0) * k / n;
+                            let y = w[0].1 + (w[1].1 - w[0].1) * k / n;
+                            assert!(!obstacles.iter().any(|o| o.contains(x, y)), "route {pts:?} crosses an obstacle at {:?}", (x, y));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

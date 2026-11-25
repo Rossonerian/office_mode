@@ -375,7 +375,7 @@ mod tests {
         let scenes = [demo::demo_scene(now), Scene::default()];
         for s in &scenes {
             for (pw, ph, ceo) in [(640, 360, true), (1600, 900, false), (300, 800, true)] {
-                let lay = layout::build_with(s, pw, ph, layout::Extras { ceo });
+                let lay = layout::build_with(s, pw, ph, layout::Extras { ceo, council: true });
                 let mut seen = std::collections::HashSet::new();
                 for i in 0..4_000u64 {
                     let t = now + i * 97;
@@ -419,7 +419,7 @@ mod tests {
         }
         for s in [demo::demo_scene(now), Scene::default(), big] {
             for (pw, ph, ceo) in [(640, 360, true), (1600, 900, false), (300, 800, true), (1920, 400, true)] {
-                let lay = layout::build_with(&s, pw, ph, layout::Extras { ceo });
+                let lay = layout::build_with(&s, pw, ph, layout::Extras { ceo, council: true });
                 out.push((s.clone(), lay));
             }
         }

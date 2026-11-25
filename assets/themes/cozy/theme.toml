@@ -1,8 +1,12 @@
 # cozy: Kenney "Roguelike Indoors" (CC0) furniture on warm procedural wood floors.
 [sheets]
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
 indoor = { file = "roguelikeIndoor.png", tile = 16, spacing = 1 }
 
 [sprites]
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
 desk = { sheet = "indoor", tiles = [[4, 4], [6, 4]] }
 chair = { sheet = "indoor", col = 0, row = 3 }
 plant = { sheet = "indoor", col = 17, row = 0 }

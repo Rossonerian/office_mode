@@ -235,9 +235,11 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
             let text = format!("Cancel {label} (pid {pid})? y/n");
             Some(centered(area, text.chars().count() as u16 + 6, 3))
         }
+        Popup::Theme { names, .. } => Some(centered(area, 36, (names.len() as u16 + 4).min(max_h))),
         Popup::Mixer { .. } => Some(centered(area, 50, (LAYERS.len() as u16 + 5).min(max_h))),
-        Popup::Reports { only, .. } => {
-            let n = crate::app::state::report_list(scene, only.as_deref()).len() as u16;
+        Popup::View { .. } => Some(centered(area, 56, (office_core::config::ShowConfig::ITEMS.len() as u16 + 5).min(max_h))),
+        Popup::Reports { only, inbox, .. } => {
+            let n = crate::app::state::report_list_for(scene, only.as_deref(), *inbox).len() as u16;
             Some(centered(area, 100, (n + 4).clamp(6, max_h)))
         }
         Popup::ReportView { .. } => Some(centered(area, 100, max_h)),
@@ -250,6 +252,55 @@ fn report_kind_tag(k: office_core::ReportKind) -> (&'static str, Color) {
         office_core::ReportKind::Report => ("report", Color::Yellow),
         office_core::ReportKind::Result => ("result", Color::LightBlue),
     }
+}
+
+/// Rect of the boss-inbox notification card inside the office area (None when it does not fit).
+pub fn card_rect(office: Rect) -> Option<Rect> {
+    if office.width < 24 || office.height < 6 {
+        return None;
+    }
+    let w = 48.min(office.width);
+    let h = 6;
+    Some(Rect::new(office.x + office.width - w, office.y + office.height - h, w, h))
+}
+
+fn draw_card(f: &mut Frame, app: &mut App, scene: &Scene, office: Rect) {
+    app.layout.card = Rect::default();
+    if app.popup != Popup::None {
+        return;
+    }
+    let (Some(rep), Some(r)) = (app.card_report(scene), card_rect(office)) else {
+        return;
+    };
+    app.layout.card = r;
+    let (tag, c) = if rep.title.starts_with('⚠') {
+        ("⚠ escalation", Color::LightRed)
+    } else if rep.kind == office_core::ReportKind::Result {
+        ("result", Color::LightBlue)
+    } else {
+        ("report", Color::Yellow)
+    };
+    let unread = app.unread_count(scene);
+    let b = Block::bordered()
+        .border_style(Style::new().fg(c))
+        .title(format!(" ✉ boss inbox{} ", if unread > 1 { format!(" · {unread} unread") } else { String::new() }))
+        .title_bottom(Line::from(" enter read · esc dismiss · i inbox ").right_aligned())
+        .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+    let inner = b.inner(r);
+    let w = inner.width as usize;
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(tag.to_string(), Style::new().fg(c).bold()),
+            Span::styled(format!("  from {}", trunc(&rep.from_label, w.saturating_sub(tag.chars().count() + 8))), Style::new().fg(Color::Gray)),
+        ]),
+        Line::from(Span::styled(trunc(&rep.title, w), Style::new().bold())),
+    ];
+    for l in rep.body.lines().map(str::trim).filter(|l| !l.is_empty()).take(2) {
+        lines.push(Line::from(Span::styled(trunc(l, w), Style::new().fg(Color::Gray))));
+    }
+    f.render_widget(Clear, r);
+    f.render_widget(b, r);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The full text of one hand-off: who, when, the brief the sender was given, and what it sent.
@@ -303,7 +354,8 @@ pub fn draw(f: &mut Frame, app: &mut App, scene: &Scene, office: &mut OfficeCtx,
     };
     app.layout.office = office_area;
     app.layout.font_px = office.font_px();
-    let occ = popup_rect(f.area(), app, scene);
+    let card = if app.popup == Popup::None && app.card_report(scene).is_some() { card_rect(office_area) } else { None };
+    let occ = popup_rect(f.area(), app, scene).or(card);
     draw_office(f, app, scene, office, office_area, occ, now_ms);
     match side_area {
         Some(s) => draw_sidebar(f, app, scene, s, now_ms),
@@ -314,6 +366,7 @@ pub fn draw(f: &mut Frame, app: &mut App, scene: &Scene, office: &mut OfficeCtx,
             app.layout.alert_agent_ids.clear();
         }
     }
+    draw_card(f, app, scene, office_area);
     draw_popup(f, app, scene, office, now_ms);
 }
 
@@ -354,6 +407,10 @@ fn draw_header(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
             Span::styled(format!(" [{tag}]"), Style::new().fg(Color::DarkGray)),
         ]
     };
+    let unread = app.unread_count(scene);
+    if unread > 0 {
+        spans.insert(1, Span::styled(format!(" ✉ {unread} "), Style::new().fg(Color::Black).bg(Color::Yellow).bold()));
+    }
     if app.sound {
         spans.push(Span::styled("  │ sound", Style::new().fg(Color::Cyan)));
     }
@@ -392,7 +449,7 @@ fn draw_footer(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
             spans.push(Span::styled("  o resume", Style::new().fg(Color::Cyan)));
         }
     }
-    spans.push(Span::styled("  Tab jump  r reports  t/T theme  s side  ? help", dim));
+    spans.push(Span::styled("  Tab jump  r reports  t theme  [ ] cycle  T mix  v view  L labels  s side  ? help", dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -776,12 +833,16 @@ pub const HELP: &[(&str, &str)] = &[
     ("a / d", "approve / deny the pending permission"),
     ("x", "cancel the selected agy call (asks y/n)"),
     ("o", "resume the selected Claude session"),
-    ("t", "cycle theme presets"),
+    ("t", "theme picker (live preview; enter keeps, esc reverts)"),
+    ("[ / ]", "previous / next theme preset"),
     ("T", "theme mixer (per layer)"),
+    ("v", "View menu: show/hide names, bubbles, zones, cat, ..."),
+    ("L", "labels on/off (names + bubbles)"),
     ("s", "toggle sidebar"),
     ("n / m", "toggle notifications / audio chime"),
     ("c / C", "clear / restore alerts"),
     ("r", "hand-offs: briefs, reports, results (selected agent's, or all)"),
+    ("i", "boss inbox: results and escalations addressed to you (enter on the card reads)"),
     ("?", "this help"),
 ];
 
@@ -853,6 +914,19 @@ pub fn detail_lines(app: &App, a: &Agent, scene: &Scene, now_ms: u64) -> Vec<Lin
     v
 }
 
+/// One-line blurb for a built-in theme preset (empty for unknown/user themes).
+fn theme_desc(name: &str) -> &'static str {
+    match name {
+        "procedural" => "built-in pixels",
+        "modern" => "bright and clean",
+        "cozy" => "warm wood",
+        "midnight" => "dark blue night",
+        "retro" => "8-bit arcade",
+        "cyberpunk" => "neon city",
+        _ => "",
+    }
+}
+
 fn popup_frame(f: &mut Frame, r: Rect, title: String) -> Rect {
     f.render_widget(Clear, r);
     let b = Block::bordered().borders(Borders::ALL).title(title).style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
@@ -910,15 +984,19 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             f.render_widget(b, r);
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((app.detail_scroll, 0)), inner);
         }
-        Popup::Reports { sel, only } => {
-            let list = crate::app::state::report_list(scene, only.as_deref());
+        Popup::Reports { sel, only, inbox } => {
+            let list = crate::app::state::report_list_for(scene, only.as_deref(), *inbox);
             let n = list.len() as u16;
             let r = centered(area, 100, (n + 4).clamp(6, max_h));
             app.layout.popup = r;
             let who = only.as_ref().map(|id| scene.agents.get(id).map(|a| a.label.clone()).unwrap_or_else(|| id.clone()));
-            let title = match &who {
+            let title = if *inbox {
+                format!(" inbox · {} unread (a: all hand-offs) ", app.unread_count(scene))
+            } else {
+                match &who {
                 Some(w) => format!(" hand-offs · {w} (a: all) "),
                 None => " hand-offs · all ".to_string(),
+                }
             };
             let inner = popup_frame(f, r, title);
             let rows = inner.height.saturating_sub(1) as usize;
@@ -929,19 +1007,22 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 let (tag, c) = report_kind_tag(rep.kind);
                 let head = format!("{:>4}  ", fmt_ago(scene.now_ms, rep.at_ms));
                 let route = format!("{} → {}  ", trunc(&rep.from_label, 22), trunc(&rep.to_label, 18));
-                let rest = w.saturating_sub(head.chars().count() + 8 + route.chars().count());
+                let rest = w.saturating_sub(head.chars().count() + 10 + route.chars().count());
+                let unread = *inbox && app.inbox_seen < rep.id;
                 let mut style = Style::new();
                 if i == *sel {
                     style = style.bg(Color::Rgb(0x2a, 0x30, 0x40));
                 }
+                let route_style = if unread { style.bold() } else { style };
                 lines.push(Line::from(vec![
+                    Span::styled(if unread { "• " } else { "  " }, style.fg(Color::Yellow).bold()),
                     Span::styled(head, style.fg(Color::DarkGray)),
                     Span::styled(format!("{tag}  "), style.fg(c)),
-                    Span::styled(route, style),
+                    Span::styled(route, route_style),
                     Span::styled(trunc(&rep.title, rest), style.bold()),
                 ]));
             }
-            lines.push(Line::from(Span::styled("↑↓ select · enter open · a all · esc close", Style::new().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled("↑↓ select · enter open · a all · i inbox · esc close", Style::new().fg(Color::DarkGray))));
             f.render_widget(Paragraph::new(lines), inner);
         }
         Popup::ReportView { id, .. } => {
@@ -955,7 +1036,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let b = Block::bordered()
                 .borders(Borders::ALL)
                 .title(format!(" {} ", trunc(&rep.title, 60)))
-                .title_bottom(Line::from(" ↑↓/PgUp/PgDn scroll · esc back · q close ").right_aligned())
+                .title_bottom(Line::from(" ↑↓ scroll · g go · o resume · a/d approve/deny · n/p next/prev · esc back · q close ").right_aligned())
                 .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
             let inner = b.inner(r);
             let wrapped: usize = lines
@@ -974,6 +1055,48 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             app.layout.popup = r;
             let inner = popup_frame(f, r, " confirm ".into());
             f.render_widget(Paragraph::new(text).style(Style::new().fg(Color::LightRed).bold()), inner);
+        }
+        Popup::View { sel } => {
+            let items = office_core::config::ShowConfig::ITEMS;
+            let r = centered(area, 56, (items.len() as u16 + 5).min(max_h));
+            app.layout.popup = r;
+            let inner = popup_frame(f, r, " view ".into());
+            let mut lines: Vec<Line> = items
+                .iter()
+                .enumerate()
+                .map(|(i, (_, label))| {
+                    let style = if i == *sel { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
+                    let mark = if i == *sel { "▶" } else { " " };
+                    let b = if app.show.get(i) { "[x]" } else { "[ ]" };
+                    Line::from(Span::styled(format!("{mark} {b} {label}"), style))
+                })
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("↑↓ move  space toggle  a all  h hide overlays  esc save", Style::new().fg(Color::DarkGray))));
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Popup::Theme { sel, names, .. } => {
+            let r = centered(area, 36, (names.len() as u16 + 4).min(max_h));
+            app.layout.popup = r;
+            let inner = popup_frame(f, r, " theme ".into());
+            let cur = names.iter().position(|n| crate::app::state::mix_eq(&app.preset_mix(n), &app.mix)).unwrap_or(names.len());
+            let w = inner.width as usize;
+            let mut lines: Vec<Line> = names
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once("custom mix…"))
+                .enumerate()
+                .map(|(i, n)| {
+                    let style = if i == *sel { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
+                    let mark = if i == *sel { "▶" } else { " " };
+                    let dot = if i == cur { "●" } else { " " };
+                    let d = theme_desc(n);
+                    let text = if d.is_empty() { format!("{mark}{dot}{} {n}", i + 1) } else { format!("{mark}{dot}{} {n:<10} {d}", i + 1) };
+                    Line::from(Span::styled(trunc(&text, w), style))
+                })
+                .collect();
+            lines.push(Line::from(Span::styled(trunc("↑↓ preview  ⏎ keep  esc undo", w), Style::new().fg(Color::DarkGray))));
+            f.render_widget(Paragraph::new(lines), inner);
         }
         Popup::Mixer { layer } => {
             let themes = office.view.as_ref().map(|v| v.themes()).unwrap_or_else(|| vec!["procedural".into()]);
@@ -1089,9 +1212,36 @@ mod tests {
         assert!(s.contains("perm-1") && s.contains("recent activity") && s.contains("/tmp/office"), "{s}");
         app.popup = Popup::ConfirmCancel { id: "agy:4242".into(), label: "agy-worker".into(), pid: 4242 };
         assert!(render(&mut app, &scene, &mut office, 120, 40).contains("Cancel agy-worker (pid 4242)? y/n"));
+        app.popup = Popup::View { sel: 1 };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("▶ [x] speech bubbles") && s.contains("[ ] labels: selected/alert only"), "{s}");
+        app.popup = Popup::Theme { sel: 2, names: vec!["procedural".into(), "modern".into(), "cozy".into()], orig: crate::app::state::MixSnap(app.mix.clone()) };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("▶ 3 cozy") && s.contains("●1 procedural") && s.contains("custom mix…"), "{s}");
         app.popup = Popup::Mixer { layer: 2 };
         let s = render(&mut app, &scene, &mut office, 120, 40);
         assert!(s.contains("▶ furniture") && s.contains("◀ procedural ▶"), "{s}");
+    }
+
+    #[test]
+    fn inbox_card_header_badge_and_list_render() {
+        let (mut app, mut scene) = test_app();
+        scene.reports.push(office_core::Report {
+            id: 1, at_ms: 60_000, kind: office_core::ReportKind::Result, from: "cc:dice".into(), from_label: "cc·DICE".into(),
+            to: None, to_label: "you".into(), title: "Turn done".into(), body: "alpha\n\nbeta\ngamma".into(), brief: String::new(),
+        });
+        let mut office = OfficeCtx::new(None, None);
+        app.observe(&scene, 62_000, &mut FakeControl::default());
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("enter read · esc dismiss · i inbox"), "{s}");
+        assert!(s.contains("from cc·DICE") && s.contains("Turn done") && s.contains("alpha") && s.contains("beta"), "{s}");
+        assert!(!s.contains("gamma"), "only two body lines");
+        assert!(s.contains("✉ 1"), "{s}");
+        assert!(app.layout.card.width > 0);
+        app.popup = Popup::Reports { sel: 0, only: None, inbox: true };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("inbox · 1 unread") && s.contains("• "), "{s}");
+        assert!(!s.contains("enter read ·"), "no card behind a popup");
     }
 
     #[test]

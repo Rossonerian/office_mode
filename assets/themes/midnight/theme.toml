@@ -1,4 +1,12 @@
 # midnight: dark-studio theme built for Ghostty & late-night coding, with warm walnut desks and amber glows.
+[sheets]
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
 [fx]
 glow = "#f5a642"
 char_tint = "#e6dfd8"

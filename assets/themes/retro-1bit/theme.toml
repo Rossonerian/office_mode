@@ -1,0 +1,31 @@
+# retro-1bit: green-phosphor terminal look. Kenney "1-Bit Pack" (CC0, vendored, coloured sheet) remapped through a luminance palette;
+# Tiny Town (CC0) trees show through the windows, remapped by the same palette.
+[sheets]
+ob = { file = "../../vendor/kenney-1-bit-pack/colored-transparent_packed.png", tile = 16 }
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+door = { sheet = "ob", col = 3, row = 9 }
+chair = { sheet = "ob", col = 11, row = 9 }
+sofa = { sheet = "ob", tiles = [[14, 9], [15, 9]] }
+plant = { sheet = "ob", col = 6, row = 1 }
+cooler = { sheet = "ob", col = 5, row = 6 }
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
+[fx]
+palette = ["#001a05", "#0a4d1a", "#2fc24a", "#b8ffc0"]
+floor_bg = "#001a05"
+wall_bg = "#001a05"
+
+[colors]
+backdrop = "#001a05"
+floor_style = "plain"
+floor_a = "#001a05"
+floor_b = "#2fc24a"
+wall = "#0a4d1a"
+wall_trim = "#2fc24a"
+rug = "#001a05"
+rug_trim = "#2fc24a"
+sky = "#001a05"

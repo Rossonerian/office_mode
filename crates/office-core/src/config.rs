@@ -42,6 +42,108 @@ pub struct Config {
     pub cat: CatConfig,
     /// The CEO (you), at the big desk in the top-right corner.
     pub ceo: CeoConfig,
+    /// Which overlay layers the office view shows (the `v` View menu).
+    #[serde(default)]
+    pub show: ShowConfig,
+}
+
+/// `[show]`: display toggles for the office view (all on by default, `selected_only_labels` off).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShowConfig {
+    pub names: bool,
+    pub bubbles: bool,
+    pub icons: bool,
+    pub nameplates: bool,
+    pub zones: bool,
+    pub couriers: bool,
+    pub boss_visits: bool,
+    pub cat: bool,
+    pub ceo: bool,
+    pub council_cabin: bool,
+    pub ambient: bool,
+    pub selected_only_labels: bool,
+}
+
+impl Default for ShowConfig {
+    fn default() -> Self {
+        ShowConfig {
+            names: true,
+            bubbles: true,
+            icons: true,
+            nameplates: true,
+            zones: true,
+            couriers: true,
+            boss_visits: true,
+            cat: true,
+            ceo: true,
+            council_cabin: true,
+            ambient: true,
+            selected_only_labels: false,
+        }
+    }
+}
+
+impl ShowConfig {
+    /// (config key, menu label) for every toggle, in menu order.
+    pub const ITEMS: [(&'static str, &'static str); 12] = [
+        ("names", "agent names"),
+        ("bubbles", "speech bubbles"),
+        ("icons", "status icons"),
+        ("nameplates", "session nameplates"),
+        ("zones", "session floor zones"),
+        ("couriers", "postmen & hand-offs"),
+        ("boss_visits", "boss visits"),
+        ("cat", "office cat"),
+        ("ceo", "CEO corner office"),
+        ("council_cabin", "council cabin"),
+        ("ambient", "ambient (steam, LEDs, kanban, strolls)"),
+        ("selected_only_labels", "labels: selected/alert only"),
+    ];
+
+    pub fn get(&self, i: usize) -> bool {
+        match i {
+            0 => self.names,
+            1 => self.bubbles,
+            2 => self.icons,
+            3 => self.nameplates,
+            4 => self.zones,
+            5 => self.couriers,
+            6 => self.boss_visits,
+            7 => self.cat,
+            8 => self.ceo,
+            9 => self.council_cabin,
+            10 => self.ambient,
+            _ => self.selected_only_labels,
+        }
+    }
+
+    pub fn set(&mut self, i: usize, v: bool) {
+        match i {
+            0 => self.names = v,
+            1 => self.bubbles = v,
+            2 => self.icons = v,
+            3 => self.nameplates = v,
+            4 => self.zones = v,
+            5 => self.couriers = v,
+            6 => self.boss_visits = v,
+            7 => self.cat = v,
+            8 => self.ceo = v,
+            9 => self.council_cabin = v,
+            10 => self.ambient = v,
+            _ => self.selected_only_labels = v,
+        }
+    }
+
+    /// Everything visible, labels not restricted.
+    pub fn all_on() -> Self {
+        Self::default()
+    }
+
+    /// Hide the overlays (names, bubbles, icons, nameplates, couriers); zones, cat and CEO stay.
+    pub fn overlays_off(&self) -> Self {
+        ShowConfig { names: false, bubbles: false, icons: false, nameplates: false, couriers: false, ..self.clone() }
+    }
 }
 
 /// `[cat] enabled = true, name = "Pixel", color = "grey"|"orange"|"black"|"white"|"calico"`.
@@ -123,6 +225,7 @@ impl Default for Config {
             sidebar: true,
             cat: CatConfig::default(),
             ceo: CeoConfig::default(),
+            show: ShowConfig::default(),
         }
     }
 }
@@ -198,5 +301,21 @@ mod tests {
         let d = Config::default();
         assert_eq!((d.ceo.skin.as_str(), d.ceo.hair.as_str(), d.ceo.hair_style.as_str(), d.ceo.number), ("#c68642", "black", "short", 9));
         assert_eq!(d.cat.color, "grey");
+    }
+    #[test]
+    fn show_section_round_trips_and_defaults() {
+        let d: Config = toml::from_str("fps = 5\n").unwrap();
+        assert_eq!(d.show, ShowConfig::default());
+        assert!(d.show.names && d.show.council_cabin && !d.show.selected_only_labels);
+        let c: Config = toml::from_str("[show]\nnames = false\nselected_only_labels = true\n").unwrap();
+        assert!(!c.show.names && c.show.bubbles && c.show.selected_only_labels);
+        let s = toml::to_string(&c).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.show, c.show);
+        let mut x = ShowConfig::default();
+        for i in 0..ShowConfig::ITEMS.len() {
+            x.set(i, i % 2 == 0);
+            assert_eq!(x.get(i), i % 2 == 0);
+        }
     }
 }

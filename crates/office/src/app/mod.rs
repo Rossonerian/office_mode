@@ -58,6 +58,9 @@ impl ThemeHost for RendererView {
     fn set_mix(&mut self, mix: &ThemeMix) {
         let _ = guarded(|| self.0.set_mix(mix));
     }
+    fn set_show(&mut self, show: &office_core::config::ShowConfig) {
+        let _ = guarded(|| self.0.set_show(show));
+    }
 }
 
 impl OfficeView for RendererView {
@@ -396,6 +399,7 @@ fn event_loop(
         Ok(r) => {
             let mut v = RendererView(r);
             v.set_mix(&cfg.theme);
+            v.set_show(&cfg.show);
             Some(Box::new(v))
         }
         Err(e) => {
@@ -508,6 +512,11 @@ fn event_loop(
                         let hit = |x: u32, y: u32| view.and_then(|v| v.hit_test(x, y));
                         if app.handle_mouse_at(m, reducer.scene(), &hit, t) {
                             app.dirty = true;
+                        }
+                        if let Some(mix) = app.pending_mix.take() {
+                            if let Some(v) = office.view.as_deref_mut() {
+                                v.set_mix(&mix);
+                            }
                         }
                     }
                     TermEvent::Resize(_, _) => app.dirty = true,
@@ -663,11 +672,12 @@ pub mod testutil {
     pub struct FakeView {
         pub themes: Vec<String>,
         pub mix: ThemeMix,
+        pub show: office_core::config::ShowConfig,
         pub composed: Arc<Mutex<Vec<(u32, u32)>>>,
     }
     impl FakeView {
         pub fn new(themes: &[&str]) -> Self {
-            FakeView { themes: themes.iter().map(|s| s.to_string()).collect(), mix: ThemeMix::default(), composed: Default::default() }
+            FakeView { themes: themes.iter().map(|s| s.to_string()).collect(), mix: ThemeMix::default(), show: Default::default(), composed: Default::default() }
         }
     }
     impl ThemeHost for FakeView {
@@ -676,6 +686,9 @@ pub mod testutil {
         }
         fn set_mix(&mut self, mix: &ThemeMix) {
             self.mix = mix.clone();
+        }
+        fn set_show(&mut self, show: &office_core::config::ShowConfig) {
+            self.show = show.clone();
         }
     }
     impl OfficeView for FakeView {

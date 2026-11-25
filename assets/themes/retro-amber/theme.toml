@@ -1,0 +1,31 @@
+# retro-amber: amber monochrome monitor look. Kenney "1-Bit Pack" (CC0, vendored, coloured sheet) remapped through a luminance palette;
+# Tiny Town (CC0) trees show through the windows, remapped by the same palette.
+[sheets]
+ob = { file = "../../vendor/kenney-1-bit-pack/colored-transparent_packed.png", tile = 16 }
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+door = { sheet = "ob", col = 3, row = 9 }
+chair = { sheet = "ob", col = 11, row = 9 }
+sofa = { sheet = "ob", tiles = [[14, 9], [15, 9]] }
+plant = { sheet = "ob", col = 6, row = 1 }
+cooler = { sheet = "ob", col = 5, row = 6 }
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
+[fx]
+palette = ["#140a00", "#5c3300", "#c27a00", "#ffc34d"]
+floor_bg = "#140a00"
+wall_bg = "#140a00"
+
+[colors]
+backdrop = "#140a00"
+floor_style = "plain"
+floor_a = "#140a00"
+floor_b = "#c27a00"
+wall = "#3a2000"
+wall_trim = "#c27a00"
+rug = "#140a00"
+rug_trim = "#c27a00"
+sky = "#140a00"

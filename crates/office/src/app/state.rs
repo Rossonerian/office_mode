@@ -2,7 +2,7 @@
 //! Everything here is pure over (Scene, ThemeHost, Control) so it can be tested without a tty.
 use super::fmt;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use office_core::{config::ThemeMix, model::AgentKind, Agent, AgentId, AgentState, AlertLevel, Scene};
+use office_core::{config::{ShowConfig, ThemeMix}, model::AgentKind, Agent, AgentId, AgentState, AlertLevel, Scene};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -11,6 +11,8 @@ use std::path::PathBuf;
 pub trait ThemeHost {
     fn themes(&self) -> Vec<String>;
     fn set_mix(&mut self, mix: &ThemeMix);
+    /// Apply the display toggles (names, bubbles, zones, ...).
+    fn set_show(&mut self, _show: &ShowConfig) {}
 }
 
 /// Side-effecting control actions (real: sources::control; demo: synthetic events; tests: fakes).
@@ -28,6 +30,15 @@ pub const NOTIFY_INTERVAL_MS: u64 = 10_000;
 pub const TOAST_MS: u64 = 4_000;
 const HISTORY_LEN: usize = 12;
 
+/// A theme mix with value equality (ThemeMix itself has none).
+#[derive(Debug, Clone)]
+pub struct MixSnap(pub ThemeMix);
+impl PartialEq for MixSnap {
+    fn eq(&self, o: &Self) -> bool {
+        mix_eq(&self.0, &o.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Popup {
     None,
@@ -35,10 +46,15 @@ pub enum Popup {
     Detail(AgentId),
     ConfirmCancel { id: AgentId, label: String, pid: u32 },
     Mixer { layer: usize },
+    /// Theme picker: `names` are the presets, followed by a "custom mix…" row; `orig` is restored on Esc.
+    Theme { sel: usize, names: Vec<String>, orig: MixSnap },
+    /// The View menu: display toggles for the office overlays.
+    View { sel: usize },
     /// Hand-offs, newest first: everything, or only what one agent sent and received.
-    Reports { sel: usize, only: Option<AgentId> },
+    /// With `inbox` set, only reports addressed to the boss (`to == None`).
+    Reports { sel: usize, only: Option<AgentId>, inbox: bool },
     /// One hand-off in full (brief + report); Esc goes back to the list.
-    ReportView { id: u64, only: Option<AgentId> },
+    ReportView { id: u64, only: Option<AgentId>, inbox: bool },
 }
 
 /// Reports newest first, optionally only those sent or received by `only`.
@@ -49,6 +65,15 @@ pub fn report_list<'a>(scene: &'a Scene, only: Option<&str>) -> Vec<&'a office_c
         .rev()
         .filter(|r| only.is_none_or(|id| r.from == id || r.to.as_deref() == Some(id)))
         .collect()
+}
+
+/// The list a Reports popup shows: the boss inbox, or everything / one agent's hand-offs.
+pub fn report_list_for<'a>(scene: &'a Scene, only: Option<&str>, inbox: bool) -> Vec<&'a office_core::Report> {
+    if inbox {
+        scene.reports.iter().rev().filter(|r| r.to.is_none()).collect()
+    } else {
+        report_list(scene, only)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +103,8 @@ pub struct LayoutCache {
     pub alert_agent_ids: Vec<Option<AgentId>>,
     /// Currently open modal popup rect (for click-outside-to-close).
     pub popup: Rect,
+    /// The boss-inbox notification card (empty when not showing).
+    pub card: Rect,
     /// Maximum scroll offset for the currently open detail popup.
     pub detail_max_scroll: u16,
     /// Terminal font size in pixels (w, h) when an image protocol is active.
@@ -115,13 +142,14 @@ pub fn layer_set(m: &mut ThemeMix, layer: usize, v: String) {
 
 /// Write `theme = {..}` into the TOML config atomically, keeping every other key and failing safely
 /// if an existing config file cannot be read or parsed.
-pub fn persist_theme(path: &std::path::Path, mix: &ThemeMix) -> anyhow::Result<()> {
+pub fn persist_config(path: &std::path::Path, mix: &ThemeMix, show: &ShowConfig) -> anyhow::Result<()> {
     let mut table: toml::Table = match std::fs::read_to_string(path) {
         Ok(s) => s.parse::<toml::Table>()?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => return Err(e.into()),
     };
     table.insert("theme".into(), toml::Value::try_from(mix)?);
+    table.insert("show".into(), toml::Value::try_from(show)?);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -153,6 +181,7 @@ pub struct App {
     /// Where `t`/`T` persist the theme mix; None = don't persist (tests).
     pub config_path: Option<PathBuf>,
     pub mix: ThemeMix,
+    pub show: ShowConfig,
     pub presets: BTreeMap<String, ThemeMix>,
     /// Recent activity per agent (time, text), newest last.
     pub history: HashMap<AgentId, VecDeque<(u64, String)>>,
@@ -160,9 +189,17 @@ pub struct App {
     seen_alerts: HashSet<(u64, String, Option<AgentId>, String)>,
     last_notify: HashMap<String, u64>,
     last_click: Option<(u64, AgentId)>,
+    /// Highest report id the boss has seen or dismissed.
+    pub inbox_seen: u64,
+    /// Highest boss report id already announced through the notify path.
+    inbox_notified: u64,
+    /// Set by the first `observe`: reports present then count as seen.
+    inbox_init: bool,
     pub layout: LayoutCache,
     /// Set whenever the UI needs a redraw independent of scene changes.
     pub dirty: bool,
+    /// Theme restore requested where no view is at hand (mouse); the event loop applies it.
+    pub pending_mix: Option<ThemeMix>,
 }
 
 impl App {
@@ -181,14 +218,19 @@ impl App {
             demo,
             config_path: Some(office_core::paths::config_file()),
             mix: cfg.theme.clone(),
+            show: cfg.show.clone(),
             presets: cfg.presets.clone(),
             history: HashMap::new(),
             prev_states: HashMap::new(),
             seen_alerts: HashSet::new(),
             last_notify: HashMap::new(),
             last_click: None,
+            inbox_seen: 0,
+            inbox_notified: 0,
+            inbox_init: false,
             layout: LayoutCache::default(),
             dirty: true,
+            pending_mix: None,
         }
     }
 
@@ -290,7 +332,60 @@ impl App {
                 ctl.play_sound(true);
             }
         }
+        self.observe_inbox(scene, now_ms, ctl);
         self.dirty = true;
+    }
+
+    fn observe_inbox(&mut self, scene: &Scene, now_ms: u64, ctl: &mut dyn Control) {
+        let top = scene.reports.iter().filter(|r| r.to.is_none()).map(|r| r.id).max().unwrap_or(0);
+        if !self.inbox_init {
+            self.inbox_init = true;
+            self.inbox_seen = top;
+            self.inbox_notified = top;
+            return;
+        }
+        let fresh: Vec<office_core::Report> =
+            scene.reports.iter().filter(|r| r.to.is_none() && r.id > self.inbox_notified).cloned().collect();
+        self.inbox_notified = self.inbox_notified.max(top);
+        for r in fresh {
+            let title = format!("{} → you", r.from_label);
+            let sent = self.maybe_notify(&format!("inbox:{}", r.id), &title, &r.title, now_ms, ctl);
+            if sent && self.sound {
+                ctl.play_sound(r.title.starts_with('⚠'));
+            }
+        }
+    }
+
+    /// Reports addressed to the boss with an id above `inbox_seen` (none until `observe` ran once).
+    pub fn unread<'a>(&self, scene: &'a Scene) -> Vec<&'a office_core::Report> {
+        if !self.inbox_init {
+            return Vec::new();
+        }
+        scene.reports.iter().filter(|r| r.to.is_none() && r.id > self.inbox_seen).collect()
+    }
+
+    pub fn unread_count(&self, scene: &Scene) -> usize {
+        self.unread(scene).len()
+    }
+
+    /// The newest unseen boss report: what the notification card shows.
+    pub fn card_report<'a>(&self, scene: &'a Scene) -> Option<&'a office_core::Report> {
+        self.unread(scene).into_iter().max_by_key(|r| r.id)
+    }
+
+    fn mark_seen(&mut self, id: u64) {
+        self.inbox_seen = self.inbox_seen.max(id);
+    }
+
+    fn dismiss_card(&mut self, scene: &Scene) {
+        let top = scene.reports.iter().filter(|r| r.to.is_none()).map(|r| r.id).max().unwrap_or(0);
+        self.mark_seen(top);
+    }
+
+    fn open_report(&mut self, id: u64, only: Option<AgentId>, inbox: bool) {
+        self.mark_seen(id);
+        self.detail_scroll = 0;
+        self.popup = Popup::ReportView { id, only, inbox };
     }
 
     /// Rate-limited (1 per 10 s per key) notification that respects the `n` toggle.
@@ -390,20 +485,44 @@ impl App {
 
     fn persist(&mut self, now_ms: u64) {
         if let Some(p) = self.config_path.clone() {
-            if let Err(e) = persist_theme(&p, &self.mix) {
+            if let Err(e) = persist_config(&p, &self.mix, &self.show) {
                 self.toast(format!("could not save theme: {e}"), AlertLevel::Warn, now_ms);
             }
         }
     }
 
-    fn cycle_theme(&mut self, view: &mut dyn ThemeHost, now_ms: u64) {
+    fn open_theme_picker(&mut self, view: &mut dyn ThemeHost) {
+        let names = self.preset_cycle(&view.themes());
+        let sel = names.iter().position(|n| mix_eq(&self.preset_mix(n), &self.mix)).unwrap_or(names.len());
+        self.popup = Popup::Theme { sel, names, orig: MixSnap(self.mix.clone()) };
+    }
+
+    /// Move the picker highlight and preview that entry live (the custom row leaves the mix alone).
+    fn theme_pick(&mut self, sel: usize, names: Vec<String>, orig: MixSnap, view: &mut dyn ThemeHost, now_ms: u64) {
+        let sel = sel.min(names.len());
+        if let Some(n) = names.get(sel) {
+            let mix = self.preset_mix(n);
+            self.apply_mix(mix, view, now_ms, false);
+        }
+        self.popup = Popup::Theme { sel, names, orig };
+        self.dirty = true;
+    }
+
+    fn close_theme_picker(&mut self, orig: MixSnap, view: &mut dyn ThemeHost, now_ms: u64) {
+        self.apply_mix(orig.0, view, now_ms, false);
+        self.popup = Popup::None;
+    }
+
+    fn cycle_theme(&mut self, delta: i32, view: &mut dyn ThemeHost, now_ms: u64) {
         let themes = view.themes();
         let cycle = self.preset_cycle(&themes);
         let idx = cycle.iter().position(|n| mix_eq(&self.preset_mix(n), &self.mix));
+        let n = cycle.len() as i32;
         let next = match idx {
-            Some(i) => (i + 1) % cycle.len(),
+            Some(i) => ((i as i32 + delta) % n + n) % n,
+            None if delta < 0 => n - 1,
             None => 0,
-        };
+        } as usize;
         let name = cycle[next].clone();
         let mix = self.preset_mix(&name);
         self.apply_mix(mix, view, now_ms, true);
@@ -422,6 +541,18 @@ impl App {
         let mut mix = self.mix.clone();
         layer_set(&mut mix, layer, themes[next as usize].clone());
         self.apply_mix(mix, view, now_ms, false);
+    }
+
+    fn set_show_item(&mut self, i: usize, v: bool, view: &mut dyn ThemeHost) {
+        self.show.set(i, v);
+        view.set_show(&self.show);
+        self.dirty = true;
+    }
+
+    fn set_show_all(&mut self, show: ShowConfig, view: &mut dyn ThemeHost) {
+        self.show = show;
+        view.set_show(&self.show);
+        self.dirty = true;
     }
 
     pub fn handle_key(
@@ -500,16 +631,19 @@ impl App {
                 }
                 return Outcome::Continue;
             }
-            Popup::Reports { sel, only } => {
-                let n = report_list(scene, only.as_deref()).len();
+            Popup::Reports { sel, only, inbox } => {
+                let n = report_list_for(scene, only.as_deref(), inbox).len();
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => self.popup = Popup::Reports { sel: sel.saturating_sub(1), only },
-                    KeyCode::Down | KeyCode::Char('j') => self.popup = Popup::Reports { sel: (sel + 1).min(n.saturating_sub(1)), only },
-                    KeyCode::Char('a') => self.popup = Popup::Reports { sel: 0, only: None },
+                    KeyCode::Up | KeyCode::Char('k') => self.popup = Popup::Reports { sel: sel.saturating_sub(1), only, inbox },
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.popup = Popup::Reports { sel: (sel + 1).min(n.saturating_sub(1)), only, inbox }
+                    }
+                    KeyCode::Char('a') => self.popup = Popup::Reports { sel: 0, only: None, inbox: false },
+                    KeyCode::Char('i') => self.popup = Popup::Reports { sel: 0, only: None, inbox: true },
                     KeyCode::Enter => {
-                        if let Some(r) = report_list(scene, only.as_deref()).get(sel) {
-                            self.detail_scroll = 0;
-                            self.popup = Popup::ReportView { id: r.id, only };
+                        let id = report_list_for(scene, only.as_deref(), inbox).get(sel).map(|r| r.id);
+                        if let Some(id) = id {
+                            self.open_report(id, only, inbox);
                         }
                     }
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('r') => self.popup = Popup::None,
@@ -517,7 +651,9 @@ impl App {
                 }
                 return Outcome::Continue;
             }
-            Popup::ReportView { id, only } => {
+            Popup::ReportView { id, only, inbox } => {
+                let list_ids: Vec<u64> = report_list_for(scene, only.as_deref(), inbox).iter().map(|r| r.id).collect();
+                let pos = list_ids.iter().position(|x| *x == id);
                 match key.code {
                     KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char(' ') => {
                         let step = if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) { 1 } else { 10 };
@@ -527,16 +663,97 @@ impl App {
                         let step = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) { 1 } else { 10 };
                         self.detail_scroll = self.detail_scroll.saturating_sub(step);
                     }
+                    KeyCode::Char('n') | KeyCode::Char('p') => {
+                        let next = match (pos, key.code) {
+                            (Some(i), KeyCode::Char('n')) => list_ids.get(i + 1).copied(),
+                            (Some(i), _) => i.checked_sub(1).and_then(|j| list_ids.get(j).copied()),
+                            (None, _) => None,
+                        };
+                        match next {
+                            Some(nid) => self.open_report(nid, only, inbox),
+                            None => self.toast(if key.code == KeyCode::Char('n') { "last report" } else { "first report" }, AlertLevel::Info, now_ms),
+                        }
+                    }
+                    KeyCode::Char('g') | KeyCode::Char('o') | KeyCode::Char('a') | KeyCode::Char('d') => {
+                        let from = scene.reports.iter().find(|r| r.id == id).map(|r| r.from.clone());
+                        match from.filter(|f| scene.agents.contains_key(f)) {
+                            None => self.toast("sender is no longer in the office", AlertLevel::Info, now_ms),
+                            Some(f) => match key.code {
+                                KeyCode::Char('g') => {
+                                    self.selected = Some(f);
+                                    self.detail_scroll = 0;
+                                    self.popup = Popup::None;
+                                }
+                                code => {
+                                    let prev = self.selected.replace(f);
+                                    match code {
+                                        KeyCode::Char('o') => self.resume(scene, ctl, now_ms),
+                                        KeyCode::Char('a') => self.permission(scene, true, ctl, now_ms),
+                                        _ => self.permission(scene, false, ctl, now_ms),
+                                    }
+                                    self.selected = prev;
+                                }
+                            },
+                        }
+                    }
                     KeyCode::Esc | KeyCode::Backspace | KeyCode::Enter => {
-                        let sel = report_list(scene, only.as_deref()).iter().position(|r| r.id == id).unwrap_or(0);
+                        let sel = pos.unwrap_or(0);
                         self.detail_scroll = 0;
-                        self.popup = Popup::Reports { sel, only };
+                        self.popup = Popup::Reports { sel, only, inbox };
                     }
                     KeyCode::Char('q') => {
                         self.detail_scroll = 0;
                         self.popup = Popup::None;
                     }
                     _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::View { sel } => {
+                let n = ShowConfig::ITEMS.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.popup = Popup::View { sel: sel.saturating_sub(1) },
+                    KeyCode::Down | KeyCode::Char('j') => self.popup = Popup::View { sel: (sel + 1).min(n - 1) },
+                    KeyCode::Char(' ') | KeyCode::Enter => {
+                        let v = !self.show.get(sel);
+                        self.set_show_item(sel, v, view);
+                    }
+                    KeyCode::Char('a') => self.set_show_all(ShowConfig::all_on(), view),
+                    KeyCode::Char('h') => {
+                        let s = self.show.overlays_off();
+                        self.set_show_all(s, view);
+                    }
+                    KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('q') => {
+                        self.popup = Popup::None;
+                        self.persist(now_ms);
+                    }
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::Theme { sel, names, orig } => {
+                let last = names.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.theme_pick(sel.saturating_sub(1), names, orig, view, now_ms),
+                    KeyCode::Down | KeyCode::Char('j') => self.theme_pick((sel + 1).min(last), names, orig, view, now_ms),
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let i = c as usize - '1' as usize;
+                        if i <= last {
+                            self.theme_pick(i, names, orig, view, now_ms);
+                        } else {
+                            self.popup = Popup::Theme { sel, names, orig };
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if sel >= last {
+                            self.popup = Popup::Mixer { layer: 0 };
+                        } else {
+                            self.popup = Popup::None;
+                            self.persist(now_ms);
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => self.close_theme_picker(orig, view, now_ms),
+                    _ => self.popup = Popup::Theme { sel, names, orig },
                 }
                 return Outcome::Continue;
             }
@@ -556,8 +773,30 @@ impl App {
             }
         }
 
+        if let Some(r) = self.card_report(scene) {
+            let id = r.id;
+            match key.code {
+                KeyCode::Enter => {
+                    self.open_report(id, None, true);
+                    return Outcome::Continue;
+                }
+                KeyCode::Esc => {
+                    self.dismiss_card(scene);
+                    return Outcome::Continue;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => return Outcome::Quit,
+            KeyCode::Char('i') => {
+                if scene.reports.iter().any(|r| r.to.is_none()) {
+                    self.popup = Popup::Reports { sel: 0, only: None, inbox: true };
+                } else {
+                    self.toast("inbox is empty", AlertLevel::Info, now_ms);
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(scene, -1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(scene, 1),
             KeyCode::Home | KeyCode::Char('g') => self.move_selection(scene, i32::MIN / 2),
@@ -571,8 +810,18 @@ impl App {
                     self.toast("no agent selected", AlertLevel::Info, now_ms);
                 }
             }
-            KeyCode::Char('t') => self.cycle_theme(view, now_ms),
+            KeyCode::Char('t') => self.open_theme_picker(view),
+            KeyCode::Char(']') => self.cycle_theme(1, view, now_ms),
+            KeyCode::Char('[') => self.cycle_theme(-1, view, now_ms),
             KeyCode::Char('T') => self.popup = Popup::Mixer { layer: 0 },
+            KeyCode::Char('v') => self.popup = Popup::View { sel: 0 },
+            KeyCode::Char('L') => {
+                let on = !(self.show.names || self.show.bubbles);
+                self.set_show_item(0, on, view);
+                self.set_show_item(1, on, view);
+                self.persist(now_ms);
+                self.toast(if on { "labels on" } else { "labels off" }, AlertLevel::Info, now_ms);
+            }
             KeyCode::Char('s') => self.sidebar = !self.sidebar,
             KeyCode::Char('n') => {
                 self.notifications = !self.notifications;
@@ -613,7 +862,7 @@ impl App {
                 if scene.reports.is_empty() {
                     self.toast("no hand-offs yet", AlertLevel::Info, now_ms);
                 } else {
-                    self.popup = Popup::Reports { sel: 0, only };
+                    self.popup = Popup::Reports { sel: 0, only, inbox: false };
                 }
             }
             _ => self.dirty = false,
@@ -707,7 +956,11 @@ impl App {
                         && ev.row >= p.y
                         && ev.row < p.y + p.height;
                     if !inside {
-                        let was_mixer = matches!(self.popup, Popup::Mixer { .. });
+                        let was_mixer = matches!(self.popup, Popup::Mixer { .. } | Popup::View { .. });
+                        if let Popup::Theme { orig, .. } = self.popup.clone() {
+                            self.mix = orig.0.clone();
+                            self.pending_mix = Some(orig.0);
+                        }
                         self.popup = Popup::None;
                         self.detail_scroll = 0;
                         if was_mixer {
@@ -903,7 +1156,7 @@ mod tests {
         let mut h = Harness::new();
         let mut seen = vec![];
         for _ in 0..5 {
-            h.press(key('t'));
+            h.press(key(']'));
             seen.push(h.app.mix.floor.clone());
             assert!(mix_eq(&h.view.mix, &h.app.mix));
         }
@@ -911,10 +1164,58 @@ mod tests {
         // Missing themes are skipped.
         let mut h = Harness::new();
         h.view = FakeView::new(&["procedural", "retro"]);
-        h.press(key('t'));
+        h.press(key(']'));
         assert_eq!(h.app.mix.characters, "retro");
-        h.press(key('t'));
+        h.press(key(']'));
         assert_eq!(h.app.mix.characters, "procedural");
+    }
+
+    #[test]
+    fn theme_picker_previews_restores_and_persists() {
+        let mut h = Harness::new();
+        h.press(key('t'));
+        match &h.app.popup {
+            Popup::Theme { sel, names, .. } => {
+                assert_eq!(*sel, 0);
+                assert_eq!(names[0], "procedural");
+                assert_eq!(names.len(), 5);
+            }
+            p => panic!("{p:?}"),
+        }
+        h.press(key('j'));
+        h.press(key('j'));
+        assert_eq!(h.view.mix.floor, "cozy");
+        assert!(mix_eq(&h.view.mix, &h.app.mix));
+        h.press(key('4'));
+        assert_eq!(h.view.mix.floor, "retro");
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.view.mix.floor, "procedural");
+        assert_eq!(h.app.mix.floor, "procedural");
+        // Enter keeps and persists.
+        let dir = std::env::temp_dir().join(format!("office-pick-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        h.app.config_path = Some(path.clone());
+        h.press(key('t'));
+        h.press(key('j'));
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.app.mix.floor, "modern");
+        let cfg: office_core::config::Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.theme.floor, "modern");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Reopening selects the current theme; custom row opens the mixer; `[` cycles back.
+        h.press(key('t'));
+        assert!(matches!(h.app.popup, Popup::Theme { sel: 1, .. }));
+        for _ in 0..4 {
+            h.press(key('j'));
+        }
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::Mixer { layer: 0 });
+        h.press(code(KeyCode::Esc));
+        h.press(key('[')); // the custom row kept the last previewed preset (cyberpunk)
+        assert_eq!(h.app.mix.floor, "retro");
     }
 
     #[test]
@@ -925,7 +1226,7 @@ mod tests {
         std::fs::write(&path, "fps = 30\n[theme]\nfloor = \"x\"\n").unwrap();
         let mut h = Harness::new();
         h.app.config_path = Some(path.clone());
-        h.press(key('t'));
+        h.press(key(']'));
         let s = std::fs::read_to_string(&path).unwrap();
         let cfg: office_core::config::Config = toml::from_str(&s).unwrap();
         assert_eq!(cfg.fps, 30);
@@ -1256,16 +1557,153 @@ mod tests {
         });
         select(&mut h.app, "cc-sub:dice/1");
         h.press(key('r'));
-        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: Some("cc-sub:dice/1".into()) });
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: Some("cc-sub:dice/1".into()), inbox: false });
         h.press(code(KeyCode::Enter));
-        assert_eq!(h.app.popup, Popup::ReportView { id: 7, only: Some("cc-sub:dice/1".into()) });
+        assert_eq!(h.app.popup, Popup::ReportView { id: 7, only: Some("cc-sub:dice/1".into()), inbox: false });
         h.press(code(KeyCode::Esc));
-        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: Some("cc-sub:dice/1".into()) });
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: Some("cc-sub:dice/1".into()), inbox: false });
         h.press(key('a'));
-        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: None });
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: None, inbox: false });
         assert_eq!(report_list(&h.scene, None).len(), 2);
         h.press(code(KeyCode::Esc));
         assert_eq!(h.app.popup, Popup::None);
     }
 
+    fn boss_report(id: u64, from: &str, title: &str) -> office_core::Report {
+        office_core::Report {
+            id, at_ms: id, kind: office_core::ReportKind::Result, from: from.into(), from_label: format!("label-{from}"),
+            to: None, to_label: "you".into(), title: title.into(), body: "line one\n\nline two\nline three".into(), brief: String::new(),
+        }
+    }
+
+    #[test]
+    fn inbox_startup_reports_are_seen_and_new_ones_get_a_card() {
+        let cfg = office_core::config::Config::default();
+        let mut app = App::new(&cfg, false);
+        app.config_path = None;
+        let mut scene = demo_scene();
+        scene.reports.push(boss_report(3, "cc:dice", "old"));
+        let mut ctl = FakeControl::default();
+        app.observe(&scene, 1_000, &mut ctl);
+        assert_eq!(app.unread_count(&scene), 0);
+        assert!(app.card_report(&scene).is_none());
+        let base = ctl.notes.len();
+        scene.reports.push(boss_report(4, "cc:dice", "fresh"));
+        app.observe(&scene, 2_000, &mut ctl);
+        assert_eq!(app.unread_count(&scene), 1);
+        assert_eq!(app.card_report(&scene).unwrap().id, 4);
+        assert_eq!(ctl.notes.len(), base + 1);
+        app.observe(&scene, 30_000, &mut ctl);
+        assert_eq!(ctl.notes.len(), base + 1, "one notification per report");
+    }
+
+    #[test]
+    fn inbox_card_enter_reads_and_esc_dismisses() {
+        let mut h = Harness::new();
+        h.scene.reports.push(boss_report(9, "cc:dice", "done"));
+        h.app.observe(&h.scene, 2_000, &mut h.ctl);
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::ReportView { id: 9, only: None, inbox: true });
+        assert_eq!(h.app.unread_count(&h.scene), 0);
+        h.press(code(KeyCode::Esc));
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+
+        h.scene.reports.push(boss_report(10, "cc:dice", "again"));
+        h.app.observe(&h.scene, 3_000, &mut h.ctl);
+        assert!(h.app.card_report(&h.scene).is_some());
+        h.press(code(KeyCode::Esc));
+        assert!(h.app.card_report(&h.scene).is_none());
+        assert_eq!(h.app.popup, Popup::None);
+        // Enter now opens the agent detail again.
+        h.press(code(KeyCode::Enter));
+        assert!(matches!(h.app.popup, Popup::Detail(_)));
+    }
+
+    #[test]
+    fn inbox_key_lists_only_boss_reports_and_reader_navigates() {
+        let mut h = Harness::new();
+        h.press(key('i'));
+        assert_eq!(h.toast(), "inbox is empty");
+        h.scene.reports.push(boss_report(1, "cc:dice", "first"));
+        let mut peer = boss_report(2, "cc-sub:dice/1", "peer");
+        peer.to = Some("cc:dice".into());
+        h.scene.reports.push(peer);
+        h.scene.reports.push(boss_report(3, "cc:dice", "third"));
+        h.press(key('i'));
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: None, inbox: true });
+        assert_eq!(report_list_for(&h.scene, None, true).iter().map(|r| r.id).collect::<Vec<_>>(), vec![3, 1]);
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::ReportView { id: 3, only: None, inbox: true });
+        h.press(key('n'));
+        assert_eq!(h.app.popup, Popup::ReportView { id: 1, only: None, inbox: true });
+        h.press(key('p'));
+        assert_eq!(h.app.popup, Popup::ReportView { id: 3, only: None, inbox: true });
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: None, inbox: true });
+    }
+
+    #[test]
+    fn reader_g_selects_sender_and_o_resumes_it() {
+        let mut h = Harness::new();
+        h.scene.reports.push(boss_report(5, "cc:dice", "done"));
+        select(&mut h.app, "cc:office");
+        h.app.popup = Popup::ReportView { id: 5, only: None, inbox: true };
+        h.press(key('o'));
+        assert!(h.ctl.calls.iter().any(|c| c == "resume /tmp/dice sess-dice"), "{:?}", h.ctl.calls);
+        assert_eq!(h.app.selected.as_deref(), Some("cc:office"), "o must not change the selection");
+        assert!(matches!(h.app.popup, Popup::ReportView { .. }));
+        h.press(key('g'));
+        assert_eq!(h.app.selected.as_deref(), Some("cc:dice"));
+        assert_eq!(h.app.popup, Popup::None);
+        // a sender that left is reported, not crashed on
+        h.scene.reports.push(boss_report(6, "gone:1", "bye"));
+        h.app.popup = Popup::ReportView { id: 6, only: None, inbox: true };
+        h.press(key('g'));
+        assert_eq!(h.toast(), "sender is no longer in the office");
+    }
+
+    #[test]
+    fn view_popup_navigates_toggles_and_persists() {
+        let dir = std::env::temp_dir().join(format!("office-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let mut h = Harness::new();
+        h.app.config_path = Some(path.clone());
+        h.press(key('v'));
+        assert_eq!(h.app.popup, Popup::View { sel: 0 });
+        h.press(key('j'));
+        h.press(code(KeyCode::Down));
+        h.press(key('k'));
+        assert_eq!(h.app.popup, Popup::View { sel: 1 });
+        h.press(key(' '));
+        assert!(!h.app.show.bubbles && h.app.show.names);
+        assert!(!h.view.show.bubbles, "applied live");
+        h.press(code(KeyCode::Enter));
+        assert!(h.app.show.bubbles);
+        h.press(key('h'));
+        let s = &h.view.show;
+        assert!(!s.names && !s.bubbles && !s.icons && !s.nameplates && !s.couriers);
+        assert!(s.zones && s.cat && s.ceo);
+        h.press(key('a'));
+        assert_eq!(h.view.show, ShowConfig::default());
+        h.press(key('h'));
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+        let cfg: office_core::config::Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!cfg.show.names && cfg.show.zones);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capital_l_toggles_labels() {
+        let mut h = Harness::new();
+        h.press(key('L'));
+        assert!(!h.app.show.names && !h.app.show.bubbles);
+        assert!(!h.view.show.names && !h.view.show.bubbles);
+        assert_eq!(h.toast(), "labels off");
+        h.press(key('L'));
+        assert!(h.app.show.names && h.app.show.bubbles);
+        assert_eq!(h.toast(), "labels on");
+    }
 }

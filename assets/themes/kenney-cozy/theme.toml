@@ -1,0 +1,34 @@
+# kenney-cozy: warm interior from Kenney "Roguelike Indoors" (CC0, vendored) plus a Tiny Town (CC0) outdoor
+# scene behind the back-wall windows. Desks/monitors stay procedural; walls and floors are warm procedural wood.
+[sheets]
+indoor = { file = "../../vendor/kenney-roguelike-indoors/roguelikeIndoor_transparent.png", tile = 16, spacing = 1 }
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+plant = { sheet = "indoor", col = 16, row = 0 }
+chair = { sheet = "indoor", col = 0, row = 2 }
+sofa = { sheet = "indoor", tiles = [[16, 9], [17, 9], [18, 9]] }
+cooler = { sheet = "indoor", col = 20, row = 17 }
+lamp = { sheet = "indoor", col = 17, row = 6 }
+desk = { sheet = "indoor", tiles = [[4, 4], [6, 4]] }
+rug = { sheet = "indoor", tiles = [[0, 9], [1, 9], [2, 9]] }
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
+[colors]
+floor_style = "wood"
+floor_a = "#c08a58"
+floor_b = "#a46f45"
+wall = "#e6c9a0"
+wall_trim = "#7a4a2a"
+sky = "#bfe3f5"
+wood = "#8a5530"
+desk = "#d2a06a"
+chair = "#9b4a2c"
+fabric = "#c0603a"
+plant = "#4f9a46"
+pot = "#3aa6a6"
+rug = "#a8432f"
+rug_trim = "#e7b36a"
+backdrop = "#2a1b12"

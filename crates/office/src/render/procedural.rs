@@ -157,18 +157,33 @@ pub fn door(c: &Colors) -> RgbaImage {
 }
 
 pub fn desk(c: &Colors) -> RgbaImage {
+    // 40×16 workstation desk lit from the top-left: bright top edge + left edge, dark outline,
+    // drawer pedestal on the right and two steel feet.
     let mut i = RgbaImage::new(40, 16);
-    fill(&mut i, 0, 0, 40, 4, c.desk);
-    fill(&mut i, 0, 3, 40, 1, shade(c.desk, 0.85));
-    fill(&mut i, 1, 4, 38, 9, shade(c.desk, 0.72));
-    // drawers
-    outline(&mut i, 27, 5, 10, 4, shade(c.desk, 0.6));
-    put(&mut i, 32, 6, c.metal);
-    outline(&mut i, 27, 9, 10, 4, shade(c.desk, 0.6));
-    put(&mut i, 32, 10, c.metal);
-    // legs
+    let ol = shade(c.desk, 0.45);
+    let hi = shade(c.desk, 1.1);
+    let body = shade(c.desk, 0.7);
+    fill(&mut i, 0, 0, 40, 14, ol);
+    fill(&mut i, 1, 1, 38, 5, c.desk);
+    fill(&mut i, 1, 1, 38, 1, hi);
+    fill(&mut i, 1, 1, 1, 5, hi);
+    fill(&mut i, 1, 5, 38, 1, shade(c.desk, 0.86));
+    fill(&mut i, 1, 6, 38, 1, shade(c.desk, 0.78));
+    fill(&mut i, 1, 7, 38, 6, body);
+    fill(&mut i, 1, 7, 38, 1, shade(body, 0.85));
+    // modesty panel seam + drawer pedestal
+    fill(&mut i, 25, 7, 1, 6, ol);
+    for k in 0..2 {
+        let y = 8 + k * 3;
+        fill(&mut i, 27, y, 10, 2, shade(c.desk, 0.78));
+        fill(&mut i, 27, y, 10, 1, shade(c.desk, 0.9));
+        fill(&mut i, 31, y, 2, 1, c.metal);
+    }
+    // cable tray (dark slot under the top at the back-left) and feet
+    fill(&mut i, 4, 8, 16, 1, ol);
     fill(&mut i, 2, 13, 2, 3, c.metal);
     fill(&mut i, 36, 13, 2, 3, c.metal);
+    fill(&mut i, 2, 13, 1, 3, shade(c.metal, 1.3));
     i
 }
 
@@ -183,13 +198,52 @@ fn monitor(c: &Colors, screen: Col) -> RgbaImage {
 }
 
 pub fn chair(c: &Colors) -> RgbaImage {
+    // Task chair seen from the front with a seated person in front of it: tall mesh back with a
+    // lit top-left edge, armrests and a gas stem on a five-star base (mostly hidden by the desk).
     let mut i = RgbaImage::new(16, 16);
-    fill(&mut i, 2, 1, 12, 10, c.chair);
-    fill(&mut i, 3, 0, 10, 1, c.chair);
-    fill(&mut i, 3, 2, 10, 1, shade(c.chair, 1.25));
-    fill(&mut i, 1, 10, 14, 3, shade(c.chair, 0.8));
-    fill(&mut i, 7, 13, 2, 2, c.metal);
-    fill(&mut i, 3, 15, 10, 1, c.metal);
+    let ol = shade(c.chair, 0.45);
+    fill(&mut i, 2, 0, 12, 11, ol);
+    fill(&mut i, 3, 1, 10, 9, c.chair);
+    fill(&mut i, 3, 1, 10, 1, shade(c.chair, 1.35));
+    fill(&mut i, 3, 1, 1, 9, shade(c.chair, 1.2));
+    fill(&mut i, 12, 2, 1, 8, shade(c.chair, 0.8));
+    fill(&mut i, 5, 5, 6, 1, shade(c.chair, 0.85));
+    // armrests
+    fill(&mut i, 0, 8, 3, 2, ol);
+    fill(&mut i, 13, 8, 3, 2, ol);
+    fill(&mut i, 1, 8, 1, 1, shade(c.metal, 1.4));
+    fill(&mut i, 14, 8, 1, 1, shade(c.metal, 1.4));
+    fill(&mut i, 1, 10, 1, 2, c.metal);
+    fill(&mut i, 14, 10, 1, 2, c.metal);
+    // seat cushion
+    fill(&mut i, 1, 10, 14, 4, ol);
+    fill(&mut i, 2, 10, 12, 3, shade(c.chair, 1.12));
+    fill(&mut i, 2, 10, 12, 1, shade(c.chair, 1.3));
+    // stem and base
+    fill(&mut i, 7, 14, 2, 1, c.metal);
+    fill(&mut i, 2, 15, 12, 1, shade(c.metal, 0.8));
+    fill(&mut i, 2, 15, 1, 1, c.metal);
+    fill(&mut i, 13, 15, 1, 1, c.metal);
+    i
+}
+
+/// A task chair seen from behind (14×14): used on the near side of the council table.
+pub fn chair_back(c: &Colors) -> RgbaImage {
+    let mut i = RgbaImage::new(14, 14);
+    let ol = shade(c.chair, 0.45);
+    fill(&mut i, 0, 0, 14, 10, ol);
+    fill(&mut i, 1, 1, 12, 8, c.chair);
+    fill(&mut i, 1, 1, 12, 1, shade(c.chair, 1.35));
+    fill(&mut i, 1, 1, 1, 8, shade(c.chair, 1.2));
+    fill(&mut i, 12, 2, 1, 7, shade(c.chair, 0.8));
+    fill(&mut i, 3, 4, 8, 1, shade(c.chair, 0.86));
+    fill(&mut i, 3, 6, 8, 1, shade(c.chair, 0.86));
+    // seat edge, stem and caster base
+    fill(&mut i, 1, 10, 12, 2, ol);
+    fill(&mut i, 6, 12, 2, 1, c.metal);
+    fill(&mut i, 2, 13, 10, 1, shade(c.metal, 0.8));
+    put(&mut i, 2, 13, c.metal);
+    put(&mut i, 11, 13, c.metal);
     i
 }
 
@@ -261,11 +315,17 @@ pub fn whiteboard(c: &Colors) -> RgbaImage {
 }
 
 pub fn lamp(c: &Colors) -> RgbaImage {
+    // articulated desk lamp: weighted base, thin arm, amber shade lit from the top-left
     let mut i = RgbaImage::new(9, 12);
-    fill(&mut i, 2, 0, 6, 3, rgb(0xd9a441));
-    fill(&mut i, 1, 3, 8, 1, shade(rgb(0xd9a441), 0.75));
+    let amber = rgb(0xd9a441);
+    fill(&mut i, 1, 0, 6, 1, shade(amber, 1.25));
+    fill(&mut i, 0, 1, 8, 2, amber);
+    fill(&mut i, 0, 3, 8, 1, shade(amber, 0.6));
+    put(&mut i, 0, 1, shade(amber, 1.25));
     fill(&mut i, 4, 4, 1, 6, c.metal);
-    fill(&mut i, 1, 10, 7, 2, c.metal);
+    put(&mut i, 5, 6, c.metal);
+    fill(&mut i, 1, 10, 7, 2, shade(c.metal, 0.8));
+    fill(&mut i, 1, 10, 7, 1, shade(c.metal, 1.3));
     i
 }
 
@@ -337,7 +397,7 @@ pub fn all(c: &Colors) -> HashMap<&'static str, (RgbaImage, Option<[i32; 4]>)> {
     let mut m = HashMap::new();
     m.insert("floor", (floor(c), None));
     m.insert("wall", (wall(c), None));
-    m.insert("window", (window(c), None));
+    m.insert("window", (window(c), Some([2, 2, 24, 13])));
     m.insert("door", (door(c), None));
     m.insert("desk", (desk(c), None));
     m.insert("monitor_off", (monitor(c, c.screen_off), Some(MONITOR_SCREEN)));
@@ -350,4 +410,103 @@ pub fn all(c: &Colors) -> HashMap<&'static str, (RgbaImage, Option<[i32; 4]>)> {
     m.insert("lamp", (lamp(c), None));
     m.insert("rug", (rug(c), None));
     m
+}
+
+pub fn mix(a: Col, b: Col, k: f32) -> Col {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k).round().clamp(0.0, 255.0) as u8;
+    [m(a[0], b[0]), m(a[1], b[1]), m(a[2], b[2]), 255]
+}
+
+/// Light carpet tile colour for a colour set: a cool neutral at the floor's lightness, a hint of rug.
+pub fn carpet_base(c: &Colors) -> Col {
+    let lum = (0.299 * c.floor_a[0] as f32 + 0.587 * c.floor_a[1] as f32 + 0.114 * c.floor_a[2] as f32).clamp(40.0, 235.0);
+    let l = (lum + 24.0).min(226.0);
+    let cool = [(l * 0.93) as u8, (l * 0.97) as u8, (l * 1.04).min(255.0) as u8, 255];
+    mix(cool, c.rug, 0.16)
+}
+
+/// Light office carpet tiles (8×8 tiles in two close tones with fine seams and a bound edge).
+pub fn carpet(c: &Colors, w: i32, h: i32) -> RgbaImage {
+    let mut i = RgbaImage::new(w as u32, h as u32);
+    let base = carpet_base(c);
+    let alt = shade(base, 0.965);
+    for ty in 0..(h + 7) / 8 {
+        for tx in 0..(w + 7) / 8 {
+            let col = if (tx + ty) % 2 == 0 { base } else { alt };
+            fill(&mut i, tx * 8, ty * 8, 8, 8, col);
+            fill(&mut i, tx * 8, ty * 8, 8, 1, shade(col, 0.93));
+            fill(&mut i, tx * 8, ty * 8, 1, 8, shade(col, 0.93));
+        }
+    }
+    outline(&mut i, 0, 0, w, h, shade(base, 0.72));
+    fill(&mut i, 1, 1, w - 2, 1, shade(base, 1.08));
+    fill(&mut i, 1, 1, 1, h - 2, shade(base, 1.08));
+    i
+}
+
+/// The joint between two desks of a bench (8×16): top, edge and modesty panel, no side outlines.
+pub fn desk_bridge(c: &Colors) -> RgbaImage {
+    let mut i = RgbaImage::new(8, 16);
+    let ol = shade(c.desk, 0.45);
+    fill(&mut i, 0, 0, 8, 14, ol);
+    fill(&mut i, 0, 1, 8, 5, c.desk);
+    fill(&mut i, 0, 1, 8, 1, shade(c.desk, 1.1));
+    fill(&mut i, 0, 5, 8, 1, shade(c.desk, 0.86));
+    fill(&mut i, 0, 6, 8, 1, shade(c.desk, 0.78));
+    fill(&mut i, 0, 7, 8, 6, shade(c.desk, 0.7));
+    // cable grommet in the top
+    fill(&mut i, 3, 3, 2, 1, ol);
+    i
+}
+
+/// Frosted privacy partition between two workstations (4×`h`), aluminium edged.
+pub fn partition(c: &Colors, h: i32) -> RgbaImage {
+    let mut i = RgbaImage::new(4, h as u32);
+    let frame = shade(c.metal, 0.9);
+    let frost = mix(c.sky, rgb(0xffffff), 0.6);
+    fill(&mut i, 0, 0, 4, h, frame);
+    fill(&mut i, 1, 1, 2, h - 3, frost);
+    fill(&mut i, 1, 1, 1, h - 3, mix(frost, rgb(0xffffff), 0.6));
+    fill(&mut i, 0, 0, 4, 1, shade(frame, 1.5));
+    fill(&mut i, 0, h - 2, 4, 2, shade(c.metal, 0.7));
+    i
+}
+
+/// Rectangular conference table (72×40): light laminate top lit from the top-left with a wood edge
+/// band, a soft front shadow line and two steel panel legs.
+pub fn council_table(c: &Colors) -> RgbaImage {
+    let (w, h) = (72, 40);
+    let mut i = RgbaImage::new(w as u32, h as u32);
+    let top = mix(c.desk, rgb(0xffffff), 0.25);
+    let edge = shade(c.wood, 1.05);
+    let ol = shade(c.wood, 0.45);
+    // legs first (under the front edge)
+    for lx in [5, w - 9] {
+        fill(&mut i, lx, 36, 4, 4, shade(c.metal, 0.75));
+        fill(&mut i, lx, 36, 1, 4, shade(c.metal, 1.3));
+    }
+    fill(&mut i, 0, 0, w, 36, ol);
+    fill(&mut i, 1, 1, w - 2, 31, top);
+    fill(&mut i, 1, 1, w - 2, 1, shade(top, 1.06));
+    fill(&mut i, 1, 1, 1, 31, shade(top, 1.06));
+    fill(&mut i, w - 2, 2, 1, 30, shade(top, 0.9));
+    fill(&mut i, 1, 31, w - 2, 1, shade(top, 0.86));
+    // faint laminate sheen
+    for k in 0..4 {
+        fill(&mut i, 8 + k * 18, 6, 6, 1, shade(top, 1.04));
+        fill(&mut i, 12 + k * 18, 20, 4, 1, shade(top, 1.04));
+    }
+    // centre-piece: a conference speakerphone and two water bottles
+    fill(&mut i, w / 2 - 4, 14, 8, 4, shade(c.metal, 0.6));
+    fill(&mut i, w / 2 - 3, 14, 6, 1, shade(c.metal, 1.4));
+    put(&mut i, w / 2, 16, rgb(0x5fd35f));
+    for bx in [w / 2 - 12, w / 2 + 9] {
+        fill(&mut i, bx, 14, 2, 5, rgb(0x9ad4ee));
+        fill(&mut i, bx, 14, 2, 1, rgb(0xe8eef2));
+    }
+    // front edge band
+    fill(&mut i, 1, 32, w - 2, 3, edge);
+    fill(&mut i, 1, 32, w - 2, 1, shade(edge, 1.2));
+    fill(&mut i, 1, 34, w - 2, 1, shade(edge, 0.75));
+    i
 }

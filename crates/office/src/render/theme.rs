@@ -161,6 +161,9 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub fn sprite_opt(&self, name: &str) -> Option<&Sprite> {
+        self.sprites.get(name)
+    }
     pub fn sprite(&self, name: &str) -> &Sprite {
         self.sprites.get(name).unwrap_or_else(|| panic!("theme {} lacks {name}", self.name))
     }
@@ -192,12 +195,40 @@ fn build(
     Theme { name: name.to_string(), sprites, fx, colors, glow, floor_bg, wall_bg }
 }
 
+/// Resolve an atlas path relative to the theme dir. Absolute paths are rejected, and `..` may climb at
+/// most to the assets root (two levels above the theme dir, e.g. `../../vendor/pack/sheet.png`).
+pub fn resolve_sheet_path(dir: &Path, file: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let rel = Path::new(file);
+    let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut ups = 0;
+    for c in rel.components() {
+        match c {
+            Component::Normal(n) => stack.push(n),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    ups += 1;
+                    if ups > 2 {
+                        return Err(anyhow!("atlas path {file:?} escapes the assets directory"));
+                    }
+                }
+            }
+            _ => return Err(anyhow!("atlas path {file:?} must be relative")),
+        }
+    }
+    if stack.is_empty() {
+        return Err(anyhow!("atlas path {file:?} names no file"));
+    }
+    Ok(dir.join(rel))
+}
+
 /// Parse a theme.toml (sheets resolved relative to `dir`).
 pub fn parse(name: &str, src: &str, dir: &Path) -> Result<Theme> {
     let tf: ThemeFile = toml::from_str(src).with_context(|| format!("parse {name}/theme.toml"))?;
     let mut sheets: HashMap<String, (RgbaImage, &SheetDef)> = HashMap::new();
     for (k, sd) in &tf.sheets {
-        let p = dir.join(&sd.file);
+        let p = resolve_sheet_path(dir, &sd.file).with_context(|| format!("{name}: sheet {k}"))?;
         let mut img = image::open(&p).with_context(|| format!("open {}", p.display()))?.to_rgba8();
         if let Some(key) = sd.key.as_deref().and_then(parse_hex) {
             for px in img.pixels_mut() {
@@ -383,7 +414,7 @@ mod tests {
         let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes")];
         let names = list(&dirs);
         assert_eq!(names[0], "procedural");
-        for n in ["modern", "cozy", "retro", "cyberpunk"] {
+        for n in ["modern", "cozy", "retro", "cyberpunk", "kenney-cozy", "retro-1bit", "retro-amber", "retro-gameboy"] {
             assert!(names.iter().any(|x| x == n), "{n} not listed: {names:?}");
             let t = load(n, &dirs).unwrap_or_else(|e| panic!("{n}: {e:#}"));
             for s in SPRITE_NAMES {
@@ -411,5 +442,63 @@ mod tests {
         // a template is not a theme: it never shows up in the theme cycle
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes");
         assert!(!list(&[root]).iter().any(|n| n.ends_with(".example")));
+    }
+
+    #[test]
+    fn sheet_paths_are_confined() {
+        let d = Path::new("/x/assets/themes/t");
+        assert!(resolve_sheet_path(d, "a.png").is_ok());
+        assert!(resolve_sheet_path(d, "../../vendor/p/a.png").is_ok());
+        assert!(resolve_sheet_path(d, "../../../etc/a.png").is_err());
+        assert!(resolve_sheet_path(d, "/etc/passwd").is_err());
+    }
+
+    /// Every atlas of every bundled theme resolves inside assets/ and every sprite rectangle is in bounds.
+    #[test]
+    fn bundled_theme_atlases_resolve_and_rects_in_bounds() {
+        let assets = std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")).unwrap();
+        let themes = assets.join("themes");
+        for e in std::fs::read_dir(&themes).unwrap().flatten() {
+            let dir = e.path();
+            let tp = dir.join("theme.toml");
+            if !tp.is_file() {
+                continue;
+            }
+            let tn = e.file_name().to_string_lossy().to_string();
+            if tn.ends_with(".example") {
+                continue; // templates reference premium art that is not bundled
+            }
+            let tf: ThemeFile = toml::from_str(&std::fs::read_to_string(&tp).unwrap()).unwrap_or_else(|e| panic!("{tn}: {e}"));
+            let mut dims: HashMap<&String, (u32, u32, u32, u32)> = HashMap::new();
+            for (k, sd) in &tf.sheets {
+                let p = resolve_sheet_path(&dir, &sd.file).unwrap_or_else(|e| panic!("{tn}/{k}: {e:#}"));
+                let real = std::fs::canonicalize(&p).unwrap_or_else(|e| panic!("{tn}/{k}: {} {e}", p.display()));
+                assert!(real.starts_with(&assets), "{tn}/{k}: {} outside assets", real.display());
+                let (w, h) = image::image_dimensions(&real).unwrap();
+                dims.insert(k, (w, h, sd.tile, sd.spacing));
+            }
+            for (k, def) in &tf.sprites {
+                let (w, h, tile, sp) = *dims.get(&def.sheet).unwrap_or_else(|| panic!("{tn}/{k}: unknown sheet"));
+                let pitch = tile + sp;
+                let nf = def.frames.unwrap_or(1).max(1);
+                let ok = |x: u32, y: u32, rw: u32, rh: u32| {
+                    assert!(x + rw <= w && y + rh <= h, "{tn}/{k}: rect {x},{y} {rw}x{rh} outside {w}x{h} sheet");
+                };
+                for f in 0..nf {
+                    if let Some(tiles) = &def.tiles {
+                        let gc = def.grid.map_or(tiles.len() as u32, |g| g[0]);
+                        for [c, r] in tiles {
+                            ok((c + f * gc) * pitch, r * pitch, tile, tile);
+                        }
+                    } else if let (Some(c), Some(r)) = (def.col, def.row) {
+                        let (cw, ch) = (def.cols.unwrap_or(1), def.rows.unwrap_or(1));
+                        ok((c + f * cw) * pitch, r * pitch, cw * tile + (cw - 1) * sp, ch * tile + (ch - 1) * sp);
+                    } else {
+                        let (rw, rh) = (def.w.unwrap_or(tile), def.h.unwrap_or(tile));
+                        ok(def.x.unwrap_or(0) + f * (rw + sp), def.y.unwrap_or(0), rw, rh);
+                    }
+                }
+            }
+        }
     }
 }
