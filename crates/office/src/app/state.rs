@@ -19,9 +19,10 @@ pub trait Control {
     fn resolve_permission(&mut self, agent: &Agent, request_id: &str, allow: bool) -> anyhow::Result<()>;
     fn resume_claude(&mut self, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String>;
     fn notify(&mut self, title: &str, body: &str);
+    fn play_sound(&mut self, _critical: bool) {}
 }
 
-pub const PRESET_ORDER: [&str; 5] = ["procedural", "modern", "cozy", "retro", "cyberpunk"];
+pub const PRESET_ORDER: [&str; 6] = ["procedural", "modern", "cozy", "midnight", "retro", "cyberpunk"];
 pub const LAYERS: [&str; 5] = ["floor", "walls", "furniture", "decor", "characters"];
 pub const NOTIFY_INTERVAL_MS: u64 = 10_000;
 pub const TOAST_MS: u64 = 4_000;
@@ -34,6 +35,20 @@ pub enum Popup {
     Detail(AgentId),
     ConfirmCancel { id: AgentId, label: String, pid: u32 },
     Mixer { layer: usize },
+    /// Hand-offs, newest first: everything, or only what one agent sent and received.
+    Reports { sel: usize, only: Option<AgentId> },
+    /// One hand-off in full (brief + report); Esc goes back to the list.
+    ReportView { id: u64, only: Option<AgentId> },
+}
+
+/// Reports newest first, optionally only those sent or received by `only`.
+pub fn report_list<'a>(scene: &'a Scene, only: Option<&str>) -> Vec<&'a office_core::Report> {
+    scene
+        .reports
+        .iter()
+        .rev()
+        .filter(|r| only.is_none_or(|id| r.from == id || r.to.as_deref() == Some(id)))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +72,14 @@ pub struct LayoutCache {
     pub agent_rows: Rect,
     /// Agent ids of the visible table rows, top to bottom.
     pub row_ids: Vec<AgentId>,
+    /// Area of the alerts list body.
+    pub alert_rows: Rect,
+    /// Associated agent ids for visible alert rows.
+    pub alert_agent_ids: Vec<Option<AgentId>>,
+    /// Currently open modal popup rect (for click-outside-to-close).
+    pub popup: Rect,
+    /// Maximum scroll offset for the currently open detail popup.
+    pub detail_max_scroll: u16,
     /// Terminal font size in pixels (w, h) when an image protocol is active.
     pub font_px: Option<(u16, u16)>,
 }
@@ -90,17 +113,21 @@ pub fn layer_set(m: &mut ThemeMix, layer: usize, v: String) {
     }
 }
 
-/// Write `theme = {..}` into the TOML config, keeping every other key the user has.
+/// Write `theme = {..}` into the TOML config atomically, keeping every other key and failing safely
+/// if an existing config file cannot be read or parsed.
 pub fn persist_theme(path: &std::path::Path, mix: &ThemeMix) -> anyhow::Result<()> {
     let mut table: toml::Table = match std::fs::read_to_string(path) {
-        Ok(s) => s.parse::<toml::Table>().unwrap_or_default(),
-        Err(_) => toml::Table::new(),
+        Ok(s) => s.parse::<toml::Table>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(e.into()),
     };
     table.insert("theme".into(), toml::Value::try_from(mix)?);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, toml::to_string_pretty(&table)?)?;
+    let tmp = path.with_extension("toml.office-tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&table)?)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -114,8 +141,10 @@ pub struct App {
     /// What the mouse hovers in the office (agent id or an ambient "office:*" id).
     pub hover: Option<AgentId>,
     pub popup: Popup,
+    pub detail_scroll: u16,
     pub sidebar: bool,
     pub notifications: bool,
+    pub sound: bool,
     pub toasts: Vec<Toast>,
     /// Alerts at or before this time are hidden (the `c` key).
     pub alerts_cleared_at: Option<u64>,
@@ -130,6 +159,7 @@ pub struct App {
     prev_states: HashMap<AgentId, AgentState>,
     seen_alerts: HashSet<(u64, String, Option<AgentId>, String)>,
     last_notify: HashMap<String, u64>,
+    last_click: Option<(u64, AgentId)>,
     pub layout: LayoutCache,
     /// Set whenever the UI needs a redraw independent of scene changes.
     pub dirty: bool,
@@ -141,8 +171,10 @@ impl App {
             selected: None,
             hover: None,
             popup: Popup::None,
+            detail_scroll: 0,
             sidebar: cfg.sidebar,
             notifications: cfg.notifications,
+            sound: cfg.sound,
             toasts: Vec::new(),
             alerts_cleared_at: None,
             permissions_enabled: demo || cfg.permission_timeout_s > 0,
@@ -154,6 +186,7 @@ impl App {
             prev_states: HashMap::new(),
             seen_alerts: HashSet::new(),
             last_notify: HashMap::new(),
+            last_click: None,
             layout: LayoutCache::default(),
             dirty: true,
         }
@@ -226,10 +259,13 @@ impl App {
         }
         self.prev_states.retain(|id, _| scene.agents.contains_key(id));
         self.history.retain(|id, _| scene.agents.contains_key(id));
+        self.last_notify.retain(|k, _| k.starts_with("alert:") || scene.agents.contains_key(k));
 
         for a in entered_needs_you {
             let body = if a.activity.is_empty() { "waiting for you".to_string() } else { a.activity.clone() };
-            self.maybe_notify(&a.id.clone(), &format!("{} needs you", a.label), &body, now_ms, ctl);
+            if self.maybe_notify(&a.id.clone(), &format!("{} needs you", a.label), &body, now_ms, ctl) && self.sound {
+                ctl.play_sound(false);
+            }
         }
 
         // New Critical alerts.
@@ -250,7 +286,9 @@ impl App {
                 None => format!("office: {}", al.code),
             };
             let key = al.agent.clone().unwrap_or_else(|| format!("alert:{}", al.code));
-            self.maybe_notify(&key, &title, &al.message, now_ms, ctl);
+            if self.maybe_notify(&key, &title, &al.message, now_ms, ctl) && self.sound {
+                ctl.play_sound(true);
+            }
         }
         self.dirty = true;
     }
@@ -269,6 +307,42 @@ impl App {
         self.last_notify.insert(key.to_string(), now_ms);
         ctl.notify(title, body);
         true
+    }
+
+    fn jump_next_attention(&mut self, scene: &Scene, now_ms: u64) {
+        let rows: Vec<AgentId> = fmt::agent_rows(scene).into_iter().map(|(id, _)| id).collect();
+        let pick_group = |pred: &dyn Fn(AgentState) -> bool| -> Option<AgentId> {
+            let matches: Vec<&AgentId> = rows.iter().filter(|id| scene.agents.get(*id).is_some_and(|a| pred(a.state))).collect();
+            if matches.is_empty() {
+                return None;
+            }
+            let next_idx = self
+                .selected
+                .as_ref()
+                .and_then(|sel| matches.iter().position(|id| *id == sel))
+                .map(|i| (i + 1) % matches.len())
+                .unwrap_or(0);
+            Some(matches[next_idx].clone())
+        };
+        let target = pick_group(&|s| s == AgentState::NeedsYou)
+            .or_else(|| pick_group(&|s| s == AgentState::Error))
+            .or_else(|| {
+                pick_group(&|s| {
+                    matches!(
+                        s,
+                        AgentState::Typing
+                            | AgentState::Running
+                            | AgentState::Reading
+                            | AgentState::Thinking
+                            | AgentState::Delegating
+                    )
+                })
+            });
+        if let Some(id) = target {
+            self.selected = Some(id);
+        } else {
+            self.toast("no active or alerting agents", AlertLevel::Info, now_ms);
+        }
     }
 
     fn move_selection(&mut self, scene: &Scene, delta: i32) {
@@ -379,17 +453,32 @@ impl App {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.move_selection(scene, -1);
+                        self.detail_scroll = 0;
                         if let Some(id) = &self.selected {
                             self.popup = Popup::Detail(id.clone());
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.move_selection(scene, 1);
+                        self.detail_scroll = 0;
                         if let Some(id) = &self.selected {
                             self.popup = Popup::Detail(id.clone());
                         }
                     }
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.popup = Popup::None,
+                    KeyCode::PageDown => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(6).min(self.layout.detail_max_scroll);
+                    }
+                    KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(6),
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.detail_scroll = self.detail_scroll.saturating_add(6).min(self.layout.detail_max_scroll);
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(6);
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.popup = Popup::None;
+                        self.detail_scroll = 0;
+                    }
                     _ => {}
                 }
                 return Outcome::Continue;
@@ -407,6 +496,46 @@ impl App {
                         }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::Reports { sel, only } => {
+                let n = report_list(scene, only.as_deref()).len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.popup = Popup::Reports { sel: sel.saturating_sub(1), only },
+                    KeyCode::Down | KeyCode::Char('j') => self.popup = Popup::Reports { sel: (sel + 1).min(n.saturating_sub(1)), only },
+                    KeyCode::Char('a') => self.popup = Popup::Reports { sel: 0, only: None },
+                    KeyCode::Enter => {
+                        if let Some(r) = report_list(scene, only.as_deref()).get(sel) {
+                            self.detail_scroll = 0;
+                            self.popup = Popup::ReportView { id: r.id, only };
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('r') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::ReportView { id, only } => {
+                match key.code {
+                    KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char(' ') => {
+                        let step = if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) { 1 } else { 10 };
+                        self.detail_scroll = self.detail_scroll.saturating_add(step).min(self.layout.detail_max_scroll);
+                    }
+                    KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
+                        let step = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) { 1 } else { 10 };
+                        self.detail_scroll = self.detail_scroll.saturating_sub(step);
+                    }
+                    KeyCode::Esc | KeyCode::Backspace | KeyCode::Enter => {
+                        let sel = report_list(scene, only.as_deref()).iter().position(|r| r.id == id).unwrap_or(0);
+                        self.detail_scroll = 0;
+                        self.popup = Popup::Reports { sel, only };
+                    }
+                    KeyCode::Char('q') => {
+                        self.detail_scroll = 0;
+                        self.popup = Popup::None;
+                    }
                     _ => {}
                 }
                 return Outcome::Continue;
@@ -433,8 +562,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(scene, 1),
             KeyCode::Home | KeyCode::Char('g') => self.move_selection(scene, i32::MIN / 2),
             KeyCode::End | KeyCode::Char('G') => self.move_selection(scene, i32::MAX / 2),
+            KeyCode::Tab => self.jump_next_attention(scene, now_ms),
             KeyCode::Enter => {
                 if let Some(a) = self.selected_agent(scene) {
+                    self.detail_scroll = 0;
                     self.popup = Popup::Detail(a.id.clone());
                 } else {
                     self.toast("no agent selected", AlertLevel::Info, now_ms);
@@ -448,10 +579,19 @@ impl App {
                 let s = if self.notifications { "notifications on" } else { "notifications off" };
                 self.toast(s, AlertLevel::Info, now_ms);
             }
+            KeyCode::Char('m') => {
+                self.sound = !self.sound;
+                let s = if self.sound { "sound on" } else { "sound off" };
+                self.toast(s, AlertLevel::Info, now_ms);
+            }
             KeyCode::Char('c') => {
                 let latest = scene.alerts.iter().map(|a| a.at_ms).max().unwrap_or(0);
                 self.alerts_cleared_at = Some(latest.max(self.alerts_cleared_at.unwrap_or(0)));
-                self.toast("alerts cleared", AlertLevel::Info, now_ms);
+                self.toast("alerts cleared (C to restore)", AlertLevel::Info, now_ms);
+            }
+            KeyCode::Char('C') => {
+                self.alerts_cleared_at = None;
+                self.toast("showing all alerts", AlertLevel::Info, now_ms);
             }
             KeyCode::Char('a') => self.permission(scene, true, ctl, now_ms),
             KeyCode::Char('d') => self.permission(scene, false, ctl, now_ms),
@@ -468,6 +608,14 @@ impl App {
             },
             KeyCode::Char('o') => self.resume(scene, ctl, now_ms),
             KeyCode::Char('?') => self.popup = Popup::Help,
+            KeyCode::Char('r') => {
+                let only = self.selected.clone().filter(|id| scene.reports.iter().any(|r| &r.from == id || r.to.as_ref() == Some(id)));
+                if scene.reports.is_empty() {
+                    self.toast("no hand-offs yet", AlertLevel::Info, now_ms);
+                } else {
+                    self.popup = Popup::Reports { sel: 0, only };
+                }
+            }
             _ => self.dirty = false,
         }
         Outcome::Continue
@@ -527,9 +675,52 @@ impl App {
         }
     }
 
-    /// Mouse: left click on a sidebar row or on an agent in the office selects it.
+    /// Mouse: left click on a sidebar row, alert row, or office agent selects it; double-click opens details.
     /// `hit` maps office pixel coordinates to an agent (Renderer::hit_test).
+    #[cfg(test)]
     pub fn handle_mouse(&mut self, ev: MouseEvent, scene: &Scene, hit: &dyn Fn(u32, u32) -> Option<AgentId>) -> bool {
+        self.handle_mouse_at(ev, scene, hit, office_core::paths::now_ms())
+    }
+
+    pub fn handle_mouse_at(
+        &mut self,
+        ev: MouseEvent,
+        scene: &Scene,
+        hit: &dyn Fn(u32, u32) -> Option<AgentId>,
+        now_ms: u64,
+    ) -> bool {
+        if self.popup != Popup::None {
+            return match ev.kind {
+                MouseEventKind::ScrollUp if matches!(self.popup, Popup::Detail(_)) => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(2);
+                    true
+                }
+                MouseEventKind::ScrollDown if matches!(self.popup, Popup::Detail(_)) => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(2).min(self.layout.detail_max_scroll);
+                    true
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let p = self.layout.popup;
+                    let inside = p.width > 0
+                        && ev.column >= p.x
+                        && ev.column < p.x + p.width
+                        && ev.row >= p.y
+                        && ev.row < p.y + p.height;
+                    if !inside {
+                        let was_mixer = matches!(self.popup, Popup::Mixer { .. });
+                        self.popup = Popup::None;
+                        self.detail_scroll = 0;
+                        if was_mixer {
+                            self.persist(now_ms);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+        }
         if ev.kind == MouseEventKind::Moved {
             let id = self.office_hit(ev.column, ev.row, hit);
             if id != self.hover {
@@ -540,11 +731,11 @@ impl App {
         }
         if ev.kind != MouseEventKind::Down(MouseButton::Left) {
             return match ev.kind {
-                MouseEventKind::ScrollUp if self.popup == Popup::None => {
+                MouseEventKind::ScrollUp => {
                     self.move_selection(scene, -1);
                     true
                 }
-                MouseEventKind::ScrollDown if self.popup == Popup::None => {
+                MouseEventKind::ScrollDown => {
                     self.move_selection(scene, 1);
                     true
                 }
@@ -554,16 +745,46 @@ impl App {
         let (x, y) = (ev.column, ev.row);
         let r = self.layout.agent_rows;
         if self.sidebar && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
-            if let Some(id) = self.layout.row_ids.get((y - r.y) as usize) {
+            if let Some(id) = self.layout.row_ids.get((y - r.y) as usize).cloned() {
+                let dbl = self
+                    .last_click
+                    .as_ref()
+                    .is_some_and(|(t, prev)| prev == &id && now_ms.saturating_sub(*t) <= 400);
                 self.selected = Some(id.clone());
+                self.last_click = Some((now_ms, id.clone()));
+                if dbl && scene.agents.contains_key(&id) {
+                    self.detail_scroll = 0;
+                    self.popup = Popup::Detail(id);
+                }
                 self.dirty = true;
                 return true;
             }
             return false;
         }
+        let ar = self.layout.alert_rows;
+        if self.sidebar && x >= ar.x && x < ar.x + ar.width && y >= ar.y && y < ar.y + ar.height {
+            if let Some(Some(id)) = self.layout.alert_agent_ids.get((y - ar.y) as usize).cloned() {
+                if scene.agents.contains_key(&id) {
+                    self.selected = Some(id);
+                    self.dirty = true;
+                    return true;
+                }
+            }
+            return false;
+        }
         if let Some(id) = self.office_hit(x, y, hit) {
             if scene.agents.contains_key(&id) || is_ambient(&id) {
-                self.selected = Some(id);
+                let dbl = !is_ambient(&id)
+                    && self
+                        .last_click
+                        .as_ref()
+                        .is_some_and(|(t, prev)| prev == &id && now_ms.saturating_sub(*t) <= 400);
+                self.selected = Some(id.clone());
+                self.last_click = Some((now_ms, id.clone()));
+                if dbl {
+                    self.detail_scroll = 0;
+                    self.popup = Popup::Detail(id);
+                }
                 self.dirty = true;
                 return true;
             }
@@ -884,4 +1105,167 @@ mod tests {
         h.app.observe(&h.scene, 9_000, &mut h.ctl);
         assert_eq!(h.app.selected.as_deref(), Some("office:cat"));
     }
+
+    #[test]
+    fn tab_jumps_needs_you_then_error_then_active() {
+        let mut h = Harness::new();
+        h.scene.agents.get_mut("agy:4242").unwrap().state = AgentState::Error;
+        // demo_scene has cc:office in NeedsYou -> Tab jumps there first.
+        select(&mut h.app, "cc:dice");
+        h.press(code(KeyCode::Tab));
+        assert_eq!(h.app.selected.as_deref(), Some("cc:office"));
+        // Remove NeedsYou -> Tab jumps to Error (agy:4242).
+        h.scene.agents.get_mut("cc:office").unwrap().state = AgentState::Idle;
+        h.press(code(KeyCode::Tab));
+        assert_eq!(h.app.selected.as_deref(), Some("agy:4242"));
+        // Clear Error too -> Tab jumps to active agent (cc:dice Reading or Explore Thinking).
+        h.scene.agents.get_mut("agy:4242").unwrap().state = AgentState::Idle;
+        h.press(code(KeyCode::Tab));
+        assert_eq!(h.app.selected.as_deref(), Some("cc:dice"));
+        h.press(code(KeyCode::Tab));
+        assert_eq!(h.app.selected.as_deref(), Some("cc-sub:dice/1"));
+        // When all agents are Idle -> informative toast.
+        for a in h.scene.agents.values_mut() {
+            a.state = AgentState::Idle;
+        }
+        h.press(code(KeyCode::Tab));
+        assert!(h.toast().contains("no active"), "{}", h.toast());
+    }
+
+    #[test]
+    fn sound_toggle_and_chime_triggers() {
+        let mut h = Harness::new();
+        assert!(!h.app.sound);
+        h.press(key('m'));
+        assert!(h.app.sound);
+        assert_eq!(h.toast(), "sound on");
+        // Trigger new NeedsYou -> play_sound(false)
+        h.scene.agents.get_mut("cc:dice").unwrap().state = AgentState::NeedsYou;
+        h.app.observe(&h.scene, 10_000, &mut h.ctl);
+        // Trigger new Critical alert -> play_sound(true)
+        h.scene.alerts.push(Alert {
+            at_ms: 11_000,
+            level: AlertLevel::Critical,
+            agent: Some("agy:4242".into()),
+            code: "timeout".into(),
+            message: "timed out".into(),
+        });
+        h.app.observe(&h.scene, 11_000, &mut h.ctl);
+        assert_eq!(h.ctl.sounds, vec![false, true]);
+        h.press(key('m'));
+        assert!(!h.app.sound);
+        assert_eq!(h.toast(), "sound off");
+    }
+
+    #[test]
+    fn alerts_clear_restore_and_detail_scroll() {
+        let mut h = Harness::new();
+        assert_eq!(h.app.visible_alerts(&h.scene).len(), 2);
+        h.press(key('c'));
+        assert_eq!(h.app.visible_alerts(&h.scene).len(), 0);
+        assert!(h.toast().contains("C to restore"));
+        h.press(key('C'));
+        assert_eq!(h.app.visible_alerts(&h.scene).len(), 2);
+        assert_eq!(h.toast(), "showing all alerts");
+
+        select(&mut h.app, "cc:office");
+        h.press(code(KeyCode::Enter));
+        h.app.layout.detail_max_scroll = 100;
+        assert_eq!(h.app.detail_scroll, 0);
+        h.press(code(KeyCode::PageDown));
+        assert_eq!(h.app.detail_scroll, 6);
+        h.press(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(h.app.detail_scroll, 12);
+        h.press(code(KeyCode::PageUp));
+        assert_eq!(h.app.detail_scroll, 6);
+        h.press(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(h.app.detail_scroll, 0);
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+    }
+
+    #[test]
+    fn mouse_double_click_alerts_and_modal_outside_close() {
+        let mut h = Harness::new();
+        h.app.layout.agent_rows = Rect::new(60, 3, 40, 5);
+        h.app.layout.row_ids = vec!["cc:dice".into(), "agy:4242".into()];
+        h.app.layout.alert_rows = Rect::new(60, 20, 40, 4);
+        h.app.layout.alert_agent_ids = vec![Some("cc-sub:dice/1".into()), None];
+        h.app.layout.office = Rect::new(0, 1, 58, 20);
+        h.app.layout.font_px = Some((10, 20));
+        let click = |c, r| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: c,
+            row: r,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Clicking alert row 0 selects its linked agent.
+        assert!(h.app.handle_mouse_at(click(62, 20), &h.scene, &|_, _| None, 100));
+        assert_eq!(h.app.selected.as_deref(), Some("cc-sub:dice/1"));
+        // Double-click agent row 1 within 400ms opens Detail popup.
+        assert!(h.app.handle_mouse_at(click(65, 4), &h.scene, &|_, _| None, 200));
+        assert_eq!(h.app.popup, Popup::None);
+        assert!(h.app.handle_mouse_at(click(65, 4), &h.scene, &|_, _| None, 350));
+        assert_eq!(h.app.popup, Popup::Detail("agy:4242".into()));
+
+        // While modal is open, hover behind modal does nothing; scroll changes detail_scroll; click outside closes.
+        h.app.layout.popup = Rect::new(20, 5, 50, 15);
+        h.app.layout.detail_max_scroll = 100;
+        let mv = MouseEvent { kind: MouseEventKind::Moved, column: 3, row: 3, modifiers: KeyModifiers::NONE };
+        assert!(!h.app.handle_mouse_at(mv, &h.scene, &|_, _| Some("cc:office".into()), 400));
+        assert_eq!(h.app.hover, None);
+        let scr_dn = MouseEvent { kind: MouseEventKind::ScrollDown, column: 30, row: 10, modifiers: KeyModifiers::NONE };
+        assert!(h.app.handle_mouse_at(scr_dn, &h.scene, &|_, _| None, 410));
+        assert_eq!(h.app.detail_scroll, 2);
+        // Click inside popup keeps it open.
+        assert!(!h.app.handle_mouse_at(click(25, 8), &h.scene, &|_, _| None, 420));
+        assert!(matches!(h.app.popup, Popup::Detail(_)));
+        // Click outside popup closes it and resets scroll.
+        assert!(h.app.handle_mouse_at(click(2, 2), &h.scene, &|_, _| None, 430));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn detail_scroll_clamps_to_max_and_mixer_persists_on_click_outside() {
+        let mut h = Harness::new();
+        h.app.popup = Popup::Detail("cc:office".into());
+        h.app.layout.detail_max_scroll = 3;
+        let scr_dn = MouseEvent { kind: MouseEventKind::ScrollDown, column: 30, row: 10, modifiers: KeyModifiers::NONE };
+        h.app.handle_mouse_at(scr_dn, &h.scene, &|_, _| None, 100);
+        h.app.handle_mouse_at(scr_dn, &h.scene, &|_, _| None, 110);
+        assert_eq!(h.app.detail_scroll, 3);
+
+        h.app.popup = Popup::Mixer { layer: 0 };
+        h.app.layout.popup = Rect::new(20, 5, 50, 10);
+        let click_out = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 1, row: 1, modifiers: KeyModifiers::NONE };
+        assert!(h.app.handle_mouse_at(click_out, &h.scene, &|_, _| None, 200));
+        assert_eq!(h.app.popup, Popup::None);
+    }
+
+    #[test]
+    fn r_opens_hand_offs_for_the_selected_agent_and_reads_one() {
+        let mut h = Harness::new();
+        h.scene.reports.push(office_core::Report {
+            id: 7, at_ms: 1, kind: office_core::ReportKind::Report, from: "cc-sub:dice/1".into(), from_label: "Explore".into(),
+            to: Some("cc:dice".into()), to_label: "cc·DICE".into(), title: "Findings".into(), body: "all good".into(), brief: String::new(),
+        });
+        h.scene.reports.push(office_core::Report {
+            id: 8, at_ms: 2, kind: office_core::ReportKind::Result, from: "cc:office".into(), from_label: "cc·office".into(),
+            to: None, to_label: "you".into(), title: "Turn done".into(), body: String::new(), brief: String::new(),
+        });
+        select(&mut h.app, "cc-sub:dice/1");
+        h.press(key('r'));
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: Some("cc-sub:dice/1".into()) });
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::ReportView { id: 7, only: Some("cc-sub:dice/1".into()) });
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: Some("cc-sub:dice/1".into()) });
+        h.press(key('a'));
+        assert_eq!(h.app.popup, Popup::Reports { sel: 0, only: None });
+        assert_eq!(report_list(&h.scene, None).len(), 2);
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+    }
+
 }

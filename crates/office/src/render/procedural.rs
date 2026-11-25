@@ -282,6 +282,56 @@ pub fn rug(c: &Colors) -> RgbaImage {
     i
 }
 
+/// Espresso / coffee counter (22×18) for the back-wall break area.
+pub fn coffee_bar(c: &Colors) -> RgbaImage {
+    let mut i = RgbaImage::new(22, 18);
+    // counter + shadow apron
+    fill(&mut i, 0, 8, 22, 3, shade(c.wood, 1.15));
+    fill(&mut i, 1, 11, 20, 6, shade(c.wood, 0.8));
+    fill(&mut i, 1, 17, 2, 1, c.metal);
+    fill(&mut i, 19, 17, 2, 1, c.metal);
+    // espresso machine on the left
+    fill(&mut i, 2, 1, 9, 8, c.metal);
+    fill(&mut i, 3, 2, 7, 2, shade(c.metal, 1.35));
+    fill(&mut i, 4, 5, 5, 3, rgb(0x181c22));
+    put(&mut i, 8, 2, rgb(0x5fd35f)); // power led
+    // ceramic mug under spout + spare cup on right
+    fill(&mut i, 5, 6, 3, 2, rgb(0xf4f1ea));
+    fill(&mut i, 15, 6, 3, 2, rgb(0xe8d5b5));
+    fill(&mut i, 14, 7, 1, 1, rgb(0xe8d5b5));
+    i
+}
+
+/// Server rack (14×26) with bay slots (animated LEDs drawn dynamically in render/mod.rs).
+pub fn server_rack(c: &Colors) -> RgbaImage {
+    let mut i = RgbaImage::new(14, 26);
+    let body = shade(c.metal, 0.72);
+    let trim = shade(c.metal, 1.25);
+    fill(&mut i, 1, 0, 12, 25, body);
+    outline(&mut i, 1, 0, 12, 25, trim);
+    for bay in 0..4 {
+        let y = 3 + bay * 5;
+        fill(&mut i, 3, y, 8, 4, shade(body, 0.75));
+        fill(&mut i, 4, y + 1, 4, 1, trim);
+    }
+    fill(&mut i, 2, 25, 2, 1, trim);
+    fill(&mut i, 10, 25, 2, 1, trim);
+    i
+}
+
+/// Lobby waiting bench (54×10) near the entrance door.
+pub fn bench(c: &Colors) -> RgbaImage {
+    let mut i = RgbaImage::new(54, 10);
+    fill(&mut i, 1, 0, 52, 1, shade(c.fabric, 1.3));
+    fill(&mut i, 1, 1, 52, 1, shade(c.fabric, 1.1));
+    fill(&mut i, 1, 2, 52, 4, c.fabric);
+    fill(&mut i, 0, 6, 54, 1, c.wood);
+    fill(&mut i, 0, 7, 54, 1, shade(c.wood, 0.7));
+    fill(&mut i, 3, 8, 2, 2, c.metal);
+    fill(&mut i, 49, 8, 2, 2, c.metal);
+    i
+}
+
 /// All logical sprites for a colour set. (name -> (image, optional screen rect))
 pub fn all(c: &Colors) -> HashMap<&'static str, (RgbaImage, Option<[i32; 4]>)> {
     let mut m = HashMap::new();

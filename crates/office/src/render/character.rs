@@ -54,14 +54,22 @@ pub enum Arms {
     RaiseRight,
     PointRight,
     Page,
-    /// Swinging while walking; bool = phase.
-    Swing(bool),
+    /// Chin-rest thinking pose.
+    Think,
+    /// NeedsYou waving hand; bool toggles wave angle.
+    Wave(bool),
+    /// Error distressed pose; bool toggles shake.
+    Panic(bool),
+    /// Idle coffee cup sip; bool toggles cup raised.
+    Sip(bool),
+    /// 4-frame arm swing while walking; phase 0..4.
+    Swing(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Legs {
     Stand,
-    Walk(bool),
+    Walk(u8),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,15 +106,21 @@ pub fn draw(img: &mut RgbaImage, ox: i32, oy: i32, l: &Look, p: &Pose) {
             rect(img, 9, 23, 3, 1, l.shoes);
         }
         Legs::Walk(ph) => {
-            let (a, c) = if ph { (0, 1) } else { (1, 0) };
-            rect(img, 5, 17, 2, 6 - a, l.pants);
-            rect(img, 9, 17, 2, 6 - c, l.pants);
-            rect(img, 4, 23 - a, 3, 1, l.shoes);
-            rect(img, 9, 23 - c, 3, 1, l.shoes);
+            let (la, ra, lx, rx) = match ph % 4 {
+                0 => (0, 2, 4, 10),
+                1 => (0, 0, 5, 9),
+                2 => (2, 0, 5, 9),
+                _ => (0, 0, 5, 9),
+            };
+            rect(img, 5, 17, 2, 6 - la, l.pants);
+            rect(img, 9, 17, 2, 6 - ra, l.pants);
+            rect(img, lx, 23 - la, 3, 1, l.shoes);
+            rect(img, rx, 23 - ra, 3, 1, l.shoes);
         }
     }
     // torso
     rect(img, 4, 10 + b, 8, 7, l.shirt);
+    rect(img, 5, 10 + b, 6, 1, shade(l.shirt, 1.08)); // subtle shoulder sheen
     rect(img, 4, 16 + b, 8, 1, shirt_d);
     rect(img, 7, 10 + b, 2, 1, skin_d); // collar
     rect(img, 5, 17, 6, 1, shade(l.pants, 0.8)); // belt
@@ -122,11 +136,15 @@ pub fn draw(img: &mut RgbaImage, ox: i32, oy: i32, l: &Look, p: &Pose) {
             px(img, 12, 16 + b, l.skin);
         }
         Arms::Swing(ph) => {
-            let (a, c) = if ph { (-1, 1) } else { (1, -1) };
+            let (ldy, rdy) = match ph % 4 {
+                0 => (1, -1),
+                2 => (-1, 1),
+                _ => (0, 0),
+            };
             sleeve(img, 3, 11 + b, 5);
             sleeve(img, 12, 11 + b, 5);
-            px(img, 3, 16 + b + a.max(0), l.skin);
-            px(img, 12, 16 + b + c.max(0), l.skin);
+            px(img, 3, 16 + b + ldy.max(0), l.skin);
+            px(img, 12, 16 + b + rdy.max(0), l.skin);
         }
         Arms::Type(alt) => {
             sleeve(img, 3, 11 + b, 4);
@@ -151,6 +169,43 @@ pub fn draw(img: &mut RgbaImage, ox: i32, oy: i32, l: &Look, p: &Pose) {
             rect(img, 13, 3 + b, 1, 8, shirt_d);
             rect(img, 13, 1 + b, 1, 2, l.skin);
             px(img, 12, 10 + b, shirt_d);
+        }
+        Arms::Wave(alt) => {
+            sleeve(img, 3, 11 + b, 5);
+            px(img, 3, 16 + b, l.skin);
+            let wx = if alt { 14 } else { 13 };
+            rect(img, 12, 9 + b, 1, 2, shirt_d);
+            rect(img, wx, 2 + b, 1, 8, shirt_d);
+            rect(img, wx, 0 + b, 1, 2, l.skin);
+        }
+        Arms::Think => {
+            sleeve(img, 3, 11 + b, 5);
+            px(img, 3, 16 + b, l.skin);
+            rect(img, 12, 10 + b, 1, 3, shirt_d);
+            rect(img, 10, 9 + b, 2, 1, l.skin);
+            px(img, 9, 8 + b, l.skin);
+        }
+        Arms::Panic(alt) => {
+            let dy = if alt { 0 } else { 1 };
+            rect(img, 2, 6 + b + dy, 1, 5, shirt_d);
+            rect(img, 13, 6 + b + (1 - dy), 1, 5, shirt_d);
+            px(img, 2, 5 + b + dy, l.skin);
+            px(img, 13, 5 + b + (1 - dy), l.skin);
+            px(img, 3, 10 + b, shirt_d);
+            px(img, 12, 10 + b, shirt_d);
+        }
+        Arms::Sip(up) => {
+            sleeve(img, 3, 11 + b, 5);
+            px(img, 3, 16 + b, l.skin);
+            sleeve(img, 12, 11 + b, 4);
+            let (mx, my) = if up { (10, 8 + b) } else { (12, 14 + b) };
+            rect(img, mx, my, 2, 2, rgb(0xf2f2f2));
+            px(img, mx, my, rgb(0x5a3a22));
+            if up {
+                rect(img, 12, 10 + b, 1, 2, l.skin);
+            } else {
+                px(img, 12, 15 + b, l.skin);
+            }
         }
         Arms::PointRight => {
             sleeve(img, 3, 11 + b, 5);
@@ -247,8 +302,19 @@ mod tests {
     #[test]
     fn draws_within_box() {
         let mut img = RgbaImage::new(CW as u32 + 4, CH as u32 + 8);
-        for arms in [Arms::Down, Arms::Up, Arms::RaiseRight, Arms::PointRight, Arms::Page, Arms::Type(true)] {
-            draw(&mut img, 2, 4, &look_for("x"), &Pose { arms, ..Default::default() });
+        for arms in [
+            Arms::Down,
+            Arms::Up,
+            Arms::RaiseRight,
+            Arms::Wave(true),
+            Arms::Think,
+            Arms::Panic(true),
+            Arms::Sip(true),
+            Arms::PointRight,
+            Arms::Page,
+            Arms::Type(true),
+        ] {
+            draw(&mut img, 2, 4, &look_for("x"), &Pose { arms, legs: Legs::Walk(2), ..Default::default() });
         }
         assert!(img.pixels().any(|p| p.0[3] > 0));
     }

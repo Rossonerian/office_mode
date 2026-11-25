@@ -27,6 +27,7 @@ pub struct Config {
     pub presets: BTreeMap<String, ThemeMix>,
     pub fps: u32,
     pub notifications: bool,
+    pub sound: bool,
     pub cost_alert_usd: f64,
     pub stuck_after_s: u64,
     /// $ per 1M tokens: model-substring -> (input, output).
@@ -112,6 +113,7 @@ impl Default for Config {
             presets: BTreeMap::new(),
             fps: 12,
             notifications: true,
+            sound: false,
             cost_alert_usd: 50.0,
             stuck_after_s: 120,
             prices,

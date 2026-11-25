@@ -143,6 +143,12 @@ pub fn map_pixels(img: &mut RgbaImage, f: &dyn Fn(Col) -> Col) {
 
 /// Nearest-neighbour scale of `src` into `dst` at (ox, oy) with factor `s` (may be < 1).
 pub fn scale_into(dst: &mut RgbaImage, src: &RgbaImage, ox: u32, oy: u32, s: f32) {
+    let mut xmap = Vec::new();
+    scale_into_with_xmap(dst, src, ox, oy, s, &mut xmap);
+}
+
+/// Nearest-neighbour scale reusing a caller-owned `xmap` buffer across frames.
+pub fn scale_into_with_xmap(dst: &mut RgbaImage, src: &RgbaImage, ox: u32, oy: u32, s: f32, xmap: &mut Vec<usize>) {
     let (dw, dh) = (dst.width(), dst.height());
     let (sw, sh) = (src.width(), src.height());
     let ow = ((sw as f32 * s).floor() as u32).min(dw.saturating_sub(ox));
@@ -150,7 +156,8 @@ pub fn scale_into(dst: &mut RgbaImage, src: &RgbaImage, ox: u32, oy: u32, s: f32
     if ow == 0 || oh == 0 {
         return;
     }
-    let xmap: Vec<usize> = (0..ow).map(|x| ((x as f32 / s) as u32).min(sw - 1) as usize * 4).collect();
+    xmap.clear();
+    xmap.extend((0..ow).map(|x| ((x as f32 / s) as u32).min(sw - 1) as usize * 4));
     let sraw = src.as_raw();
     let draw = dst.as_mut();
     let mut last_sy = u32::MAX;

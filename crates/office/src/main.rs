@@ -5,7 +5,7 @@ mod render;
 mod sources;
 
 const USAGE: &str = "\
-office: a terminal pixel office for your AI coding agents
+office: ROSSO's terminal pixel office for your AI coding agents
 
 USAGE:
     office                      run the office (live sources)

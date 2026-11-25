@@ -94,14 +94,19 @@ pub struct Leg {
     pub alert: bool,
     /// The alerting desks when this leg was planned.
     alerts: Vec<Spot>,
-    /// Layout geometry the leg was planned on.
-    layout: String,
+    /// Layout geometry hash the leg was planned on.
+    layout_hash: u64,
+    /// Cached aisle route + walk duration so per-frame updates allocate nothing.
+    route: Vec<(i32, i32)>,
+    walk_ms: f32,
 }
 
 impl Leg {
     fn plan(lay: &Layout, alerts: &[Spot], k: u64, start: u64, from: Spot) -> Leg {
         let (to, alert) = waypoint(lay, alerts, k);
-        Leg { k, start, from, to, alert, alerts: alerts.to_vec(), layout: lay.static_key() }
+        let route = lay.route(&from, &to);
+        let walk_ms = (path_len(&route) / WALK_PX_PER_S * 1000.0).min(MAX_WALK_MS);
+        Leg { k, start, from, to, alert, alerts: alerts.to_vec(), layout_hash: lay.static_hash(), route, walk_ms }
     }
 
     /// The leg a fresh cat would be on at `t` (a pure function of `t`).
@@ -109,10 +114,6 @@ impl Leg {
         let k = t / LEG_MS + 1;
         let (from, _) = waypoint(lay, alerts, k - 1);
         Leg::plan(lay, alerts, k, (k - 1) * LEG_MS, from)
-    }
-
-    fn walk_ms(&self, lay: &Layout) -> f32 {
-        (path_len(&lay.route(&self.from, &self.to)) / WALK_PX_PER_S * 1000.0).min(MAX_WALK_MS)
     }
 }
 
@@ -127,13 +128,13 @@ impl Memory {
     /// Where the cat is and what it is doing at `t`, continuing the current leg.
     pub fn state(&mut self, lay: &Layout, scene: &Scene, t: u64) -> CatState {
         let alerts = alert_desks(scene, lay);
-        let key = lay.static_key();
+        let key = lay.static_hash();
         let mut leg = match self.leg.take() {
             // a new layout, a clock jump backwards or a long gap: start over
-            Some(l) if l.layout == key && t >= l.start && t < l.start + 2 * LEG_MS => l,
+            Some(l) if l.layout_hash == key && t >= l.start && t < l.start + 2 * LEG_MS => l,
             _ => Leg::fresh(lay, &alerts, t),
         };
-        let walked = t as f32 >= leg.start as f32 + leg.walk_ms(lay);
+        let walked = t as f32 >= leg.start as f32 + leg.walk_ms;
         if t >= leg.start + LEG_MS {
             let start = leg.start + LEG_MS;
             leg = Leg::plan(lay, &alerts, leg.k + 1, start.max(t.saturating_sub(LEG_MS - 1)), leg.to);
@@ -188,13 +189,13 @@ fn pos_on(pts: &[(i32, i32)], from: &Spot, to: &Spot, p: f32) -> (f32, f32, usiz
 fn leg_state(lay: &Layout, leg: &Leg, t: u64) -> CatState {
     let (from, to, alert, k) = (leg.from, leg.to, leg.alert, leg.k);
     let within = t.saturating_sub(leg.start);
-    let walk_ms = leg.walk_ms(lay);
+    let walk_ms = leg.walk_ms;
     let dx = to.x - from.x;
     let tail_up = (t / 450) % 7 == 0 || (alert && (t / 250) % 2 == 0);
     let default_left = if dx != 0 { dx < 0 } else { mix(k ^ 0x51) % 2 == 0 };
     if (within as f32) < walk_ms {
         let p = within as f32 / walk_ms;
-        let (x, y, _, sx) = walk_pos(lay, &from, &to, p);
+        let (x, y, _, sx) = pos_on(&leg.route, &from, &to, p);
         let left = if sx != 0 { sx < 0 } else { default_left };
         let frame = ((t / 110) % 4) as u8;
         return clamp_in(lay, CatState { x: x.round() as i32, y: y.round() as i32, left, action: Action::Walk(frame), tail_up });

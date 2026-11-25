@@ -7,12 +7,16 @@ pub const CELL_W: i32 = 48;
 pub const CELL_H: i32 = 64;
 pub const POD_W: i32 = CELL_W * 2;
 pub const POD_H: i32 = CELL_H * 2;
-pub const GAP_X: i32 = 16;
-pub const GAP_Y: i32 = 8;
+pub const GAP_X: i32 = 24;
+pub const GAP_Y: i32 = 12;
+/// Nameplate strip above each session's floor zone (the session name is drawn there).
+pub const ZONE_HEAD: i32 = 11;
+/// How far a session's floor zone extends around its pods.
+pub const ZONE_PAD: i32 = 5;
 pub const MARGIN: i32 = 16;
 pub const WALL_H: i32 = 48;
-pub const DECOR_H: i32 = 28;
-pub const BOTTOM_H: i32 = 36;
+pub const DECOR_H: i32 = 38;
+pub const BOTTOM_H: i32 = 46;
 pub const MIN_W: i32 = 272;
 pub const DESKS_PER_POD: usize = 4;
 /// The CEO's corner office (top-right, below the decor strip).
@@ -71,6 +75,15 @@ pub enum PodKind {
     Overflow,
     /// Unmatched agy / other agents.
     Lab,
+    /// A session's council cabin: council seats (architect, advisors) and their agy calls at a
+    /// round table instead of desks.
+    Council,
+}
+
+/// Council members: the `agy-council-*` relay subagents and their `council-*` agy calls.
+pub fn is_council(a: &Agent) -> bool {
+    let r = a.role.as_deref().unwrap_or("");
+    r.starts_with("agy-council") || (a.kind == AgentKind::Agy && r.starts_with("council"))
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +92,20 @@ pub struct Pod {
     pub x: i32,
     pub y: i32,
     pub desks: [Option<AgentId>; DESKS_PER_POD],
+    /// Index of the group (one per session, then the lab) this pod belongs to.
+    pub group: usize,
+}
+
+/// A session's own patch of floor: one per run of same-group pods in a row.
+#[derive(Debug, Clone)]
+pub struct Zone {
+    pub group: usize,
+    /// The owning top-level session (None for the agy lab).
+    pub session: Option<AgentId>,
+    /// Floor rect [x, y, w, h], nameplate strip included.
+    pub rect: [i32; 4],
+    /// True for the first zone of a group (it carries the nameplate text).
+    pub head: bool,
 }
 
 impl Pod {
@@ -104,9 +131,15 @@ pub struct Layout {
     pub cols: usize,
     pub rows: usize,
     pub pods: Vec<Pod>,
+    /// Per-session floor zones (drawn under the pods, each in its session's colour).
+    pub zones: Vec<Zone>,
     pub seats: HashMap<AgentId, Seat>,
     /// Feet position at the door (walk start/end).
     pub door: (i32, i32),
+    /// Waiting lobby area along the bottom corridor (feet y, starting x).
+    pub lobby_bench: (i32, i32),
+    /// Back-wall coffee bar access point.
+    pub coffee_bar: (i32, i32),
     /// The CEO corner office [x, y, w, h], when reserved.
     pub ceo: Option<[i32; 4]>,
     /// Cat waypoints (sofa, windowsill, CEO desk, floor, then every desk top).
@@ -118,12 +151,41 @@ impl Layout {
     pub fn static_key(&self) -> String {
         let mut k = format!("{}x{}:{}x{}", self.w, self.h, self.cols, self.rows);
         for p in &self.pods {
-            k.push_str(&format!("|{:?}@{},{}", p.kind, p.x, p.y));
+            k.push_str(&format!("|{:?}@{},{}#{}", p.kind, p.x, p.y, p.group));
         }
         if let Some(c) = self.ceo {
             k.push_str(&format!("|ceo@{c:?}"));
         }
         k
+    }
+
+    /// Zero-allocation hash of room geometry and pod kinds.
+    pub fn static_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut feed = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        feed(self.w as u64);
+        feed(self.h as u64);
+        feed(self.cols as u64);
+        feed(self.rows as u64);
+        for p in &self.pods {
+            feed(p.kind as u64);
+            feed(p.x as u64);
+            feed(p.y as u64);
+            feed(p.group as u64);
+        }
+        if let Some([cx, cy, cw, ch]) = self.ceo {
+            feed(1);
+            feed(cx as u64);
+            feed(cy as u64);
+            feed(cw as u64);
+            feed(ch as u64);
+        } else {
+            feed(0);
+        }
+        h
     }
 }
 
@@ -181,7 +243,8 @@ pub fn room_size_with(cols: usize, rows: usize, ex: Extras) -> (i32, i32) {
     let rows = rows.max(1) as i32;
     let ceo_w = if ex.ceo { GAP_X + CEO_W } else { 0 };
     let w = (MARGIN * 2 + cols * POD_W + (cols - 1) * GAP_X + ceo_w).max(MIN_W);
-    let h = (WALL_H + DECOR_H + rows * POD_H + (rows - 1) * GAP_Y + BOTTOM_H).max(WALL_H + DECOR_H + CEO_H + BOTTOM_H);
+    let h = (WALL_H + DECOR_H + rows * (POD_H + ZONE_HEAD + ZONE_PAD) + (rows - 1) * GAP_Y + BOTTOM_H)
+        .max(WALL_H + DECOR_H + CEO_H + BOTTOM_H);
     (w, h)
 }
 
@@ -192,13 +255,16 @@ pub fn best_cols(n_pods: usize, px_w: u32, px_h: u32) -> usize {
 
 pub fn best_cols_with(n_pods: usize, px_w: u32, px_h: u32, ex: Extras) -> usize {
     let n = n_pods.max(1);
-    let mut best = (1usize, f32::MIN);
+    let (pw, ph) = (px_w.max(1) as f32, px_h.max(1) as f32);
+    let mut best = (1usize, f32::MIN, f32::MIN);
     for cols in 1..=n {
         let rows = n.div_ceil(cols);
         let (w, h) = room_size_with(cols, rows, ex);
-        let fit = (px_w as f32 / w as f32).min(px_h as f32 / h as f32);
-        if fit > best.1 + 1e-4 {
-            best = (cols, fit);
+        let raw_fit = (pw / w as f32).min(ph / h as f32);
+        let int_fit = if raw_fit >= 1.0 { raw_fit.floor() } else { raw_fit };
+        let fill = (w as f32 * int_fit * h as f32 * int_fit) / (pw * ph);
+        if int_fit > best.1 + 1e-4 || ((int_fit - best.1).abs() <= 1e-4 && fill > best.2 + 1e-4) {
+            best = (cols, int_fit, fill);
         }
     }
     best.0
@@ -209,20 +275,40 @@ pub fn build(scene: &Scene, px_w: u32, px_h: u32) -> Layout {
 }
 
 pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
-    let mut pod_plans: Vec<(PodKind, Vec<AgentId>)> = Vec::new();
-    for (host, ids) in groups(scene) {
+    let mut pod_plans: Vec<(PodKind, Vec<AgentId>, usize)> = Vec::new();
+    let mut group_hosts: Vec<Option<AgentId>> = Vec::new();
+    for (g, (host, ids)) in groups(scene).into_iter().enumerate() {
         let lab = host.is_empty();
-        for (i, chunk) in ids.chunks(DESKS_PER_POD).enumerate() {
+        group_hosts.push((!lab).then(|| host.clone()));
+        let (council, desks): (Vec<AgentId>, Vec<AgentId>) = if lab {
+            (Vec::new(), ids)
+        } else {
+            ids.into_iter().partition(|id| scene.agents.get(id).is_some_and(is_council))
+        };
+        for (i, chunk) in desks.chunks(DESKS_PER_POD).enumerate() {
             let kind = if lab { PodKind::Lab } else if i == 0 { PodKind::Session } else { PodKind::Overflow };
-            pod_plans.push((kind, chunk.to_vec()));
+            pod_plans.push((kind, chunk.to_vec(), g));
+        }
+        for chunk in council.chunks(DESKS_PER_POD) {
+            pod_plans.push((PodKind::Council, chunk.to_vec(), g));
         }
     }
     if pod_plans.is_empty() {
-        pod_plans.push((PodKind::Session, Vec::new()));
+        pod_plans.push((PodKind::Session, Vec::new(), 0));
+        group_hosts.push(None);
     }
     let cols = best_cols_with(pod_plans.len(), px_w, px_h, ex);
     let rows = pod_plans.len().div_ceil(cols);
-    let (w, h) = room_size_with(cols, rows, ex);
+    let (base_w, base_h) = room_size_with(cols, rows, ex);
+    let fit = (px_w.max(1) as f32 / base_w as f32).min(px_h.max(1) as f32 / base_h as f32);
+    let (w, h) = if fit >= 1.0 {
+        let s = fit.floor();
+        let tw = ((px_w as f32 / s).floor() as i32) & !1;
+        let th = ((px_h as f32 / s).floor() as i32) & !1;
+        (tw.clamp(base_w, base_w + 144), th.clamp(base_h, base_h + 48))
+    } else {
+        (base_w, base_h)
+    };
     // centre the pod grid horizontally (left of the CEO corner, when reserved)
     let grid_w = cols as i32 * POD_W + (cols as i32 - 1) * GAP_X;
     let ceo = ex.ceo.then(|| [w - MARGIN - CEO_W, WALL_H + DECOR_H, CEO_W, CEO_H]);
@@ -230,15 +316,20 @@ pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
         Some(c) => MARGIN + (c[0] - GAP_X - MARGIN - grid_w).max(0) / 2,
         None => (w - grid_w) / 2,
     };
+    // centre the grid vertically in any spare height between the decor strip and the corridor
+    let grid_h = rows as i32 * (POD_H + ZONE_HEAD + ZONE_PAD) + (rows as i32 - 1) * GAP_Y;
+    let spare = (h - BOTTOM_H - (WALL_H + DECOR_H) - grid_h).max(0);
+    let y0 = WALL_H + DECOR_H + ZONE_HEAD + spare / 2;
     let mut pods = Vec::new();
     let mut seats = HashMap::new();
-    for (i, (kind, ids)) in pod_plans.into_iter().enumerate() {
+    for (i, (kind, ids, group)) in pod_plans.into_iter().enumerate() {
         let (c, r) = ((i % cols) as i32, (i / cols) as i32);
         let mut pod = Pod {
             kind,
             x: x0 + c * (POD_W + GAP_X),
-            y: WALL_H + DECOR_H + r * (POD_H + GAP_Y),
+            y: y0 + r * (POD_H + ZONE_HEAD + ZONE_PAD + GAP_Y),
             desks: Default::default(),
+            group,
         };
         for (d, id) in ids.into_iter().enumerate() {
             let (x, y) = pod.cell(d);
@@ -246,6 +337,20 @@ pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
             pod.desks[d] = Some(id);
         }
         pods.push(pod);
+    }
+    // floor zones: merge runs of same-group pods in the same row
+    let mut zones: Vec<Zone> = Vec::new();
+    let mut seen_groups = std::collections::HashSet::new();
+    for p in &pods {
+        let rect = [p.x - ZONE_PAD, p.y - ZONE_HEAD, POD_W + ZONE_PAD * 2, POD_H + ZONE_HEAD + ZONE_PAD];
+        if let Some(z) = zones.last_mut() {
+            if z.group == p.group && z.rect[1] == rect[1] && z.rect[0] + z.rect[2] + GAP_X - ZONE_PAD * 2 == rect[0] {
+                z.rect[2] = rect[0] + rect[2] - z.rect[0];
+                continue;
+            }
+        }
+        let head = seen_groups.insert(p.group);
+        zones.push(Zone { group: p.group, session: group_hosts.get(p.group).cloned().flatten(), rect, head });
     }
     let mut spots = vec![
         Spot { kind: SpotKind::Sofa, x: w - SOFA_CX_FROM_RIGHT, y: WALL_H + DECOR_H - 9 },
@@ -256,13 +361,29 @@ pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
         spots.push(Spot { kind: SpotKind::CeoDesk, x: cx + cw - 16, y: cy + CEO_DESK_TOP + 2 });
     }
     for (pi, pod) in pods.iter().enumerate() {
+        if pod.kind == PodKind::Council {
+            continue; // no desks to sit on in the council cabin
+        }
         for d in 0..DESKS_PER_POD {
             let (ox, oy) = pod.cell(d);
             let (x, y) = desk_top(ox, oy);
             spots.push(Spot { kind: SpotKind::Desk(pi, d), x, y });
         }
     }
-    Layout { w, h, cols, rows, pods, seats, door: (MARGIN + 9, h - 14), ceo, spots }
+    Layout {
+        w,
+        h,
+        cols,
+        rows,
+        pods,
+        zones,
+        seats,
+        door: (MARGIN + 9, h - 14),
+        lobby_bench: (MARGIN + 52, h - 22),
+        coffee_bar: (MARGIN + 52, WALL_H + DECOR_H + 2),
+        ceo,
+        spots,
+    }
 }
 
 /// Desk furniture rect [x, y, w, h] of the desk cell at (ox, oy) (as drawn by the renderer).
@@ -351,6 +472,36 @@ impl Layout {
         xs
     }
 
+    /// Wide vertical aisles between pod columns (for 16 px walking humans).
+    pub fn outer_aisles_x(&self) -> Vec<i32> {
+        let mut xs = Vec::new();
+        for p in &self.pods {
+            xs.push(p.x - GAP_X / 2);
+            xs.push(p.x + POD_W + GAP_X / 2);
+        }
+        if xs.is_empty() {
+            xs.push(MARGIN / 2 + 8);
+        }
+        xs.sort_unstable();
+        xs.dedup();
+        xs
+    }
+
+    /// Manhattan aisle route for walking agents (never cuts diagonally through desks).
+    pub fn walk_route(&self, from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
+        if (from.1 - to.1).abs() <= 4 {
+            return vec![from, to];
+        }
+        let xv = self
+            .outer_aisles_x()
+            .into_iter()
+            .min_by_key(|x| ((from.0 - x).abs() + (to.0 - x).abs(), *x))
+            .unwrap_or(from.0);
+        let mut pts = vec![from, (xv, from.1), (xv, to.1), to];
+        pts.dedup();
+        pts
+    }
+
     /// Manhattan route between two spots along floor aisles: hop down to the access point, walk
     /// the aisle to a vertical aisle, along it, then the target's aisle, and hop up. Returns the
     /// polyline including both end points (consecutive duplicates removed).
@@ -398,6 +549,9 @@ mod tests {
             cwd: cwd.map(Into::into),
             role: None,
             model: None,
+            current_tool: None,
+            last_tool: None,
+            last_tool_ok: None,
             slot: None,
             pid: None,
             state: AgentState::Idle,
@@ -528,4 +682,36 @@ mod tests {
         assert_eq!(l.pods[1].kind, PodKind::Overflow);
         assert!(l.rows >= 2, "tall target stacks rows");
     }
+
+    #[test]
+    fn each_session_gets_its_own_floor_zone_and_one_nameplate() {
+        let mut s = Scene::default();
+        for (n, id) in ["cc:a", "cc:b", "cc:c"].iter().enumerate() {
+            s.agents.insert((*id).into(), agent(id, AgentKind::Claude, None, Some(&format!("/p/{n}")), n as u64));
+        }
+        // five subagents for cc:a -> it spills into an overflow pod in the same zone run
+        for k in 0..5 {
+            let id = format!("cc-sub:a/{k}");
+            s.agents.insert(id.clone(), agent(&id, AgentKind::ClaudeSub, Some("cc:a"), None, 10 + k));
+        }
+        s.agents.insert("agy:1".into(), agent("agy:1", AgentKind::Agy, None, Some("/elsewhere"), 50));
+        let l = build(&s, 1600, 600);
+        let heads: Vec<_> = l.zones.iter().filter(|z| z.head).collect();
+        assert_eq!(heads.len(), 4, "3 sessions + lab: {:?}", l.zones);
+        assert_eq!(heads.iter().filter(|z| z.session.is_none()).count(), 1);
+        for (i, a) in l.zones.iter().enumerate() {
+            for b in &l.zones[i + 1..] {
+                let [ax, ay, aw, ah] = a.rect;
+                let [bx, by, bw, bh] = b.rect;
+                assert!(ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay, "zones overlap: {a:?} {b:?}");
+            }
+        }
+        // every pod sits inside a zone of its own group
+        for p in &l.pods {
+            assert!(l.zones.iter().any(|z| z.group == p.group
+                && z.rect[0] <= p.x && p.x + POD_W <= z.rect[0] + z.rect[2]
+                && z.rect[1] <= p.y && p.y + POD_H <= z.rect[1] + z.rect[3]));
+        }
+    }
+
 }

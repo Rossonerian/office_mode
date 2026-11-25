@@ -18,8 +18,9 @@ pub const CLAUDE_EVENTS: &[&str] = &[
     "SubagentStart",
     "SubagentStop",
     "SessionEnd",
+    "StopFailure",
 ];
-const AG_EVENTS: &[&str] = &["SessionStart", "PreToolUse", "PostToolUse", "Stop"];
+const AG_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"];
 const AG_PLUGIN: &str = "agent-office";
 /// Every command we install contains this marker; uninstall removes exactly those.
 const MARKER: &str = "OFFICE_SOURCE=";
@@ -101,7 +102,11 @@ fn hook_entry(cmd: String, timeout: u64) -> Value {
 /// Merge (or with `hook == None`, remove) our entries in a Claude settings.json. Returns true if written.
 /// Idempotent: our old entries are removed first, then re-added; other hooks are untouched.
 pub fn update_claude_settings(path: &Path, hook: Option<&Path>, permission: bool, permission_timeout_s: u64) -> anyhow::Result<bool> {
-    let original = std::fs::read_to_string(path).ok();
+    let original = match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
+    };
     let mut root: Value = match &original {
         Some(s) if !s.trim().is_empty() => serde_json::from_str(s).map_err(|e| anyhow::anyhow!("{}: invalid JSON: {e}", path.display()))?,
         _ => json!({}),
@@ -127,20 +132,31 @@ pub fn update_claude_settings(path: &Path, hook: Option<&Path>, permission: bool
     if original.as_deref() == Some(text.as_str()) {
         return Ok(false);
     }
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let orig_perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
     if let Some(orig) = &original {
-        let bak = path.with_file_name(format!(
-            "{}.bak-office-{}",
-            path.file_name().and_then(|s| s.to_str()).unwrap_or("settings.json"),
-            paths::now_ms() / 1000
-        ));
+        let prefix = format!("{}.bak-office-", path.file_name().and_then(|s| s.to_str()).unwrap_or("settings.json"));
+        if let Some(dir) = path.parent() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+        let bak = path.with_file_name(format!("{prefix}{}", paths::now_ms() / 1000));
         std::fs::write(&bak, orig)?;
     }
-    if let Some(d) = path.parent() {
+    if let Some(d) = target.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let tmp = path.with_extension("json.office-tmp");
+    let tmp = target.with_extension("json.office-tmp");
     std::fs::write(&tmp, &text)?;
-    std::fs::rename(&tmp, path)?;
+    if let Some(perms) = orig_perms {
+        let _ = std::fs::set_permissions(&tmp, perms);
+    }
+    std::fs::rename(&tmp, &target)?;
     Ok(true)
 }
 
@@ -198,36 +214,53 @@ fn write_private(p: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn count_ours(settings: &Value) -> (usize, Vec<String>) {
+fn extract_hook_bin(cmd: &str) -> Option<&str> {
+    let idx = cmd.find("office-hook")?;
+    let rest = &cmd[..idx + "office-hook".len()];
+    let start = rest.rfind(['\'', '"', ' ']).map(|i| i + 1).unwrap_or(0);
+    Some(&rest[start..])
+}
+
+fn count_ours(settings: &Value) -> (usize, Vec<String>, Vec<String>) {
     let mut n = 0;
     let mut evs = Vec::new();
+    let mut missing_bins = Vec::new();
     if let Some(h) = settings.get("hooks").and_then(Value::as_object) {
         for (ev, groups) in h {
-            let c = groups
+            let mut c = 0;
+            for cmd in groups
                 .as_array()
                 .into_iter()
                 .flatten()
                 .flat_map(|g| g.get("hooks").and_then(Value::as_array).into_iter().flatten())
-                .filter(|x| x.get("command").and_then(Value::as_str).map(is_ours).unwrap_or(false))
-                .count();
+                .filter_map(|x| x.get("command").and_then(Value::as_str))
+                .filter(|cmd| is_ours(cmd))
+            {
+                c += 1;
+                if let Some(bin) = extract_hook_bin(cmd) {
+                    if !Path::new(bin).is_file() && !missing_bins.iter().any(|b| b == bin) {
+                        missing_bins.push(bin.to_string());
+                    }
+                }
+            }
             if c > 0 {
                 n += c;
                 evs.push(ev.clone());
             }
         }
     }
-    (n, evs)
+    (n, evs, missing_bins)
 }
 
 pub fn doctor() -> anyhow::Result<()> {
     let cfg = Config::load();
     let ok = |b: bool| if b { "ok " } else { "-- " };
-    println!("agent-office doctor");
+    println!("ROSSO office doctor");
     let cf = paths::config_file();
     println!("{}config       {}{}", ok(cf.exists()), cf.display(), if cf.exists() { "" } else { " (defaults)" });
 
     let sock = paths::hook_socket();
-    let state = if !sock.exists() {
+    let state = if std::fs::symlink_metadata(&sock).is_err() {
         "absent (office not running)"
     } else if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         "listening"
@@ -242,41 +275,57 @@ pub fn doctor() -> anyhow::Result<()> {
     }
 
     let sp = claude_settings_path();
-    match std::fs::read_to_string(&sp).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
-        Some(v) => {
-            let (n, evs) = count_ours(&v);
-            let missing: Vec<&str> = CLAUDE_EVENTS.iter().copied().filter(|e| !evs.iter().any(|x| x == e)).collect();
-            println!(
-                "{}claude hooks {} [{n} entries{}{}]",
-                ok(missing.is_empty()),
-                sp.display(),
-                if missing.is_empty() { String::new() } else { format!(", missing: {}", missing.join(",")) },
-                if evs.iter().any(|e| e == "PermissionRequest") { ", PermissionRequest on" } else { "" }
-            );
-        }
-        None => println!("-- claude hooks {} unreadable", sp.display()),
+    match std::fs::read_to_string(&sp) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("-- claude hooks {} missing", sp.display()),
+        Err(e) => println!("-- claude hooks {} unreadable: {e}", sp.display()),
+        Ok(s) => match serde_json::from_str::<Value>(&s) {
+            Err(e) => println!("-- claude hooks {} invalid JSON: {e}", sp.display()),
+            Ok(v) => {
+                let (n, evs, missing_bins) = count_ours(&v);
+                let missing: Vec<&str> = CLAUDE_EVENTS.iter().copied().filter(|e| !evs.iter().any(|x| x == e)).collect();
+                let bin_note = if missing_bins.is_empty() {
+                    String::new()
+                } else {
+                    format!(", missing hook binary: {}", missing_bins.join(", "))
+                };
+                println!(
+                    "{}claude hooks {} [{n} entries{}{}{}]",
+                    ok(missing.is_empty() && missing_bins.is_empty()),
+                    sp.display(),
+                    if missing.is_empty() { String::new() } else { format!(", missing: {}", missing.join(",")) },
+                    if evs.iter().any(|e| e == "PermissionRequest") { ", PermissionRequest on" } else { "" },
+                    bin_note
+                );
+            }
+        },
     }
     let ag = gemini_plugins_dir().join(AG_PLUGIN).join("hooks.json");
     println!("{}antigravity  {}", ok(ag.exists()), ag.display());
 
     let route = Path::new(&cfg.agy_route);
     if route.exists() {
-        let out = std::process::Command::new(route).args(["--role", "fallback", "--prompt", "x", "--dry-run"]).output();
-        match out {
-            Ok(o) => {
-                let st = crate::sources::agy_router::parse_dry_run(&String::from_utf8_lossy(&o.stdout));
+        match crate::sources::agy_router::run_dry(&cfg.agy_route) {
+            Some(text) => {
+                let st = crate::sources::agy_router::parse_dry_run(&text);
+                let v = |o: Option<u32>| o.map_or_else(|| "?".to_string(), |n| n.to_string());
+                let pressure = match st.pressure {
+                    Some(1) => "normal".to_string(),
+                    Some(2) => "warn".to_string(),
+                    Some(4) => "critical".to_string(),
+                    other => v(other.map(u32::from)),
+                };
                 println!(
-                    "{}agy-route    {} [capacity {:?}, slots {}/{:?}, free {:?} MB, pressure {:?}]",
+                    "{}agy-route    {} [capacity {}, slots {}/{}, free {} MB, pressure {}]",
                     ok(st.capacity.is_some()),
                     route.display(),
-                    st.capacity,
+                    v(st.capacity),
                     st.busy_slots,
-                    st.max_concurrent,
-                    st.free_mb,
-                    st.pressure
+                    v(st.max_concurrent),
+                    v(st.free_mb),
+                    pressure
                 );
             }
-            Err(e) => println!("-- agy-route    {} failed: {e}", route.display()),
+            None => println!("-- agy-route    {} status check timed out or failed", route.display()),
         }
     } else {
         println!("-- agy-route    {} not found", route.display());

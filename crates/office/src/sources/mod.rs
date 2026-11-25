@@ -7,19 +7,29 @@ pub mod agy_router;
 pub mod claude_transcripts;
 pub mod control;
 pub mod hook_socket;
+pub mod reports;
+pub mod rosso;
 
 /// Start every source on its own thread(s): hook socket listener, Claude transcript tailer, agy router scanner.
 /// Must never panic the caller; source failures become Alert events.
-pub fn spawn_all(cfg: &Config, tx: Sender<Event>) {
-    if let Err(e) = hook_socket::spawn(cfg, tx.clone()) {
-        source_alert(&tx, SourceKind::ClaudeHook, "hook_socket", format!("hook socket unavailable: {e}"));
-    }
+pub fn spawn_all(cfg: &Config, tx: Sender<Event>) -> Option<hook_socket::SocketGuard> {
+    let guard = match hook_socket::spawn(cfg, tx.clone()) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            source_alert(&tx, SourceKind::ClaudeHook, "hook_socket", format!("hook socket unavailable: {e}"));
+            None
+        }
+    };
     if let Err(e) = claude_transcripts::spawn(cfg, tx.clone()) {
         source_alert(&tx, SourceKind::ClaudeTranscript, "transcripts", format!("transcript tailer failed: {e}"));
     }
     if let Err(e) = agy_router::spawn(cfg, tx.clone()) {
         source_alert(&tx, SourceKind::AgyRouter, "agy_router", format!("agy router scanner failed: {e}"));
     }
+    if let Err(e) = rosso::spawn(cfg, tx.clone()) {
+        source_alert(&tx, SourceKind::Rosso, "rosso", format!("rosso watcher failed: {e}"));
+    }
+    guard
 }
 
 pub(crate) fn source_alert(tx: &Sender<Event>, source: SourceKind, code: &str, message: String) {

@@ -77,6 +77,72 @@ pub fn fmt_cost_short(usd: f64) -> String {
     }
 }
 
+/// Height of the Selected Agent Inspector strip based on inner sidebar height.
+pub fn inspector_height(inner_h: u16, has_selected: bool) -> u16 {
+    if !has_selected || inner_h < 6 {
+        0
+    } else if inner_h >= 10 {
+        3
+    } else {
+        2
+    }
+}
+
+/// Line 1 of the 3-line inspector: `label · role · parent`.
+pub fn inspector_header(a: &Agent, scene: &Scene, width: usize) -> String {
+    let mut parts = vec![a.label.clone()];
+    if let Some(r) = a.role.as_ref().filter(|r| !r.is_empty()) {
+        parts.push(r.clone());
+    }
+    if let Some(pid) = &a.parent {
+        let pname = scene.agents.get(pid).map(|p| p.label.as_str()).unwrap_or(pid.as_str());
+        parts.push(format!("↳{pname}"));
+    }
+    trunc(&parts.join(" · "), width)
+}
+
+/// Line 2 of the 3-line inspector: `state · current/last tool & target`.
+pub fn inspector_state_tool(a: &Agent, width: usize) -> String {
+    let st = state_name(a.state);
+    let detail = if let Some(ct) = &a.current_tool {
+        if a.activity.is_empty() { ct.clone() } else { a.activity.clone() }
+    } else if let Some(lt) = &a.last_tool {
+        let ok = match a.last_tool_ok {
+            Some(true) => "ok",
+            Some(false) => "fail",
+            None => "",
+        };
+        if ok.is_empty() { format!("last {lt}") } else { format!("last {lt} ({ok})") }
+    } else if !a.activity.is_empty() {
+        a.activity.clone()
+    } else {
+        String::new()
+    };
+    let s = if detail.is_empty() { st.to_string() } else { format!("{st} · {detail}") };
+    trunc(&s, width)
+}
+
+/// Line 3 of the 3-line inspector: `ctx bar · rss · model · tools/fail`.
+pub fn inspector_metrics(a: &Agent, width: usize) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = a.context_pct {
+        let pct = p.clamp(0.0, 100.0);
+        let filled = (((pct / 100.0) * 5.0).round() as usize).min(5);
+        parts.push(format!("ctx [{}{}] {p:.0}%", "█".repeat(filled), "░".repeat(5 - filled)));
+    }
+    if let Some(r) = a.rss_mb {
+        parts.push(format!("{r}M"));
+    }
+    if let Some(m) = &a.model {
+        parts.push(model_short(m));
+    }
+    if a.tool_calls > 0 || a.tool_failures > 0 {
+        parts.push(format!("{}t/{}f", a.tool_calls, a.tool_failures));
+    }
+    let s = if parts.is_empty() { "no metrics".to_string() } else { parts.join(" · ") };
+    trunc(&s, width)
+}
+
 pub fn fmt_cost(usd: f64) -> String {
     format!("${usd:.2}")
 }
@@ -324,5 +390,31 @@ mod tests {
         );
         let (c, s, g, o) = kind_counts(&scene);
         assert_eq!((c, s, g, o), (2, 2, 1, 0));
+    }
+
+    #[test]
+    fn inspector_tiers_and_formatters() {
+        assert_eq!(inspector_height(5, true), 0);
+        assert_eq!(inspector_height(6, true), 2);
+        assert_eq!(inspector_height(9, true), 2);
+        assert_eq!(inspector_height(10, true), 3);
+        assert_eq!(inspector_height(12, false), 0);
+
+        let p = agent("cc:p", AgentKind::Claude, None);
+        let mut s = agent("cc-sub:p/1", AgentKind::ClaudeSub, Some("cc:p"));
+        s.role = Some("Explore".into());
+        s.state = AgentState::Thinking;
+        s.last_tool = Some("Bash".into());
+        s.last_tool_ok = Some(false);
+        s.tool_calls = 4;
+        s.tool_failures = 1;
+        s.context_pct = Some(40.0);
+        s.rss_mb = Some(120);
+        s.model = Some("claude-sonnet-4-6".into());
+        let scene = scene_with(vec![p, s.clone()]);
+        assert!(inspector_header(&s, &scene, 80).contains("Explore"));
+        assert!(inspector_state_tool(&s, 80).contains("last Bash (fail)"));
+        let m = inspector_metrics(&s, 80);
+        assert!(m.contains("40%") && m.contains("120M") && m.contains("4t/1f"));
     }
 }

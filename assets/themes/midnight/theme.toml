@@ -1,0 +1,24 @@
+# midnight: dark-studio theme built for Ghostty & late-night coding, with warm walnut desks and amber glows.
+[fx]
+glow = "#f5a642"
+char_tint = "#e6dfd8"
+
+[colors]
+floor_style = "wood"
+floor_a = "#252934"
+floor_b = "#1d2029"
+wall = "#1c2230"
+wall_trim = "#3a4459"
+sky = "#121a30"
+wood = "#5c3f2c"
+desk = "#4d3728"
+metal = "#2e3647"
+screen_off = "#121620"
+screen_on = "#1f3758"
+chair = "#2c3547"
+fabric = "#8a4b38"
+plant = "#3b7d4e"
+pot = "#7a442c"
+rug = "#2c243a"
+rug_trim = "#6b558a"
+backdrop = "#111319"

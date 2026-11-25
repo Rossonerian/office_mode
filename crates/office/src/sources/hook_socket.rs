@@ -1,22 +1,97 @@
 //! Unix socket listener for office-hook lines; decodes Claude Code and Antigravity hook payloads into Events.
-use super::{basename, short};
-use office_core::model::{AgentKind, AgentState};
+use super::{basename, reports, short};
+use office_core::model::{AgentKind, AgentState, ReportKind};
 use office_core::{config::Config, paths, Event, EventKind, SourceKind};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
-use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Per-line cap (office-hook caps stdin at 1 MB; leave room for the envelope).
 const MAX_LINE: u64 = (1 << 20) + 64 * 1024;
+const CONN_WORKERS: usize = 4;
+const CONN_QUEUE: usize = 64;
+const CONN_DEADLINE: Duration = Duration::from_secs(5);
 
-pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
-    let listener = bind(&paths::hook_socket())?;
+/// Removes the unix socket file (and our pid file) when the office exits cleanly.
+pub struct SocketGuard(pub PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let pf = pid_file(&self.0);
+        if read_pid(&pf) == Some(std::process::id()) {
+            let _ = std::fs::remove_file(&pf);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+/// `office.pid` next to the socket: the pid of the office that owns the hook socket.
+pub fn pid_file(sock: &Path) -> PathBuf {
+    sock.with_file_name("office.pid")
+}
+
+fn read_pid(p: &Path) -> Option<u32> {
+    std::fs::read_to_string(p).ok()?.trim().parse().ok()
+}
+
+fn pid_alive(pid: u32) -> bool {
+    pid > 1 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+}
+
+/// True when `pid` is an `office` TUI process (never office-hook, never anything else).
+fn is_office_process(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next().unwrap_or("").to_string())
+        .is_some_and(|c| c == "office")
+}
+
+/// Pids of `office` processes holding the socket: from the pid file, else from `lsof`
+/// (older builds wrote no pid file).
+fn socket_holders(sock: &Path) -> Vec<u32> {
+    let me = std::process::id();
+    let mut pids: Vec<u32> = read_pid(&pid_file(sock)).into_iter().collect();
+    if pids.is_empty() {
+        if let Ok(o) = std::process::Command::new("/usr/sbin/lsof").arg("-t").arg(sock).output() {
+            pids = String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids.into_iter().filter(|&p| p != me && pid_alive(p) && is_office_process(p)).collect()
+}
+
+/// The newest office wins: ask older office instances holding the socket to quit (SIGTERM,
+/// then SIGKILL after ~1.5 s for orphans that no longer respond). Returns the pids asked.
+fn take_over(sock: &Path) -> Vec<u32> {
+    let holders = socket_holders(sock);
+    for &p in &holders {
+        unsafe { libc::kill(p as libc::pid_t, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline && holders.iter().any(|&p| pid_alive(p)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for &p in &holders {
+        if pid_alive(p) && is_office_process(p) {
+            unsafe { libc::kill(p as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+    holders
+}
+
+pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<SocketGuard> {
+    let sock = paths::hook_socket();
+    let listener = bind(&sock)?;
     std::thread::Builder::new().name("hook-socket".into()).spawn(move || serve(listener, tx))?;
-    Ok(())
+    Ok(SocketGuard(sock))
 }
 
 /// Bind the socket: create its dir (0700 when it's our runtime dir), drop a stale socket file.
@@ -29,39 +104,77 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
     }
-    if path.exists() {
+    if std::fs::symlink_metadata(path).is_ok() {
         if UnixStream::connect(path).is_ok() {
-            anyhow::bail!("another office is already listening on {}", path.display());
+            // Another office (often an orphan left behind by a closed terminal window) owns the
+            // socket, so this one would get no hook events. Take it over.
+            take_over(path);
+            std::thread::sleep(Duration::from_millis(100));
+            if UnixStream::connect(path).is_ok() {
+                anyhow::bail!("another office is already listening on {} and did not hand over", path.display());
+            }
         }
-        std::fs::remove_file(path)?;
+        let _ = std::fs::remove_file(path);
     }
     let l = UnixListener::bind(path)?;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::write(pid_file(path), std::process::id().to_string());
     Ok(l)
 }
 
-pub fn serve(listener: UnixListener, tx: Sender<Event>) {
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        let tx = tx.clone();
-        let _ = std::thread::Builder::new().name("hook-conn".into()).spawn(move || {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let mut r = BufReader::new(stream.take(MAX_LINE * 4));
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match (&mut r).take(MAX_LINE).read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        for ev in decode_line(line.trim(), paths::now_ms()) {
-                            if tx.send(ev).is_err() {
-                                return;
-                            }
-                        }
+fn handle_conn(stream: UnixStream, tx: &Sender<Event>) -> bool {
+    let deadline = Instant::now() + CONN_DEADLINE;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut r = BufReader::new(stream.take(MAX_LINE * 4));
+    let mut line = String::new();
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        line.clear();
+        match (&mut r).take(MAX_LINE).read_line(&mut line) {
+            Ok(0) => break,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                if !line.is_empty() && Instant::now() < deadline {
+                    continue;
+                }
+                break;
+            }
+            Err(_) => break,
+            Ok(_) => {
+                for ev in decode_line(line.trim(), paths::now_ms()) {
+                    if tx.send(ev).is_err() {
+                        return false;
                     }
                 }
             }
+        }
+    }
+    true
+}
+
+pub fn serve(listener: UnixListener, tx: Sender<Event>) {
+    let (conn_tx, conn_rx) = mpsc::sync_channel::<UnixStream>(CONN_QUEUE);
+    let conn_rx: Arc<Mutex<Receiver<UnixStream>>> = Arc::new(Mutex::new(conn_rx));
+    for i in 0..CONN_WORKERS {
+        let rx = conn_rx.clone();
+        let tx = tx.clone();
+        let _ = std::thread::Builder::new().name(format!("hook-worker-{i}")).spawn(move || loop {
+            let stream = {
+                let Ok(guard) = rx.lock() else { return };
+                guard.recv()
+            };
+            let Ok(stream) = stream else { return };
+            if !handle_conn(stream, &tx) {
+                return;
+            }
         });
+    }
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        if conn_tx.try_send(stream).is_err() {
+            // Queue saturated: drop slow extra connection rather than exhausting OS threads.
+        }
     }
 }
 
@@ -71,23 +184,51 @@ fn s<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
 
 /// Short human summary of a tool call: file basename, first 40 chars of a command, pattern, url…
 pub fn tool_summary(tool: &str, input: &Value) -> String {
-    if let Some(p) = s(input, &["file_path", "notebook_path", "path"]) {
-        return short(&basename(p), 40);
+    if matches!(tool, "Grep" | "Glob" | "grep_search" | "find_by_name") {
+        let pat = s(input, &["pattern", "Query", "query"]);
+        let path = s(input, &["path", "Path", "SearchPath", "DirectoryPath"]);
+        match (pat, path) {
+            (Some(p), Some(dir)) => return short(&format!("{p} @ {}", basename(dir)), 40),
+            (Some(p), None) => return short(p, 40),
+            _ => {}
+        }
     }
-    if let Some(c) = s(input, &["command"]) {
-        return short(c, 40);
+    if matches!(tool, "Agent" | "Task" | "invoke_subagent") {
+        let role = s(input, &["subagent_type", "Role"]);
+        let desc = s(input, &["description", "prompt"]);
+        match (role, desc) {
+            (Some(r), Some(d)) => return short(&format!("{r}: {d}"), 40),
+            (Some(r), None) => return short(r, 40),
+            (None, Some(d)) => return short(d, 40),
+            (None, None) => {}
+        }
     }
-    if matches!(tool, "Agent" | "Task") {
-        if let Some(d) = s(input, &["subagent_type", "description"]) {
+    if matches!(tool, "Bash" | "run_command") {
+        if let Some(d) = s(input, &["description"]) {
             return short(d, 40);
         }
+        if let Some(c) = s(input, &["command", "CommandLine"]) {
+            return short(c, 40);
+        }
+    }
+    if let Some((srv, t)) = tool.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")) {
+        return short(&format!("{srv}:{t}"), 40);
+    }
+    if let Some(p) = s(
+        input,
+        &["file_path", "notebook_path", "path", "Path", "TargetFile", "AbsolutePath", "DirectoryPath", "SearchPath"],
+    ) {
+        return short(&basename(p), 40);
+    }
+    if let Some(c) = s(input, &["command", "CommandLine"]) {
+        return short(c, 40);
     }
     if tool == "AskUserQuestion" {
         if let Some(q) = input.get("questions").and_then(|q| q.get(0)).and_then(|q| q.get("question")).and_then(Value::as_str) {
             return short(q, 40);
         }
     }
-    if let Some(x) = s(input, &["pattern", "url", "query", "description", "prompt"]) {
+    if let Some(x) = s(input, &["pattern", "url", "query", "Query", "description", "prompt"]) {
         return short(x, 40);
     }
     String::new()
@@ -129,7 +270,13 @@ fn decode_claude(p: &Value, hook_event: Option<&str>, request_id: Option<String>
                 EventKind::AgentSeen {
                     id: id.clone(),
                     kind: AgentKind::ClaudeSub,
-                    label: Some(agent_type.clone().unwrap_or_else(|| "sub".into())),
+                    label: Some(
+                        agent_type
+                            .as_deref()
+                            .and_then(|t| office_core::rosso::title_for(t, None))
+                            .or_else(|| agent_type.clone())
+                            .unwrap_or_else(|| "sub".into()),
+                    ),
                     parent: Some(parent_id.clone()),
                     cwd: cwd.clone(),
                     role: agent_type.clone(),
@@ -165,7 +312,10 @@ fn decode_claude(p: &Value, hook_event: Option<&str>, request_id: Option<String>
     let input = p.get("tool_input").cloned().unwrap_or(Value::Null);
     let state = |st: AgentState, act: Option<String>| EventKind::State { id: id.clone(), state: st, activity: act };
     match name {
-        "SessionStart" | "SubagentStart" => {}
+        "SessionStart" => {}
+        "SubagentStart" => {
+            out.push(ev(at, src, state(AgentState::Thinking, Some("starting…".into()))));
+        }
         "UserPromptSubmit" => {
             let prompt = s(p, &["prompt"]).map(|x| short(x, 40));
             out.push(ev(at, src, state(AgentState::Thinking, prompt)));
@@ -199,18 +349,57 @@ fn decode_claude(p: &Value, hook_event: Option<&str>, request_id: Option<String>
                 out.push(ev(at, src, EventKind::PermissionResolved { id: id.clone(), request_id: r }));
             }
         }
-        "Stop" => out.push(ev(at, src, state(AgentState::Idle, Some(String::new())))),
+        "Stop" => {
+            out.push(ev(at, src, state(AgentState::Idle, Some(String::new()))));
+            // A top-level session finished a turn: its answer goes to you (the boss).
+            if agent_id.is_none() {
+                let body = s(p, &["last_assistant_message"])
+                    .map(str::to_string)
+                    .or_else(|| s(p, &["transcript_path"]).and_then(|t| reports::last_report(Path::new(t))));
+                if let Some(body) = body.filter(|b| !b.trim().is_empty()) {
+                    out.push(ev(at, src, EventKind::Handoff {
+                        from: id.clone(),
+                        to: None,
+                        kind: ReportKind::Result,
+                        title: reports::title_of(&body, 60),
+                        body,
+                        brief: String::new(),
+                    }));
+                }
+            }
+        }
         "StopFailure" => out.push(ev(at, src, state(AgentState::Error, s(p, &["error", "message"]).map(|x| short(x, 40))))),
         "SubagentStop" => {
             out.push(ev(at, src, state(AgentState::Done, None)));
-            if agent_id.is_some() {
-                out.push(ev(at, src, EventKind::Gone { id: id.clone() }));
-            }
+            // The subagent's report travels back to the session that briefed it.
+            let path = s(p, &["agent_transcript_path"]).map(PathBuf::from).or_else(|| {
+                let t = s(p, &["transcript_path"])?;
+                Some(reports::subagent_transcript(Path::new(t), agent_id?))
+            });
+            let body = s(p, &["last_assistant_message"])
+                .map(str::to_string)
+                .or_else(|| path.as_deref().and_then(reports::last_report))
+                .unwrap_or_default();
+            let brief = path.as_deref().and_then(reports::first_brief).unwrap_or_default();
+            let title = path
+                .as_deref()
+                .and_then(reports::subagent_description)
+                .unwrap_or_else(|| if body.is_empty() { "finished".into() } else { reports::title_of(&body, 60) });
+            out.push(ev(at, src, EventKind::Handoff { from: id.clone(), to: Some(parent_id.clone()), kind: ReportKind::Report, title, body, brief }));
         }
         "SessionEnd" => out.push(ev(at, src, EventKind::Gone { id: id.clone() })),
         _ => {}
     }
     out
+}
+
+fn cwd_hash6(c: &str) -> u32 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in c.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h & 0x00ff_ffff) as u32
 }
 
 /// Antigravity CLI hook payloads: field names vary, so accept snake/camel variants.
@@ -219,7 +408,7 @@ fn decode_antigravity(p: &Value, hook_event: Option<&str>, _request_id: Option<S
     let cwd = s(p, &["cwd", "workspace", "workspaceRoot"]).map(str::to_string);
     let sid = s(p, &["session_id", "sessionId", "conversation_id", "conversationId"])
         .map(str::to_string)
-        .or_else(|| cwd.clone().map(|c| format!("cwd-{}", paths::sanitize_id(&basename(&c)))));
+        .or_else(|| cwd.clone().map(|c| format!("cwd-{}-{:06x}", paths::sanitize_id(&basename(&c)), cwd_hash6(&c))));
     let Some(sid) = sid else { return vec![] };
     let id = format!("ag:{sid}");
     let src = SourceKind::AgyHook;
@@ -261,21 +450,25 @@ fn decode_antigravity(p: &Value, hook_event: Option<&str>, _request_id: Option<S
     out
 }
 
-/// Build office-hook (no-op when fresh) and return its path, from cargo's JSON messages.
+/// Build office-hook once per test binary (avoids parallel cargo build lock contention) and return its path.
 #[cfg(test)]
-fn office_hook_bin() -> std::path::PathBuf {
-    let out = std::process::Command::new(env!("CARGO"))
-        .args(["build", "-q", "-p", "office-hook", "--message-format=json"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("cargo build office-hook");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["target"]["name"] == "office-hook")
-        .find_map(|v| v["executable"].as_str().map(std::path::PathBuf::from))
-        .expect("office-hook executable path")
+fn office_hook_bin() -> &'static Path {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let out = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-q", "-p", "office-hook", "--message-format=json"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("cargo build office-hook");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["target"]["name"] == "office-hook")
+            .find_map(|v| v["executable"].as_str().map(PathBuf::from))
+            .expect("office-hook executable path")
+    })
+    .as_path()
 }
 
 #[cfg(test)]
@@ -326,7 +519,7 @@ mod tests {
         }
         assert!(matches!(&evs[1].kind, EventKind::ToolStart { summary, .. } if summary == "main.rs"));
         let stop = r#"{"source":"claude","payload":{"session_id":"s1","agent_id":"a9","hook_event_name":"SubagentStop"}}"#;
-        assert_eq!(kinds(&decode_line(stop, 1)), vec!["AgentSeen", "State", "Gone"]);
+        assert_eq!(kinds(&decode_line(stop, 1)), vec!["AgentSeen", "State", "Handoff"]);
     }
 
     #[test]
@@ -405,5 +598,26 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"{}").unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    #[test]
+    fn tool_summary_formats_grep_agent_bash_and_mcp() {
+        assert_eq!(
+            tool_summary("Grep", &serde_json::json!({"pattern": "foo", "path": "/a/b/src"})),
+            "foo @ src"
+        );
+        assert_eq!(
+            tool_summary("Agent", &serde_json::json!({"subagent_type": "Explore", "description": "find routes"})),
+            "Explore: find routes"
+        );
+        assert_eq!(
+            tool_summary("Bash", &serde_json::json!({"description": "run tests", "command": "cargo test"})),
+            "run tests"
+        );
+        assert_eq!(
+            tool_summary("Bash", &serde_json::json!({"command": "cargo test"})),
+            "cargo test"
+        );
+        assert_eq!(tool_summary("mcp__github__list_issues", &serde_json::json!({})), "github:list_issues");
     }
 }

@@ -77,6 +77,7 @@ struct SpriteDef {
 #[serde(default)]
 struct FxDef {
     tint: Option<String>,
+    char_tint: Option<String>,
     palette: Option<Vec<String>>,
     glow: Option<String>,
     floor_bg: Option<String>,
@@ -87,6 +88,7 @@ struct FxDef {
 #[derive(Debug, Clone, Default)]
 pub struct Fx {
     pub tint: Option<Col>,
+    pub char_tint: Option<Col>,
     pub palette: Vec<Col>,
 }
 
@@ -107,6 +109,13 @@ impl Fx {
             c = [p[0], p[1], p[2], c[3]];
         }
         c
+    }
+    pub fn apply_char(&self, c: Col) -> Col {
+        let c = self.apply(c);
+        match self.char_tint {
+            Some(ct) if self.palette.is_empty() => tint(c, ct),
+            _ => c,
+        }
     }
 }
 
@@ -244,6 +253,7 @@ pub fn parse(name: &str, src: &str, dir: &Path) -> Result<Theme> {
     }
     let fx = Fx {
         tint: tf.fx.tint.as_deref().and_then(parse_hex),
+        char_tint: tf.fx.char_tint.as_deref().and_then(parse_hex),
         palette: tf.fx.palette.iter().flatten().filter_map(|s| parse_hex(s)).collect(),
     };
     let ph = |o: &Option<String>| o.as_deref().and_then(parse_hex);

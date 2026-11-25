@@ -1,10 +1,10 @@
 //! agy-route watcher: `ps` scan of live routers (1 s), slot/worker lock files, dry-run capacity (5 s),
 //! and the audit log tail (~/.claude/run/agy-route.log.jsonl) for failed calls.
 use super::basename;
-use office_core::model::{AgentKind, AgentState, Alert, AlertLevel, RouterStatus};
+use office_core::model::{AgentKind, AgentState, Alert, AlertLevel, ReportKind, RouterStatus};
 use office_core::{config::Config, paths, Event, EventKind, SourceKind};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,8 +29,14 @@ pub struct Proc {
 pub struct RouterProc {
     pub pid: u32,
     pub role: String,
+    /// `--domain` for manager calls (frontend, backend, …).
+    pub domain: Option<String>,
     pub cwd: Option<String>,
     pub rss_mb: u32,
+    /// `--rosso-job <job>`: the ROSSO job this call works for.
+    pub rosso_job: Option<String>,
+    /// `--as "<title>"`: the ROSSO office title this call plays.
+    pub rosso_as: Option<String>,
 }
 
 /// Shared between the scan and audit threads.
@@ -90,9 +96,19 @@ pub fn parse_ps(text: &str) -> Vec<Proc> {
 }
 
 fn flag(cmd: &str, name: &str) -> Option<String> {
-    let mut it = cmd.split_whitespace();
+    let mut it = cmd.split_whitespace().peekable();
     while let Some(t) = it.next() {
         if t == name {
+            if name == "--cwd" || name == "--as" {
+                let mut parts = Vec::new();
+                while let Some(&next) = it.peek() {
+                    if next.starts_with("--") {
+                        break;
+                    }
+                    parts.push(it.next().unwrap());
+                }
+                return (!parts.is_empty()).then(|| parts.join(" "));
+            }
             return it.next().map(str::to_string);
         }
         if let Some(v) = t.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
@@ -100,6 +116,19 @@ fn flag(cmd: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn has_flag(cmd: &str, name: &str) -> bool {
+    let mut it = cmd.split_whitespace();
+    while let Some(t) = it.next() {
+        if t == name || t.starts_with(&format!("{name}=")) {
+            return true;
+        }
+        if t == "--prompt" || t == "--prompt-file" {
+            let _ = it.next();
+        }
+    }
+    false
 }
 
 /// Live routers: `bun … agy-route --role <r> …` (not --dry-run), with summed descendant RSS.
@@ -112,11 +141,16 @@ pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
         .iter()
         .filter(|p| {
             let first = p.cmd.split_whitespace().next().unwrap_or("");
-            basename(first) == "bun" && p.cmd.contains("agy-route") && p.cmd.contains("--role") && !p.cmd.contains("--dry-run")
+            basename(first) == "bun"
+                && p.cmd.contains("agy-route")
+                && has_flag(&p.cmd, "--role")
+                && !has_flag(&p.cmd, "--dry-run")
+                && !has_flag(&p.cmd, "--status")
         })
         .map(|p| {
             let mut kb = 0u64;
             let mut stack = vec![p.pid];
+            let mut visited = HashSet::from([p.pid]);
             let mut guard = 0;
             while let Some(x) = stack.pop() {
                 guard += 1;
@@ -124,15 +158,20 @@ pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
                     break;
                 }
                 for k in kids.get(&x).into_iter().flatten() {
-                    kb += k.rss_kb;
-                    stack.push(k.pid);
+                    if visited.insert(k.pid) {
+                        kb += k.rss_kb;
+                        stack.push(k.pid);
+                    }
                 }
             }
             RouterProc {
                 pid: p.pid,
                 role: flag(&p.cmd, "--role").unwrap_or_else(|| "?".into()),
+                domain: flag(&p.cmd, "--domain"),
                 cwd: flag(&p.cmd, "--cwd"),
                 rss_mb: (kb / 1024) as u32,
+                rosso_job: flag(&p.cmd, "--rosso-job"),
+                rosso_as: flag(&p.cmd, "--as"),
             }
         })
         .collect()
@@ -164,92 +203,129 @@ pub fn short_model(m: &str) -> String {
     }
 }
 
+fn has_any_lock(run_dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(run_dir) else { return false };
+    rd.flatten().any(|e| {
+        let n = e.file_name();
+        let s = n.to_string_lossy();
+        s.starts_with("agy-route.") && s.ends_with(".lock")
+    })
+}
+
+fn canon_cwd(p: &str) -> String {
+    std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string())
+}
+
 fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir: PathBuf) {
     // pid -> (slot, rss_mb, running)
-    let mut live: BTreeMap<u32, (Option<u32>, u32, bool)> = BTreeMap::new();
+    let mut live: BTreeMap<u32, (Option<u32>, u32, bool, Option<String>)> = BTreeMap::new();
+    let mut tick: u64 = 0;
     loop {
-        let out = Command::new("ps").args(["-axo", "pid=,ppid=,rss=,command="]).stderr(Stdio::null()).output();
-        if let Ok(out) = out {
-            let procs = parse_ps(&String::from_utf8_lossy(&out.stdout));
-            let routers = find_routers(&procs);
-            let slots = read_slots(&run_dir);
-            let mut evs = Vec::new();
-            let mut queued = 0;
-            let models = shared.lock().map(|s| s.models.clone()).unwrap_or_default();
-            for r in &routers {
-                let id = format!("agy:{}", r.pid);
-                let slot = slots.get(&r.pid).copied();
-                let model = models.get(&r.role).cloned().or_else(|| cfg.agy_models.get(&r.role).cloned());
-                let running = slot.is_some() || r.rss_mb > 0;
-                if !running {
-                    queued += 1;
+        let idle = live.is_empty() && !has_any_lock(&run_dir);
+        if !idle || tick % 3 == 0 {
+            let out = Command::new("ps").args(["-axo", "pid=,ppid=,rss=,command="]).stderr(Stdio::null()).output();
+            if let Ok(out) = out {
+                let procs = parse_ps(&String::from_utf8_lossy(&out.stdout));
+                let routers = find_routers(&procs);
+                let slots = read_slots(&run_dir);
+                let mut evs = Vec::new();
+                let mut queued = 0;
+                let models = shared.lock().map(|s| s.models.clone()).unwrap_or_default();
+                for r in &routers {
+                    let id = format!("agy:{}", r.pid);
+                    let slot = slots.get(&r.pid).copied();
+                    let model = models.get(&r.role).cloned().or_else(|| cfg.agy_models.get(&r.role).cloned());
+                    let running = slot.is_some() || r.rss_mb > 0;
+                    if !running {
+                        queued += 1;
+                    }
+                    let prev = live.get(&r.pid).cloned();
+                    if prev.as_ref().map(|p| (&p.0, &p.2, &p.3)) != Some((&slot, &running, &model)) {
+                        let who = match &r.domain {
+                            Some(d) => format!("{}:{}", r.role, d),
+                            None => r.role.clone(),
+                        };
+                        let name = r
+                            .rosso_as
+                            .clone()
+                            .or_else(|| office_core::rosso::title_for(&r.role, r.domain.as_deref()))
+                            .unwrap_or_else(|| who.clone());
+                        let label = match &model {
+                            Some(m) => format!("{}·{}", name, short_model(m)),
+                            None => name,
+                        };
+                        let job_note = r.rosso_job.as_deref().map(|j| format!(" · job {j}")).unwrap_or_default();
+                        evs.push(EventKind::AgentSeen {
+                            id: id.clone(),
+                            kind: AgentKind::Agy,
+                            label: Some(label),
+                            parent: None,
+                            cwd: r.cwd.clone(),
+                            role: Some(r.role.clone()),
+                            model: model.clone(),
+                            slot,
+                            pid: Some(r.pid),
+                            resume_id: None,
+                        });
+                        if prev.as_ref().map(|p| (p.0, p.2)) != Some((slot, running)) {
+                            let (state, act) = if !running {
+                                (AgentState::Queued, "waiting for a slot".to_string())
+                            } else if r.role == "worker" {
+                                (AgentState::Typing, format!("editing {}{job_note}", r.cwd.as_deref().map(basename).unwrap_or_default()))
+                            } else {
+                                (AgentState::Thinking, format!("{} {}{job_note}", who, r.cwd.as_deref().map(basename).unwrap_or_default()))
+                            };
+                            evs.push(EventKind::State { id: id.clone(), state, activity: Some(act.trim().to_string()) });
+                        }
+                        if let (Ok(mut s), Some(c)) = (shared.lock(), &r.cwd) {
+                            s.recent.insert((r.role.clone(), canon_cwd(c)), id.clone());
+                        }
+                    }
+                    // Emit Resources each scan for live routers as heartbeat.
+                    evs.push(EventKind::Resources { id: id.clone(), rss_mb: r.rss_mb });
+                    live.insert(r.pid, (slot, r.rss_mb, running, model));
                 }
-                let prev = live.get(&r.pid).copied();
-                if prev.map(|p| (p.0, p.2)) != Some((slot, running)) {
-                    let label = match &model {
-                        Some(m) => format!("{}·{}", r.role, short_model(m)),
-                        None => r.role.clone(),
-                    };
-                    evs.push(EventKind::AgentSeen {
-                        id: id.clone(),
-                        kind: AgentKind::Agy,
-                        label: Some(label),
-                        parent: None,
-                        cwd: r.cwd.clone(),
-                        role: Some(r.role.clone()),
-                        model,
-                        slot,
-                        pid: Some(r.pid),
-                        resume_id: None,
-                    });
-                    let (state, act) = if !running {
-                        (AgentState::Queued, "waiting for a slot".to_string())
-                    } else if r.role == "worker" {
-                        (AgentState::Typing, format!("editing {}", r.cwd.as_deref().map(basename).unwrap_or_default()))
-                    } else {
-                        (AgentState::Thinking, format!("{} {}", r.role, r.cwd.as_deref().map(basename).unwrap_or_default()))
-                    };
-                    evs.push(EventKind::State { id: id.clone(), state, activity: Some(act.trim().to_string()) });
-                    if let (Ok(mut s), Some(c)) = (shared.lock(), &r.cwd) {
-                        s.recent.insert((r.role.clone(), c.clone()), id.clone());
+                let gone: Vec<u32> = live.keys().filter(|p| !routers.iter().any(|r| r.pid == **p)).copied().collect();
+                for pid in gone {
+                    live.remove(&pid);
+                    evs.push(EventKind::Gone { id: format!("agy:{pid}") });
+                }
+                if let Ok(mut s) = shared.lock() {
+                    s.queued = queued;
+                    if s.recent.len() > 256 {
+                        let live_ids: HashSet<String> = live.keys().map(|p| format!("agy:{p}")).collect();
+                        s.recent.retain(|_, v| live_ids.contains(v));
                     }
                 }
-                if prev.map(|p| p.1) != Some(r.rss_mb) {
-                    evs.push(EventKind::Resources { id: id.clone(), rss_mb: r.rss_mb });
-                }
-                live.insert(r.pid, (slot, r.rss_mb, running));
-            }
-            let gone: Vec<u32> = live.keys().filter(|p| !routers.iter().any(|r| r.pid == **p)).copied().collect();
-            for pid in gone {
-                live.remove(&pid);
-                evs.push(EventKind::Gone { id: format!("agy:{pid}") });
-            }
-            if let Ok(mut s) = shared.lock() {
-                s.queued = queued;
-                if s.recent.len() > 256 {
-                    s.recent.clear();
-                }
-            }
-            for k in evs {
-                if tx.send(Event::now(SourceKind::AgyRouter, k)).is_err() {
-                    return;
+                for k in evs {
+                    if tx.send(Event::now(SourceKind::AgyRouter, k)).is_err() {
+                        return;
+                    }
                 }
             }
         }
+        tick = tick.wrapping_add(1);
         std::thread::sleep(SCAN_EVERY);
     }
 }
 
 // ---------------------------------------------------------------- dry run
 
-fn run_dry(route: &str) -> Option<String> {
+pub fn run_dry(route: &str) -> Option<String> {
     let mut child = Command::new(route)
-        .args(["--role", "fallback", "--prompt", "x", "--dry-run"])
+        .args(["--status"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let ok = stdout.read_to_string(&mut s).is_ok();
+        let _ = tx.send(ok.then_some(s));
+    });
     let t0 = Instant::now();
     loop {
         match child.try_wait() {
@@ -262,9 +338,7 @@ fn run_dry(route: &str) -> Option<String> {
             }
         }
     }
-    let mut s = String::new();
-    child.stdout.take()?.read_to_string(&mut s).ok()?;
-    Some(s)
+    rx.recv_timeout(Duration::from_millis(200)).ok().flatten()
 }
 
 fn first_num<T: std::str::FromStr>(s: &str) -> Option<T> {
@@ -322,6 +396,37 @@ pub fn audit_alert(v: &Value, agent: Option<String>, now: u64) -> Option<Alert> 
     None
 }
 
+/// A finished agy call's result, handed back to the relay that started it. The full response
+/// text is included when the router saved it (long answers); otherwise the relay's own report
+/// (which quotes the router block verbatim) carries it.
+fn audit_report(v: &Value, from: String) -> EventKind {
+    let g = |k: &str| v.get(k).map(|x| match x {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        o => o.to_string(),
+    }).unwrap_or_default();
+    let status = g("status");
+    let code = g("errorCode");
+    let secs = v.get("durationMs").and_then(Value::as_u64).unwrap_or(0) / 1000;
+    let mut body = format!(
+        "STATUS: {status}{}\nROLE: {}\nMODEL: {}\nDURATION: {secs} s (queued {} ms)\nRESPONSE: {} chars",
+        if code.is_empty() { String::new() } else { format!(" ({code})") },
+        g("role"),
+        g("model"),
+        g("queuedMs"),
+        g("responseChars"),
+    );
+    let file = g("fullResponseFile");
+    if !file.is_empty() {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            body.push_str("\n\n");
+            body.push_str(&text.chars().take(15_000).collect::<String>());
+        }
+    }
+    let title = format!("{} {}{}", g("role"), status, if code.is_empty() { String::new() } else { format!(" {code}") });
+    EventKind::Handoff { from, to: None, kind: ReportKind::Report, title, body, brief: String::new() }
+}
+
 fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
     let mut offset: Option<u64> = None;
     let mut partial = Vec::new();
@@ -351,9 +456,14 @@ fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
                             if let Some(m) = v.get("model").and_then(Value::as_str) {
                                 s.models.insert(role.clone(), m.to_string());
                             }
-                            agent = s.recent.get(&(role, cwd)).cloned();
+                            agent = s.recent.get(&(role, canon_cwd(&cwd))).cloned();
                         }
                         if replay {
+                            if let Some(from) = agent.clone() {
+                                if tx.send(Event::now(SourceKind::AgyRouter, audit_report(&v, from))).is_err() {
+                                    return;
+                                }
+                            }
                             if let Some(a) = audit_alert(&v, agent, paths::now_ms()) {
                                 if tx.send(Event::now(SourceKind::AgyRouter, EventKind::Alert(a))).is_err() {
                                     return;
@@ -361,6 +471,8 @@ fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
                             }
                         }
                     }
+                } else if partial.len() > (8 << 20) {
+                    partial.clear();
                 }
                 if !replay {
                     partial.clear(); // the seed window may start mid-line
@@ -395,11 +507,23 @@ mod tests {
   101   100 204800 /opt/homebrew/bin/agy -p x --model gemini-4-hydrogen-low
   102   101 102400 node helper
   200     1  40000 /opt/homebrew/bin/bun /Users/u/.claude/bin/agy-route --role fallback --prompt x --dry-run
+  201     1  40000 /opt/homebrew/bin/bun /Users/u/.claude/bin/agy-route --role worker --status
   300     1   1000 /bin/zsh -c grep agy-route --role
 ";
         let r = find_routers(&parse_ps(ps));
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0], RouterProc { pid: 100, role: "worker".into(), cwd: Some("/p/repo".into()), rss_mb: 300 });
+        assert_eq!(r[0], RouterProc { pid: 100, role: "worker".into(), domain: None, cwd: Some("/p/repo".into()), rss_mb: 300, rosso_job: None, rosso_as: None });
+        let mgr = "  500 1 1000 /opt/homebrew/bin/bun /Users/u/.claude/bin/agy-route --role manager --domain frontend --cwd /p/repo\n";
+        let m = find_routers(&parse_ps(mgr));
+        assert_eq!(m[0].domain.as_deref(), Some("frontend"));
+        let ro = "  600 1 1000 /opt/homebrew/bin/bun agy-route --role council-advisor --rosso-job demo --as Security Seat --cwd /p/repo --prompt-file /tmp/x\n";
+        let rr = find_routers(&parse_ps(ro));
+        assert_eq!(rr[0].rosso_job.as_deref(), Some("demo"));
+        assert_eq!(rr[0].rosso_as.as_deref(), Some("Security Seat"));
+        assert_eq!(rr[0].cwd.as_deref(), Some("/p/repo"));
+        let spaced = "  400 1 1000 /opt/homebrew/bin/bun agy-route --role worker --cwd /Users/u/My App --prompt-file /tmp/x\n";
+        let rs = find_routers(&parse_ps(spaced));
+        assert_eq!(rs[0].cwd.as_deref(), Some("/Users/u/My App"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::model::{AgentId, AgentKind, AgentState, Alert, RouterStatus};
+use crate::model::{AgentId, AgentKind, AgentState, Alert, ReportKind, RouterStatus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +11,8 @@ pub enum SourceKind {
     AgyHook,
     /// agy-route: process scan, lock files, audit log, dry-run capacity.
     AgyRouter,
+    /// ROSSO job logbook / mailroom tail.
+    Rosso,
     /// Synthetic (tests / demo mode).
     Demo,
 }
@@ -52,6 +54,8 @@ pub enum EventKind {
         tokens_cache_write: u64,
         cost_usd: f64,
         context_pct: Option<f32>,
+        #[serde(default)]
+        model: Option<String>,
     },
     Resources { id: AgentId, rss_mb: u32 },
     PermissionRequested { id: AgentId, request_id: String, summary: String },
@@ -59,6 +63,31 @@ pub enum EventKind {
     Gone { id: AgentId },
     Router(RouterStatus),
     Alert(Alert),
+    /// A document handed from one agent to another. `to: None` means "whoever asked": the
+    /// sender's parent, or you (the boss) for a top-level session.
+    Handoff {
+        from: AgentId,
+        to: Option<AgentId>,
+        kind: ReportKind,
+        title: String,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        brief: String,
+    },
+    /// A ROSSO delivery (logbook line) or escalation (mailroom line), by office title.
+    RossoMail {
+        job: String,
+        from_title: String,
+        to_titles: Vec<String>,
+        doc_type: String,
+        verdict: Option<String>,
+        subject: String,
+        doc_path: Option<String>,
+        escalation: bool,
+        #[serde(default)]
+        body: String,
+    },
 }
 
 impl Event {

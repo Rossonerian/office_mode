@@ -159,7 +159,10 @@ impl Detector {
                     | AgentState::Arriving
                     | AgentState::Error
             );
-            if !watched || now_ms.saturating_sub(a.last_event_ms) < self.stuck_after_ms {
+            if !watched
+                || now_ms.saturating_sub(a.last_event_ms) < self.stuck_after_ms
+                || crate::reducer::has_live_active_children(scene, id)
+            {
                 continue;
             }
             let p = self.per.entry(id.clone()).or_default();

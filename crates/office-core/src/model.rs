@@ -70,6 +70,12 @@ pub struct Agent {
     pub rss_mb: Option<u32>,
     pub tool_calls: u32,
     pub tool_failures: u32,
+    #[serde(default)]
+    pub current_tool: Option<String>,
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    #[serde(default)]
+    pub last_tool_ok: Option<bool>,
     /// Session id usable for `claude --resume`.
     pub resume_id: Option<String>,
     /// Pending Claude permission request id (control action: approve/deny).
@@ -114,9 +120,43 @@ pub struct RouterStatus {
     pub limit_text: Option<String>,
 }
 
+/// What a hand-off carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReportKind {
+    /// Work handed down: a session briefs a subagent, a relay subagent starts an agy call.
+    Task,
+    /// Work handed back up: a subagent's or agy call's final report to whoever asked.
+    Report,
+    /// A top-level session's turn output, taken to you (the boss).
+    Result,
+}
+
+/// One document passed between agents (or to you). Labels are captured at hand-off time,
+/// so the record stays readable after the agents have left.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Report {
+    pub id: u64,
+    pub at_ms: u64,
+    pub kind: ReportKind,
+    pub from: AgentId,
+    pub from_label: String,
+    /// None = the boss (you).
+    pub to: Option<AgentId>,
+    pub to_label: String,
+    pub title: String,
+    /// The report text (truncated to a bounded size).
+    pub body: String,
+    /// The brief the sender was given (for subagent reports), if known.
+    #[serde(default)]
+    pub brief: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scene {
     pub agents: BTreeMap<AgentId, Agent>,
+    /// Hand-offs between agents and to you, oldest first (bounded).
+    #[serde(default)]
+    pub reports: Vec<Report>,
     pub alerts: Vec<Alert>,
     pub router: RouterStatus,
     pub total_tokens: u64,

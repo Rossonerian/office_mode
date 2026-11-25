@@ -49,6 +49,61 @@ fn main() -> anyhow::Result<()> {
         println!("{name:<11} {}", p.display());
     }
     r.set_hover(None);
+    // busy: three sessions side by side, a selected subagent next to a hovered session, long
+    // bubbles in adjacent pods (the overlap case), agy lab calls.
+    {
+        use office_core::model::{AgentKind, AgentState};
+        let mut s = office_core::Scene { now_ms: now, ..Default::default() };
+        let mut add = |id: &str, kind: AgentKind, label: &str, parent: Option<&str>, state: AgentState, act: &str, start: u64| {
+            let mut a = render::demo::demo_scene(now).agents.values().next().unwrap().clone();
+            a.id = id.into();
+            a.kind = kind;
+            a.label = label.into();
+            a.parent = parent.map(Into::into);
+            a.state = state;
+            a.activity = act.into();
+            a.started_ms = start;
+            a.last_event_ms = now - 500;
+            a.cwd = Some(format!("/p/{label}"));
+            a.role = (kind != AgentKind::Claude).then(|| label.split('·').next().unwrap_or(label).to_string());
+            a.current_tool = (state == AgentState::NeedsYou).then(|| "AskUserQuestion".to_string());
+            s.agents.insert(a.id.clone(), a);
+        };
+        add("cc:m", AgentKind::Claude, "cc·macoptimizer", None, AgentState::Idle, "", 1);
+        add("cc-sub:m/1", AgentKind::ClaudeSub, "general-purpose", Some("cc:m"), AgentState::Running, "Bash syntax-check router as .ts", 2);
+        add("cc:o", AgentKind::Claude, "cc·agent-office", None, AgentState::Running, "Bash test, reinstall, rerun doctor", 3);
+        add("cc-sub:o/1", AgentKind::ClaudeSub, "agy-council-architect", Some("cc:o"), AgentState::Running, "Bash agy-route council-architect", 4);
+        add("cc-sub:o/2", AgentKind::ClaudeSub, "agy-manager", Some("cc:o"), AgentState::Thinking, "starting…", 5);
+        add("cc:d", AgentKind::Claude, "cc·DICE", None, AgentState::NeedsYou, "Bash rm -rf build", 6);
+        add("agy:9", AgentKind::Agy, "worker·hydrogen-low", None, AgentState::Typing, "editing other-repo", 7);
+        add("cc-sub:o/3", AgentKind::ClaudeSub, "agy-council-advisor", Some("cc:o"), AgentState::Running, "Bash agy-route council-advisor", 8);
+        add("agy:11", AgentKind::Agy, "council-architect·neon-xhigh", Some("cc-sub:o/1"), AgentState::Thinking, "council-architect agent-office", 9);
+        add("agy:12", AgentKind::Agy, "council-advisor·neon-high", Some("cc-sub:o/3"), AgentState::Thinking, "council-advisor agent-office", 10);
+        // hand-offs in flight: a report going up, a brief going down
+        let mk = |id: u64, at: u64, kind: office_core::ReportKind, from: &str, to: &str| office_core::Report {
+            id, at_ms: at, kind, from: from.into(), from_label: from.into(), to: Some(to.into()), to_label: to.into(),
+            title: "t".into(), body: String::new(), brief: String::new(),
+        };
+        s.reports.push(mk(1, now - 1_200, office_core::ReportKind::Report, "cc-sub:m/1", "cc:m"));
+        s.reports.push(mk(2, now - 1_800, office_core::ReportKind::Task, "cc:o", "cc-sub:o/2"));
+        r.set_mix(&ThemeMix { floor: "cozy".into(), walls: "cozy".into(), furniture: "cozy".into(), decor: "cozy".into(), characters: "procedural".into() });
+        r.set_hover(Some("cc:o".into()));
+        let sel = "cc-sub:m/1".to_string();
+        for (name, (bw, bh)) in [("busy", (w, h)), ("busy-wide", (1600, 600)), ("busy-small", (640, 360))] {
+            let img = r.compose(&s, Some(&sel), bw, bh, now);
+            let p = out.join(format!("{name}.png"));
+            img.save(&p)?;
+            println!("{name:<11} {}", p.display());
+        }
+        // later: the session has reached the boss's desk with its plan, the vote is up
+        let later = now + 9_000;
+        s.now_ms = later;
+        let img = r.compose(&s, Some(&sel), w, h, later);
+        let p = out.join("busy-vote.png");
+        img.save(&p)?;
+        println!("busy-vote   {}", p.display());
+        r.set_hover(None);
+    }
     for e in r.theme_errors() {
         eprintln!("theme error: {e}");
     }

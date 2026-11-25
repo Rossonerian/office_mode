@@ -19,9 +19,13 @@ whiteboard = { sheet = "ob", col = 15, row = 7, tint = "#00e5ff" }
 glow = "#00b8ff"
 floor_bg = "#0b0614"
 wall_bg = "#130a24"
+char_tint = "#c8d8ff"
 
 [colors]
+wall = "#130a24"
 wall_trim = "#ff2bd6"
+wood = "#231438"
+desk = "#1f1233"
 metal = "#2a2140"
 screen_on = "#003a4a"
 screen_off = "#0b0614"

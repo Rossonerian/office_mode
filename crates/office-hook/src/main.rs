@@ -13,8 +13,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const MAX_STDIN: u64 = 1 << 20;
-const STDIN_TIMEOUT: Duration = Duration::from_millis(200);
-const SEND_TIMEOUT: Duration = Duration::from_millis(150);
+const TOTAL_BUDGET: Duration = Duration::from_millis(280);
+const STDIN_TIMEOUT: Duration = Duration::from_millis(150);
+const SEND_CAP: Duration = Duration::from_millis(120);
+const STALE_DECISION_AGE: Duration = Duration::from_secs(3600);
 
 fn main() {
     // Never let a panic produce a non-zero exit or noise.
@@ -23,24 +25,27 @@ fn main() {
     std::process::exit(0);
 }
 
-fn read_stdin() -> Option<Vec<u8>> {
+fn read_stdin(timeout: Duration) -> Option<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::stdin().take(MAX_STDIN).read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    rx.recv_timeout(STDIN_TIMEOUT).ok()
+    rx.recv_timeout(timeout).ok()
 }
 
 /// Send one line to the socket with an overall deadline (UnixStream has no connect timeout).
 /// Returns true only if the office received it (i.e. the office is running).
-fn send_line(line: String) -> bool {
+fn send_line(line: String, timeout: Duration) -> bool {
+    if timeout.is_zero() {
+        return false;
+    }
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let ok = (|| -> std::io::Result<()> {
             let mut s = UnixStream::connect(paths::hook_socket())?;
-            s.set_write_timeout(Some(SEND_TIMEOUT))?;
+            s.set_write_timeout(Some(timeout))?;
             s.write_all(line.as_bytes())?;
             s.write_all(b"\n")?;
             s.flush()
@@ -48,18 +53,19 @@ fn send_line(line: String) -> bool {
         .is_ok();
         let _ = tx.send(ok);
     });
-    rx.recv_timeout(SEND_TIMEOUT).unwrap_or(false)
+    rx.recv_timeout(timeout).unwrap_or(false)
 }
 
 fn run() {
+    let start = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let permission = args.iter().any(|a| a == "--permission");
     let hook_event = args.iter().position(|a| a == "--hook-event").and_then(|i| args.get(i + 1)).cloned();
 
-    let raw = read_stdin().unwrap_or_default();
+    let raw = read_stdin(STDIN_TIMEOUT).unwrap_or_default();
     let payload: Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
-        Err(_) if raw.is_empty() => Value::Null,
+        Err(_) if raw.is_empty() || raw.len() as u64 >= MAX_STDIN => Value::Null,
         Err(_) => Value::String(String::from_utf8_lossy(&raw).into_owned()),
     };
     let source = std::env::var("OFFICE_SOURCE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "claude".into());
@@ -72,7 +78,8 @@ fn run() {
     if let Some(id) = &request_id {
         line["request_id"] = json!(id);
     }
-    let delivered = send_line(line.to_string());
+    let remaining = TOTAL_BUDGET.saturating_sub(start.elapsed()).min(SEND_CAP);
+    let delivered = send_line(line.to_string(), remaining);
 
     let Some(request_id) = request_id else { return };
     // Office not running: never make the user wait; fall through to the normal Claude prompt.
@@ -80,11 +87,12 @@ fn run() {
         return;
     }
     let timeout_s = office_core::config::Config::load().permission_timeout_s;
-    if timeout_s == 0 {
-        return;
-    }
-    let decision = wait_decision(&request_id, Duration::from_secs(timeout_s));
-    // Tell the office the request is no longer pending (decided or timed out).
+    let decision = if timeout_s > 0 {
+        wait_decision(&request_id, Duration::from_secs(timeout_s))
+    } else {
+        None
+    };
+    // Tell the office the request is no longer pending (decided, timed out, or permission_timeout_s == 0).
     let mut done = json!({
         "hook_event_name": "OfficePermissionResolved",
         "request_id": request_id,
@@ -93,7 +101,7 @@ fn run() {
     if let Some(a) = payload.get("agent_id") {
         done["agent_id"] = a.clone();
     }
-    send_line(json!({ "source": source, "payload": done, "ts": paths::now_ms(), "request_id": request_id }).to_string());
+    send_line(json!({ "source": source, "payload": done, "ts": paths::now_ms(), "request_id": request_id }).to_string(), SEND_CAP);
 
     if let Some(allow) = decision {
         let out = decision_json(allow);
@@ -105,19 +113,36 @@ fn run() {
 
 /// Poll <runtime_dir>/decisions/<id> for "allow"/"deny". None on timeout.
 fn wait_decision(request_id: &str, timeout: Duration) -> Option<bool> {
-    let path = paths::decisions_dir().join(request_id);
+    let dir = paths::decisions_dir();
+    let path = dir.join(request_id);
+    // Drop any stale decision file left by an earlier aborted run with the same id.
+    let _ = std::fs::remove_file(&path);
     let deadline = Instant::now() + timeout;
+    let mut res = None;
     while Instant::now() < deadline {
         if let Ok(s) = std::fs::read_to_string(&path) {
             let s = s.trim().to_ascii_lowercase();
             if s == "allow" || s == "deny" {
                 let _ = std::fs::remove_file(&path);
-                return Some(s == "allow");
+                res = Some(s == "allow");
+                break;
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    None
+    prune_old_decisions(&dir);
+    res
+}
+
+fn prune_old_decisions(dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if let Ok(age) = e.metadata().and_then(|m| m.modified()).and_then(|m| m.elapsed().map_err(std::io::Error::other)) {
+            if age > STALE_DECISION_AGE {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 /// Claude Code PermissionRequest hook output (hookSpecificOutput.decision.behavior).

@@ -12,6 +12,9 @@ pub fn runtime_dir() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() }.to_string();
+    #[cfg(not(unix))]
     let uid = std::env::var("UID").ok().or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "u".into());
     std::env::temp_dir().join(format!("agent-office-{uid}"))
 }

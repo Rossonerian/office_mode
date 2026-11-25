@@ -1,30 +1,44 @@
 //! Workstream C. TUI: event loop, office widget (ratatui-image), sidebar, keys, control actions, notifications.
 pub mod demo;
 pub mod fmt;
+pub mod kitty;
 pub mod state;
 pub mod ui;
 
 use crate::{render, sources};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, MouseEvent, MouseEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use office_core::{config::Config, config::ThemeMix, Agent, AgentId, AlertLevel, Event, EventKind, Reducer, Scene, SourceKind};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use ratatui_image::picker::{Picker, ProtocolType};
 use state::{App, Control, Outcome, ThemeHost};
 use std::cell::Cell;
-use std::io::Stdout;
+use std::io::{Stdout, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// What the office widget needs from the renderer (workstream B); faked in tests.
 pub trait OfficeView: ThemeHost {
     fn compose(&mut self, scene: &Scene, selected: Option<&AgentId>, px_w: u32, px_h: u32, t_ms: u64) -> image::RgbaImage;
+    fn compose_logical(
+        &mut self,
+        _scene: &Scene,
+        _selected: Option<&AgentId>,
+        _px_w: u32,
+        _px_h: u32,
+        _t_ms: u64,
+    ) -> Option<render::LogicalFrame<'_>> {
+        None
+    }
     fn hit_test(&self, x: u32, y: u32) -> Option<AgentId>;
     /// What the mouse is over (the renderer shows the cat's name on hover).
     fn set_hover(&mut self, _id: Option<AgentId>) {}
@@ -49,6 +63,16 @@ impl ThemeHost for RendererView {
 impl OfficeView for RendererView {
     fn compose(&mut self, scene: &Scene, selected: Option<&AgentId>, px_w: u32, px_h: u32, t_ms: u64) -> image::RgbaImage {
         self.0.compose(scene, selected, px_w, px_h, t_ms)
+    }
+    fn compose_logical(
+        &mut self,
+        scene: &Scene,
+        selected: Option<&AgentId>,
+        px_w: u32,
+        px_h: u32,
+        t_ms: u64,
+    ) -> Option<render::LogicalFrame<'_>> {
+        Some(self.0.compose_logical(scene, selected, px_w, px_h, t_ms))
     }
     fn hit_test(&self, x: u32, y: u32) -> Option<AgentId> {
         guarded(|| self.0.hit_test(x, y)).ok().flatten()
@@ -93,10 +117,87 @@ pub fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     r.map_err(|e| panic_text(&*e))
 }
 
+/// Set once the controlling terminal is known to be gone (orphaned / hung up): restore writes are skipped.
+static TERMINAL_GONE: AtomicBool = AtomicBool::new(false);
+/// The hook-socket guard lives here so the watchdog can remove office.sock / office.pid before a forced exit.
+static SOCK_GUARD: Mutex<Option<sources::hook_socket::SocketGuard>> = Mutex::new(None);
+
+fn drop_sock_guard() {
+    if let Ok(mut g) = SOCK_GUARD.lock() {
+        g.take();
+    }
+}
+
+/// True when we were started under a real parent and have since been re-parented to launchd/init.
+pub fn is_orphaned(start_ppid: i32, cur_ppid: i32) -> bool {
+    start_ppid != 1 && cur_ppid == 1
+}
+
+/// What the quit watchdog should do on a tick. `since_trigger` is how long ago quitting began.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchdogAction {
+    Wait,
+    Exit,
+}
+
+pub const WATCHDOG_GRACE: Duration = Duration::from_millis(1500);
+/// With the terminal gone nothing can be restored, so only a short grace for a clean exit.
+pub const WATCHDOG_GRACE_ORPHAN: Duration = Duration::from_millis(200);
+
+pub fn watchdog_action(since_trigger: Option<Duration>, orphan: bool) -> WatchdogAction {
+    let grace = if orphan { WATCHDOG_GRACE_ORPHAN } else { WATCHDOG_GRACE };
+    match since_trigger {
+        Some(d) if d >= grace => WatchdogAction::Exit,
+        _ => WatchdogAction::Wait,
+    }
+}
+
+/// Independent of the event loop (which can be wedged inside crossterm's read on a hung-up tty):
+/// once quitting starts, force the process out if it hasn't exited shortly after.
+fn spawn_quit_watchdog(quit_flag: Arc<AtomicBool>, start_ppid: i32) {
+    let _ = std::thread::Builder::new().name("quit-watchdog".into()).spawn(move || {
+        let mut trigger: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            #[cfg(unix)]
+            let orphan = is_orphaned(start_ppid, unsafe { libc::getppid() });
+            #[cfg(not(unix))]
+            let orphan = false;
+            if orphan {
+                TERMINAL_GONE.store(true, Ordering::SeqCst);
+            }
+            if trigger.is_none() && (orphan || quit_flag.load(Ordering::Relaxed)) {
+                trigger = Some(std::time::Instant::now());
+            }
+            if watchdog_action(trigger.map(|t| t.elapsed()), TERMINAL_GONE.load(Ordering::SeqCst)) == WatchdogAction::Exit {
+                drop_sock_guard();
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 fn restore_terminal() {
     if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+        if TERMINAL_GONE.load(Ordering::SeqCst) {
+            return;
+        }
+        let is_tmux = std::env::var_os("TMUX").is_some();
+        let del = kitty::delete_seqs(is_tmux);
+        let mut so = std::io::stdout();
+        // A write error (EIO on a hung-up pty) means the terminal is gone: don't try anything else.
+        if so.write_all(&del).is_err() {
+            TERMINAL_GONE.store(true, Ordering::SeqCst);
+            return;
+        }
+        // Harmless if no synchronized update is open; unfreezes the screen if one was left open.
+        let _ = execute!(so, EndSynchronizedUpdate);
+        if so.flush().is_err() {
+            TERMINAL_GONE.store(true, Ordering::SeqCst);
+            return;
+        }
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+        let _ = execute!(so, LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
     }
 }
 
@@ -158,6 +259,9 @@ impl Control for RealControl {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
     }
+    fn play_sound(&mut self, critical: bool) {
+        let _ = guarded(|| sources::control::play_sound(critical));
+    }
 }
 
 /// Demo control: never touches real processes; answers with synthetic events.
@@ -195,6 +299,9 @@ impl Control for DemoControl {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
     }
+    fn play_sound(&mut self, critical: bool) {
+        let _ = guarded(|| sources::control::play_sound(critical));
+    }
 }
 
 // ---------- the loop ----------
@@ -210,24 +317,60 @@ fn make_picker() -> Picker {
     }
 }
 
-/// Whether the office has something moving (so we redraw at fps even without events).
-fn animating(scene: &Scene) -> bool {
+/// Target redraw cadence in ms: `fps` when active or walking, 6 FPS for smooth ambient cat/CEO/queued motion,
+/// or 1000 ms for elapsed counters only.
+pub fn frame_interval_ms(scene: &Scene, cfg: &Config, now_ms: u64, walking: bool) -> u64 {
     use office_core::AgentState::*;
-    scene.agents.values().any(|a| !matches!(a.state, Idle | Done | Queued))
+    let active = scene.agents.values().any(|a| {
+        !matches!(a.state, Idle | Done | Queued)
+            || (a.state == Done && now_ms.saturating_sub(a.last_event_ms) < 3_000)
+    });
+    if active || walking {
+        (1000 / cfg.fps.clamp(1, 60) as u64).max(16)
+    } else if cfg.cat.enabled || cfg.ceo.enabled || scene.agents.values().any(|a| a.state == Queued) {
+        166
+    } else {
+        1000
+    }
+}
+
+pub fn poll_wait_ms(cadence_ms: u64, since_draw_ms: u64) -> u64 {
+    cadence_ms.saturating_sub(since_draw_ms).clamp(5, 20)
 }
 
 pub fn run(cfg: Config, demo: bool) -> anyhow::Result<()> {
     // The capability query toggles raw mode itself, so it runs before our terminal setup.
     let picker = make_picker();
     install_panic_hook();
+    let quit_flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let _ = signal_hook::flag::register(libc::SIGTERM, Arc::clone(&quit_flag));
+        let _ = signal_hook::flag::register(libc::SIGHUP, Arc::clone(&quit_flag));
+    }
     let (mut term, _guard) = setup_terminal()?;
-    let res = event_loop(&mut term, cfg, demo, picker);
+    #[cfg(unix)]
+    let start_ppid = unsafe { libc::getppid() };
+    #[cfg(not(unix))]
+    let start_ppid = 0;
+    spawn_quit_watchdog(Arc::clone(&quit_flag), start_ppid);
+    let res = event_loop(&mut term, cfg, demo, picker, Arc::clone(&quit_flag), start_ppid);
+    // The loop is over (quit key, signal, orphan or error): arm the watchdog in case teardown hangs.
+    quit_flag.store(true, Ordering::Relaxed);
     drop(term);
     restore_terminal();
+    drop_sock_guard();
     res
 }
 
-fn event_loop(term: &mut Terminal<CrosstermBackend<Stdout>>, cfg: Config, demo: bool, picker: Picker) -> anyhow::Result<()> {
+fn event_loop(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    cfg: Config,
+    demo: bool,
+    picker: Picker,
+    quit_flag: Arc<AtomicBool>,
+    start_ppid: i32,
+) -> anyhow::Result<()> {
     let now = office_core::paths::now_ms;
     let mut app = App::new(&cfg, demo);
     let (tx, rx) = mpsc::channel::<Event>();
@@ -238,8 +381,13 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<Stdout>>, cfg: Config, demo: 
     } else {
         let c2 = cfg.clone();
         let t2 = tx.clone();
-        if let Err(e) = guarded(move || sources::spawn_all(&c2, t2)) {
-            app.toast(format!("sources unavailable: {e}"), AlertLevel::Critical, now());
+        match guarded(move || sources::spawn_all(&c2, t2)) {
+            Ok(g) => {
+                if let Ok(mut slot) = SOCK_GUARD.lock() {
+                    *slot = g;
+                }
+            }
+            Err(e) => app.toast(format!("sources unavailable: {e}"), AlertLevel::Critical, now()),
         }
         Box::new(RealControl)
     };
@@ -261,13 +409,19 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<Stdout>>, cfg: Config, demo: 
     }
 
     let mut reducer = Reducer::with_config(&cfg);
-    let frame_ms = 1000 / cfg.fps.clamp(1, 60) as u64;
     let mut last_sweep = 0u64;
     let mut last_draw = 0u64;
     let mut reducer_broken = false;
     let mut scene_changed = true;
 
-    loop {
+    while !quit_flag.load(Ordering::Relaxed) {
+        // The terminal that ran us is gone (we were re-parented to launchd): exit instead of
+        // spinning in the background and holding the hook socket.
+        #[cfg(unix)]
+        if is_orphaned(start_ppid, unsafe { libc::getppid() }) {
+            TERMINAL_GONE.store(true, Ordering::SeqCst);
+            break;
+        }
         let t = now();
         // 1. Events from sources / demo.
         while let Ok(ev) = rx.try_recv() {
@@ -298,39 +452,81 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<Stdout>>, cfg: Config, demo: 
             app.observe(reducer.scene(), t, ctl.as_mut());
             scene_changed = false;
         }
-        // 3. Draw: on change, at fps while animating, and at least once a second (elapsed times).
+        // 3. Draw with Ghostty synchronized output (DEC 2026) and zero-redundant Kitty uploads.
         let since = t.saturating_sub(last_draw);
-        let anim = animating(reducer.scene());
-        if app.dirty || (anim && since >= frame_ms) || since >= 1000 {
+        let cadence = frame_interval_ms(reducer.scene(), &cfg, t, office.last_walking);
+        if app.dirty || since >= cadence {
             app.dirty = false;
-            last_draw = t;
             let scene = reducer.scene();
-            term.draw(|f| ui::draw(f, &mut app, scene, &mut office, t))?;
+            let sz = term.size()?;
+            let office_area = ui::office_rect(Rect::new(0, 0, sz.width, sz.height), app.sidebar);
+            office.prepare_frame(&app, scene, office_area, t);
+            let pending = office.take_pending_kitty();
+
+            let sync = matches!(office.picker.as_ref().map(|p| p.protocol_type()), Some(ProtocolType::Kitty));
+            if sync || pending.is_some() {
+                let backend = term.backend_mut();
+                if sync {
+                    let _ = execute!(backend, BeginSynchronizedUpdate);
+                }
+                if let Some(bytes) = pending {
+                    let _ = backend.write_all(&bytes);
+                }
+            }
+            let drawn = term.draw(|f| ui::draw(f, &mut app, scene, &mut office, t)).map(|_| ());
+            if sync {
+                // Always close the sync block, even when the draw failed, or the terminal stays frozen.
+                let _ = execute!(term.backend_mut(), EndSynchronizedUpdate);
+            }
+            drawn?;
+            last_draw = now();
         }
-        // 4. Input (bounded wait so the channel stays responsive).
-        let wait = if anim { frame_ms.saturating_sub(now().saturating_sub(last_draw)).max(5) } else { 100 };
-        if event::poll(Duration::from_millis(wait.min(100)))? {
-            let t = now();
-            match event::read()? {
-                TermEvent::Key(k) => {
-                    let scene = reducer.scene();
-                    let theme: &mut dyn ThemeHost = match office.view.as_deref_mut() {
-                        Some(v) => v,
-                        None => &mut NullTheme,
-                    };
-                    if app.handle_key(k, scene, theme, ctl.as_mut(), t) == Outcome::Quit {
-                        break;
+        // 4. Input: bounded wait, then drain all queued events & coalesce mouse moves.
+        let wait = poll_wait_ms(cadence, now().saturating_sub(last_draw));
+        if event::poll(Duration::from_millis(wait))? {
+            let mut last_move: Option<MouseEvent> = None;
+            let mut quit = false;
+            for _ in 0..128 {
+                let t = now();
+                match event::read()? {
+                    TermEvent::Key(k) => {
+                        let scene = reducer.scene();
+                        let theme: &mut dyn ThemeHost = match office.view.as_deref_mut() {
+                            Some(v) => v,
+                            None => &mut NullTheme,
+                        };
+                        if app.handle_key(k, scene, theme, ctl.as_mut(), t) == Outcome::Quit {
+                            quit = true;
+                            break;
+                        }
                     }
-                }
-                TermEvent::Mouse(m) => {
-                    let view = office.view.as_deref();
-                    let hit = |x: u32, y: u32| view.and_then(|v| v.hit_test(x, y));
-                    if app.handle_mouse(m, reducer.scene(), &hit) {
-                        app.dirty = true;
+                    TermEvent::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                        last_move = Some(m);
                     }
+                    TermEvent::Mouse(m) => {
+                        let view = office.view.as_deref();
+                        let hit = |x: u32, y: u32| view.and_then(|v| v.hit_test(x, y));
+                        if app.handle_mouse_at(m, reducer.scene(), &hit, t) {
+                            app.dirty = true;
+                        }
+                    }
+                    TermEvent::Resize(_, _) => app.dirty = true,
+                    _ => {}
                 }
-                TermEvent::Resize(_, _) => app.dirty = true,
-                _ => {}
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+            if quit {
+                break;
+            }
+            if let Some(m) = last_move {
+                let t = now();
+                let view = office.view.as_deref();
+                let hit = |x: u32, y: u32| view.and_then(|v| v.hit_test(x, y));
+                if app.handle_mouse_at(m, reducer.scene(), &hit, t) {
+                    app.dirty = true;
+                }
             }
         }
     }
@@ -367,6 +563,9 @@ pub mod testutil {
             cwd: None,
             role: None,
             model: None,
+            current_tool: None,
+            last_tool: None,
+            last_tool_ok: None,
             slot: None,
             pid: None,
             state: AgentState::Idle,
@@ -493,6 +692,7 @@ pub mod testutil {
     pub struct FakeControl {
         pub calls: Vec<String>,
         pub notes: Vec<(String, String)>,
+        pub sounds: Vec<bool>,
         pub fail: bool,
     }
     impl Control for FakeControl {
@@ -520,11 +720,32 @@ pub mod testutil {
         fn notify(&mut self, title: &str, body: &str) {
             self.notes.push((title.into(), body.into()));
         }
+        fn play_sound(&mut self, critical: bool) {
+            self.sounds.push(critical);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orphan_detection() {
+        assert!(super::is_orphaned(500, 1));
+        assert!(!super::is_orphaned(500, 500));
+        assert!(!super::is_orphaned(1, 1));
+    }
+
+    #[test]
+    fn watchdog_decisions() {
+        use super::{watchdog_action as w, WatchdogAction::*};
+        use std::time::Duration as D;
+        assert_eq!(w(None, false), Wait);
+        assert_eq!(w(Some(D::from_millis(1000)), false), Wait);
+        assert_eq!(w(Some(D::from_millis(1500)), false), Exit);
+        assert_eq!(w(Some(D::from_millis(250)), true), Exit);
+        assert_eq!(w(Some(D::from_millis(100)), true), Wait);
+    }
+
     use super::*;
 
     #[test]
@@ -543,5 +764,38 @@ mod tests {
         let evs: Vec<Event> = rx.try_iter().collect();
         assert!(matches!(evs.last().unwrap().kind, EventKind::Gone { ref id } if id == "agy:4242"));
         assert!(c.resume_claude(Some("/x"), "s").unwrap().contains("cd /x && claude --resume s"));
+    }
+
+    #[test]
+    fn poll_wait_ms_and_frame_interval_tiers() {
+        assert_eq!(poll_wait_ms(1000, 0), 20);
+        assert_eq!(poll_wait_ms(16, 15), 5);
+        assert_eq!(poll_wait_ms(20, 10), 10);
+
+        let mut cfg = Config::default();
+        cfg.fps = 30;
+        cfg.cat.enabled = false;
+        cfg.ceo.enabled = false;
+        let mut s = Scene::default();
+        assert_eq!(frame_interval_ms(&s, &cfg, 0, false), 1000);
+        assert_eq!(frame_interval_ms(&s, &cfg, 0, true), 33);
+        cfg.cat.enabled = true;
+        assert_eq!(frame_interval_ms(&s, &cfg, 0, false), 166);
+
+        // Done: fast inside the 3 s grace window, back to idle cadence after it.
+        cfg.cat.enabled = false;
+        let mut agent = testutil::demo_scene().agents["agy:4242"].clone();
+        agent.state = office_core::AgentState::Done;
+        agent.last_event_ms = 10_000;
+        s.agents.insert("d".into(), agent);
+        assert_eq!(frame_interval_ms(&s, &cfg, 12_999, false), 33);
+        assert_eq!(frame_interval_ms(&s, &cfg, 13_000, false), 1000);
+        // Queued (not active) uses the slow animation tier even with cat/ceo off.
+        s.agents.get_mut("d").unwrap().state = office_core::AgentState::Queued;
+        assert_eq!(frame_interval_ms(&s, &cfg, 99_000, false), 166);
+        assert_eq!(frame_interval_ms(&s, &cfg, 99_000, true), 33);
+        // A working agent drives the full rate.
+        s.agents.get_mut("d").unwrap().state = office_core::AgentState::Typing;
+        assert_eq!(frame_interval_ms(&s, &cfg, 99_000, false), 33);
     }
 }

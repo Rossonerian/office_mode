@@ -6,9 +6,20 @@ use std::process::{Command, Stdio};
 /// SIGTERM an agy-route router process (it releases its slot and kills its agy group).
 pub fn cancel_agy(router_pid: u32) -> anyhow::Result<()> {
     anyhow::ensure!(router_pid > 1, "refusing to signal pid {router_pid}");
-    let st = Command::new("kill").args(["-TERM", &router_pid.to_string()]).stderr(Stdio::null()).status()?;
-    anyhow::ensure!(st.success(), "kill -TERM {router_pid} failed");
-    Ok(())
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(router_pid as libc::pid_t, libc::SIGTERM) };
+        if rc != 0 {
+            return Err(anyhow::anyhow!("kill -TERM {router_pid} failed: {}", std::io::Error::last_os_error()));
+        }
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let st = Command::new("kill").args(["-TERM", &router_pid.to_string()]).stderr(Stdio::null()).status()?;
+        anyhow::ensure!(st.success(), "kill -TERM {router_pid} failed");
+        Ok(())
+    }
 }
 
 /// Answer a pending Claude permission request that office-hook --permission is waiting on
@@ -41,22 +52,26 @@ pub fn resume_command(cwd: Option<&str>, session_id: &str) -> String {
 }
 
 /// Resume command for a Claude session: copy `cd <cwd> && claude --resume <id>` to the clipboard (pbcopy)
-/// and try to open a new Ghostty window running it. Returns the command string.
+/// asynchronously and try to open a new Ghostty window running it inside the user's login shell.
 pub fn resume_claude(cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
     let cmd = resume_command(cwd, session_id);
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        if let Some(mut si) = child.stdin.take() {
-            let _ = si.write_all(cmd.as_bytes());
+    let clip = cmd.clone();
+    std::thread::spawn(move || {
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(clip.as_bytes());
+            }
+            let _ = child.wait();
         }
-        let _ = child.wait();
-    }
+    });
     let ghostty = std::path::Path::new("/Applications/Ghostty.app").exists()
         || dirs::home_dir().map(|h| h.join("Applications/Ghostty.app").exists()).unwrap_or(false);
     if ghostty {
-        // Keep the shell open after claude exits.
-        let inner = format!("{cmd}; exec ${{SHELL:-/bin/zsh}} -l");
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        // Run inside the user's interactive login shell so `claude` is on PATH, and keep it open on exit.
+        let inner = format!("{cmd}; exec {} -l", sh_quote(&shell));
         if let Ok(child) = Command::new("open")
-            .args(["-na", "Ghostty", "--args", "-e", "sh", "-c", &inner])
+            .args(["-na", "Ghostty", "--args", "-e", &shell, "-lic", &inner])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -66,6 +81,24 @@ pub fn resume_claude(cwd: Option<&str>, session_id: &str) -> anyhow::Result<Stri
         }
     }
     Ok(cmd)
+}
+
+/// Non-blocking macOS chime when `sound = true` (no-op elsewhere).
+pub fn play_sound(critical: bool) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let path = if critical {
+        "/System/Library/Sounds/Sosumi.aiff"
+    } else {
+        "/System/Library/Sounds/Glass.aiff"
+    };
+    if !std::path::Path::new(path).exists() {
+        return;
+    }
+    if let Ok(child) = Command::new("afplay").arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        reap(child);
+    }
 }
 
 fn reap(mut child: std::process::Child) {
