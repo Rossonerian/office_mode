@@ -1,5 +1,6 @@
 //! App state machine: selection, popups, toasts, key/mouse handling, notifications, theme cycling.
 //! Everything here is pure over (Scene, ThemeHost, Control) so it can be tested without a tty.
+use super::chime::{Chime, Chimer};
 use super::fmt;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use office_core::{config::{ShowConfig, ThemeMix}, model::AgentKind, Agent, AgentId, AgentState, AlertLevel, Scene};
@@ -21,7 +22,7 @@ pub trait Control {
     fn resolve_permission(&mut self, agent: &Agent, request_id: &str, allow: bool) -> anyhow::Result<()>;
     fn resume_claude(&mut self, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String>;
     fn notify(&mut self, title: &str, body: &str);
-    fn play_sound(&mut self, _critical: bool) {}
+    fn play_sound(&mut self, _chime: Chime) {}
 }
 
 pub const PRESET_ORDER: [&str; 6] = ["procedural", "modern", "cozy", "midnight", "retro", "cyberpunk"];
@@ -142,7 +143,7 @@ pub fn layer_set(m: &mut ThemeMix, layer: usize, v: String) {
 
 /// Write `theme = {..}` into the TOML config atomically, keeping every other key and failing safely
 /// if an existing config file cannot be read or parsed.
-pub fn persist_config(path: &std::path::Path, mix: &ThemeMix, show: &ShowConfig) -> anyhow::Result<()> {
+pub fn persist_config(path: &std::path::Path, mix: &ThemeMix, show: &ShowConfig, notifications: bool, sound: bool) -> anyhow::Result<()> {
     let mut table: toml::Table = match std::fs::read_to_string(path) {
         Ok(s) => s.parse::<toml::Table>()?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
@@ -150,6 +151,8 @@ pub fn persist_config(path: &std::path::Path, mix: &ThemeMix, show: &ShowConfig)
     };
     table.insert("theme".into(), toml::Value::try_from(mix)?);
     table.insert("show".into(), toml::Value::try_from(show)?);
+    table.insert("notifications".into(), toml::Value::Boolean(notifications));
+    table.insert("sound".into(), toml::Value::Boolean(sound));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -173,6 +176,7 @@ pub struct App {
     pub sidebar: bool,
     pub notifications: bool,
     pub sound: bool,
+    chimer: Chimer,
     pub toasts: Vec<Toast>,
     /// Alerts at or before this time are hidden (the `c` key).
     pub alerts_cleared_at: Option<u64>,
@@ -212,6 +216,7 @@ impl App {
             sidebar: cfg.sidebar,
             notifications: cfg.notifications,
             sound: cfg.sound,
+            chimer: Chimer::default(),
             toasts: Vec::new(),
             alerts_cleared_at: None,
             permissions_enabled: demo || cfg.permission_timeout_s > 0,
@@ -305,9 +310,8 @@ impl App {
 
         for a in entered_needs_you {
             let body = if a.activity.is_empty() { "waiting for you".to_string() } else { a.activity.clone() };
-            if self.maybe_notify(&a.id.clone(), &format!("{} needs you", a.label), &body, now_ms, ctl) && self.sound {
-                ctl.play_sound(false);
-            }
+            self.maybe_notify(&a.id.clone(), &format!("{} needs you", a.label), &body, now_ms, ctl);
+            self.chime(Chime::NeedsYou, now_ms, ctl);
         }
 
         // New Critical alerts.
@@ -328,9 +332,8 @@ impl App {
                 None => format!("office: {}", al.code),
             };
             let key = al.agent.clone().unwrap_or_else(|| format!("alert:{}", al.code));
-            if self.maybe_notify(&key, &title, &al.message, now_ms, ctl) && self.sound {
-                ctl.play_sound(true);
-            }
+            self.maybe_notify(&key, &title, &al.message, now_ms, ctl);
+            self.chime(Chime::Error, now_ms, ctl);
         }
         self.observe_inbox(scene, now_ms, ctl);
         self.dirty = true;
@@ -349,10 +352,8 @@ impl App {
         self.inbox_notified = self.inbox_notified.max(top);
         for r in fresh {
             let title = format!("{} → you", r.from_label);
-            let sent = self.maybe_notify(&format!("inbox:{}", r.id), &title, &r.title, now_ms, ctl);
-            if sent && self.sound {
-                ctl.play_sound(r.title.starts_with('⚠'));
-            }
+            self.maybe_notify(&format!("inbox:{}", r.id), &title, &r.title, now_ms, ctl);
+            self.chime(if r.title.starts_with('⚠') { Chime::Error } else { Chime::Inbox }, now_ms, ctl);
         }
     }
 
@@ -386,6 +387,13 @@ impl App {
         self.mark_seen(id);
         self.detail_scroll = 0;
         self.popup = Popup::ReportView { id, only, inbox };
+    }
+
+    /// Play a chime if sound is on and the 3 s rate limit allows (independent of the `n` toggle).
+    fn chime(&mut self, chime: Chime, now_ms: u64, ctl: &mut dyn Control) {
+        if self.chimer.allow(self.sound, chime, now_ms) {
+            ctl.play_sound(chime);
+        }
     }
 
     /// Rate-limited (1 per 10 s per key) notification that respects the `n` toggle.
@@ -485,8 +493,8 @@ impl App {
 
     fn persist(&mut self, now_ms: u64) {
         if let Some(p) = self.config_path.clone() {
-            if let Err(e) = persist_config(&p, &self.mix, &self.show) {
-                self.toast(format!("could not save theme: {e}"), AlertLevel::Warn, now_ms);
+            if let Err(e) = persist_config(&p, &self.mix, &self.show, self.notifications, self.sound) {
+                self.toast(format!("could not save settings: {e}"), AlertLevel::Warn, now_ms);
             }
         }
     }
@@ -575,8 +583,17 @@ impl App {
         match self.popup.clone() {
             Popup::None => {}
             Popup::Help => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')) {
-                    self.popup = Popup::None;
+                let max = self.layout.detail_max_scroll;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                        self.popup = Popup::None;
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.detail_scroll = self.detail_scroll.saturating_add(1).min(max),
+                    KeyCode::Up | KeyCode::Char('k') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => self.detail_scroll = self.detail_scroll.saturating_add(8).min(max),
+                    KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(8),
+                    _ => {}
                 }
                 return Outcome::Continue;
             }
@@ -820,18 +837,24 @@ impl App {
                 self.set_show_item(0, on, view);
                 self.set_show_item(1, on, view);
                 self.persist(now_ms);
-                self.toast(if on { "labels on" } else { "labels off" }, AlertLevel::Info, now_ms);
+                self.toast(if on { "name tags + bubbles on" } else { "name tags + bubbles off" }, AlertLevel::Info, now_ms);
             }
             KeyCode::Char('s') => self.sidebar = !self.sidebar,
             KeyCode::Char('n') => {
                 self.notifications = !self.notifications;
+                self.persist(now_ms);
                 let s = if self.notifications { "notifications on" } else { "notifications off" };
                 self.toast(s, AlertLevel::Info, now_ms);
             }
             KeyCode::Char('m') => {
                 self.sound = !self.sound;
-                let s = if self.sound { "sound on" } else { "sound off" };
-                self.toast(s, AlertLevel::Info, now_ms);
+                self.persist(now_ms);
+                if self.sound {
+                    self.chime(Chime::Test, now_ms, ctl);
+                    self.toast("sound on (test chime played; chimes: needs you, inbox, errors)", AlertLevel::Info, now_ms);
+                } else {
+                    self.toast("sound off", AlertLevel::Info, now_ms);
+                }
             }
             KeyCode::Char('c') => {
                 let latest = scene.alerts.iter().map(|a| a.at_ms).max().unwrap_or(0);
@@ -856,7 +879,10 @@ impl App {
                 None => self.toast("no agent selected", AlertLevel::Info, now_ms),
             },
             KeyCode::Char('o') => self.resume(scene, ctl, now_ms),
-            KeyCode::Char('?') => self.popup = Popup::Help,
+            KeyCode::Char('?') => {
+                self.detail_scroll = 0;
+                self.popup = Popup::Help;
+            }
             KeyCode::Char('r') => {
                 let only = self.selected.clone().filter(|id| scene.reports.iter().any(|r| &r.from == id || r.to.as_ref() == Some(id)));
                 if scene.reports.is_empty() {
@@ -1435,27 +1461,56 @@ mod tests {
 
     #[test]
     fn sound_toggle_and_chime_triggers() {
+        use super::super::chime::Chime;
         let mut h = Harness::new();
         assert!(!h.app.sound);
+        // Sound off: no chime even for a needs-you transition.
+        h.scene.agents.get_mut("cc:dice").unwrap().state = AgentState::NeedsYou;
+        h.app.observe(&h.scene, 1_000, &mut h.ctl);
+        assert!(h.ctl.sounds.is_empty());
+        h.scene.agents.get_mut("cc:dice").unwrap().state = AgentState::Idle;
+        h.app.observe(&h.scene, 2_000, &mut h.ctl);
         h.press(key('m'));
         assert!(h.app.sound);
-        assert_eq!(h.toast(), "sound on");
-        // Trigger new NeedsYou -> play_sound(false)
+        assert!(h.toast().starts_with("sound on"), "{}", h.toast());
+        assert_eq!(h.ctl.sounds, vec![Chime::Test]);
+        // Notifications off must not silence chimes.
+        h.app.notifications = false;
         h.scene.agents.get_mut("cc:dice").unwrap().state = AgentState::NeedsYou;
-        h.app.observe(&h.scene, 10_000, &mut h.ctl);
-        // Trigger new Critical alert -> play_sound(true)
+        h.app.observe(&h.scene, 20_000, &mut h.ctl);
+        // A critical alert 1 s later is rate limited; one 4 s later plays the error chime.
         h.scene.alerts.push(Alert {
-            at_ms: 11_000,
+            at_ms: 21_000,
             level: AlertLevel::Critical,
             agent: Some("agy:4242".into()),
             code: "timeout".into(),
             message: "timed out".into(),
         });
-        h.app.observe(&h.scene, 11_000, &mut h.ctl);
-        assert_eq!(h.ctl.sounds, vec![false, true]);
+        h.app.observe(&h.scene, 21_000, &mut h.ctl);
+        h.scene.alerts.push(Alert {
+            at_ms: 24_000,
+            level: AlertLevel::Critical,
+            agent: Some("agy:4242".into()),
+            code: "oops".into(),
+            message: "again".into(),
+        });
+        h.app.observe(&h.scene, 24_000, &mut h.ctl);
+        assert_eq!(h.ctl.sounds, vec![Chime::Test, Chime::NeedsYou, Chime::Error]);
         h.press(key('m'));
         assert!(!h.app.sound);
         assert_eq!(h.toast(), "sound off");
+    }
+
+    #[test]
+    fn sound_and_notification_settings_persist() {
+        let path = std::env::temp_dir().join(format!("office-sound-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut h = Harness::new();
+        h.app.config_path = Some(path.clone());
+        h.press(key('m'));
+        let t: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(t["sound"].as_bool(), Some(true));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1701,9 +1756,9 @@ mod tests {
         h.press(key('L'));
         assert!(!h.app.show.names && !h.app.show.bubbles);
         assert!(!h.view.show.names && !h.view.show.bubbles);
-        assert_eq!(h.toast(), "labels off");
+        assert_eq!(h.toast(), "name tags + bubbles off");
         h.press(key('L'));
         assert!(h.app.show.names && h.app.show.bubbles);
-        assert_eq!(h.toast(), "labels on");
+        assert_eq!(h.toast(), "name tags + bubbles on");
     }
 }

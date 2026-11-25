@@ -17,7 +17,8 @@ The screenshots come from `cargo run -p office --example preview`, which writes 
 `target/preview/`.
 
 Everything stays on your machine: there is no network access and no telemetry. The design
-contract is in [docs/DESIGN.md](docs/DESIGN.md).
+contract is in [docs/DESIGN.md](docs/DESIGN.md). New here? Read the friendly
+[user guide](docs/GUIDE.md).
 
 ## Install
 
@@ -60,8 +61,12 @@ name.
 | `T` | theme mixer: choose a theme for each layer |
 | `s` | toggle the sidebar |
 | `n` | toggle desktop notifications |
+| `m` | toggle sound chimes (plays a test chime when turned on) |
+| `L` | show / hide name tags and speech bubbles |
+| `v` | View menu: choose what the office shows |
+| `r` / `i` | reports / boss inbox (friendly reader with status, summary and Markdown) |
 | `c` | clear alerts |
-| `?` | help |
+| `?` | help (sections, scrollable) |
 
 The sidebar and header count tokens **without cache reads**: fresh input, cache writes and output.
 Long sessions re-read their whole context from the prompt cache on every turn, so including cache
@@ -75,6 +80,7 @@ cost always includes cache reads, which are billed at 10% of the input price.
 ```toml
 fps = 12                      # redraw rate
 notifications = true          # macOS notifications for critical alerts and NeedsYou (toggle: n)
+sound = false                 # chimes: Glass needs you, Ping inbox, Basso error (toggle: m, saved)
 sidebar = true
 cost_alert_usd = 50.0         # alert each time a session passes $50, $100, $150, … (0 = off)
 stuck_after_s = 120           # "stuck" alert after this long without events

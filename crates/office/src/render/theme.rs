@@ -414,7 +414,7 @@ mod tests {
         let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes")];
         let names = list(&dirs);
         assert_eq!(names[0], "procedural");
-        for n in ["modern", "cozy", "retro", "cyberpunk", "kenney-cozy", "retro-1bit", "retro-amber", "retro-gameboy"] {
+        for n in ["modern", "cozy", "retro", "cyberpunk", "retro-1bit", "retro-amber", "retro-gameboy"] {
             assert!(names.iter().any(|x| x == n), "{n} not listed: {names:?}");
             let t = load(n, &dirs).unwrap_or_else(|e| panic!("{n}: {e:#}"));
             for s in SPRITE_NAMES {

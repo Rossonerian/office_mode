@@ -1,6 +1,7 @@
 //! Drawing: header, office (compressed Kitty / direct halfblocks / ratatui-image), sidebar, footer, popups.
 use super::fmt::*;
 use super::kitty;
+use super::reader;
 use super::state::{layer_get, App, Popup, LAYERS};
 use super::{guarded, OfficeView};
 use crate::render;
@@ -226,7 +227,7 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
     let max_h = area.height.saturating_sub(2).max(5);
     match &app.popup {
         Popup::None => None,
-        Popup::Help => Some(centered(area, 62, (HELP.len() as u16 + 4).min(max_h))),
+        Popup::Help => Some(centered(area, 78, (help_lines().len() as u16 + 2).min(max_h))),
         Popup::Detail(id) => scene.agents.get(id).map(|a| {
             let lines = detail_lines(app, a, scene, scene.now_ms);
             centered(area, 72, (lines.len() as u16 + 2).min(max_h))
@@ -237,12 +238,12 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
         }
         Popup::Theme { names, .. } => Some(centered(area, 36, (names.len() as u16 + 4).min(max_h))),
         Popup::Mixer { .. } => Some(centered(area, 50, (LAYERS.len() as u16 + 5).min(max_h))),
-        Popup::View { .. } => Some(centered(area, 56, (office_core::config::ShowConfig::ITEMS.len() as u16 + 5).min(max_h))),
+        Popup::View { .. } => Some(centered(area, 66, (office_core::config::ShowConfig::ITEMS.len() as u16 + 8).min(max_h))),
         Popup::Reports { only, inbox, .. } => {
             let n = crate::app::state::report_list_for(scene, only.as_deref(), *inbox).len() as u16;
             Some(centered(area, 100, (n + 4).clamp(6, max_h)))
         }
-        Popup::ReportView { .. } => Some(centered(area, 100, max_h)),
+        Popup::ReportView { .. } => Some(centered(area, 104, max_h)),
     }
 }
 
@@ -295,19 +296,29 @@ fn draw_card(f: &mut Frame, app: &mut App, scene: &Scene, office: Rect) {
         ]),
         Line::from(Span::styled(trunc(&rep.title, w), Style::new().bold())),
     ];
-    for l in rep.body.lines().map(str::trim).filter(|l| !l.is_empty()).take(2) {
-        lines.push(Line::from(Span::styled(trunc(l, w), Style::new().fg(Color::Gray))));
+    let parsed = reader::parse_body(&rep.body);
+    let mut room = 2usize;
+    if let Some((st, col)) = reader::status_line(&parsed) {
+        lines.push(Line::from(Span::styled(trunc(&st, w), Style::new().fg(col))));
+        room -= 1;
+    }
+    for l in reader::summary_of(&parsed.content).lines().map(|l| reader::first_line(l)).filter(|l| !l.is_empty()).take(room) {
+        lines.push(Line::from(Span::styled(trunc(&l, w), Style::new().fg(Color::Gray))));
     }
     f.render_widget(Clear, r);
     f.render_widget(b, r);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The full text of one hand-off: who, when, the brief the sender was given, and what it sent.
-pub fn report_lines(r: &office_core::Report, now_ms: u64) -> Vec<Line<'static>> {
+/// The full text of one hand-off, friendly: who and when, a one-line status, a summary, what it was
+/// asked and what it sent back. `width` is the popup's inner width; text is wrapped by the reader.
+pub fn report_lines(r: &office_core::Report, now_ms: u64, width: usize) -> Vec<Line<'static>> {
     let (tag, c) = report_kind_tag(r.kind);
     let dim = Style::new().fg(Color::DarkGray);
-    let mut v = vec![
+    let margin = if width >= 30 { 2 } else { 0 };
+    let w = width.saturating_sub(margin * 2).clamp(12, reader::MAX_WIDTH);
+    let pad = " ".repeat(margin);
+    let mut v: Vec<Line<'static>> = vec![
         Line::from(vec![
             Span::styled(tag.trim().to_string(), Style::new().fg(c).bold()),
             Span::raw(format!("  {} → {}", r.from_label, r.to_label)),
@@ -315,26 +326,51 @@ pub fn report_lines(r: &office_core::Report, now_ms: u64) -> Vec<Line<'static>> 
         ]),
         Line::from(Span::styled(r.title.clone(), Style::new().bold())),
     ];
-    let mut section = |name: &str, text: &str| {
-        if text.trim().is_empty() {
-            return;
-        }
+    let parsed = reader::parse_body(&r.body);
+    if let Some((st, col)) = reader::status_line(&parsed) {
+        v.push(Line::from(Span::styled(st, Style::new().fg(col).bold())));
+    }
+    for (msg, col) in reader::alert_lines(&parsed) {
+        v.extend(reader::render_markdown(&msg, w).into_iter().map(|l| l.patch_style(Style::new().fg(col).bold())));
+    }
+    let header = |name: &str| Line::from(Span::styled(name.to_string(), Style::new().fg(Color::Yellow).bold()));
+    let content = parsed.content.trim();
+    let nonblank = content.lines().filter(|l| !l.trim().is_empty()).count();
+    let summary = reader::summary_of(content);
+    if nonblank > 8 && !summary.trim().is_empty() {
         v.push(Line::raw(""));
-        v.push(Line::from(Span::styled(format!("── {name} "), dim)));
-        for l in text.lines() {
-            v.push(Line::raw(l.to_string()));
+        v.push(header("Summary"));
+        v.extend(reader::render_markdown(&summary, w));
+        v.push(Line::from(Span::styled("─".repeat(w.min(48)), dim)));
+    }
+    let brief = r.brief.trim();
+    if !brief.is_empty() {
+        v.push(Line::raw(""));
+        v.push(header("What it was asked"));
+        let mut b = reader::render_markdown(brief, w);
+        if b.len() > 8 {
+            let more = b.len() - 8;
+            b.truncate(8);
+            b.push(Line::from(Span::styled(format!("… {more} more lines"), dim)));
         }
-    };
-    section("brief it was given", &r.brief);
-    let body_name = match r.kind {
-        office_core::ReportKind::Task => "brief",
-        office_core::ReportKind::Report => "report",
-        office_core::ReportKind::Result => "result",
-    };
-    section(body_name, &r.body);
-    if r.brief.trim().is_empty() && r.body.trim().is_empty() {
+        v.extend(b.into_iter().map(|l| l.patch_style(Style::new().fg(Color::Gray))));
+    }
+    if !content.is_empty() {
+        v.push(Line::raw(""));
+        v.push(header(match r.kind {
+            office_core::ReportKind::Task => "The brief",
+            _ => "What it sent back",
+        }));
+        v.extend(reader::render_markdown(content, w));
+    }
+    if brief.is_empty() && content.is_empty() {
         v.push(Line::raw(""));
         v.push(Line::from(Span::styled("(no text captured: the brief is filled in when the report comes back)", dim)));
+    }
+    if margin > 0 {
+        for l in v.iter_mut() {
+            l.spans.insert(0, Span::raw(pad.clone()));
+        }
     }
     v
 }
@@ -824,26 +860,87 @@ fn draw_alerts(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: 
 
 // Toast rendering now happens inside draw_footer so it never occludes Kitty graphics.
 
-pub const HELP: &[(&str, &str)] = &[
-    ("q / ctrl-c", "quit"),
-    ("↑↓ / j k, g G", "select agent (or click a row / an agent)"),
-    ("Tab", "jump to next alerting / active agent"),
-    ("enter", "agent details (double-click also opens)"),
-    ("PgUp / PgDn", "scroll agent details"),
-    ("a / d", "approve / deny the pending permission"),
-    ("x", "cancel the selected agy call (asks y/n)"),
-    ("o", "resume the selected Claude session"),
-    ("t", "theme picker (live preview; enter keeps, esc reverts)"),
-    ("[ / ]", "previous / next theme preset"),
-    ("T", "theme mixer (per layer)"),
-    ("v", "View menu: show/hide names, bubbles, zones, cat, ..."),
-    ("L", "labels on/off (names + bubbles)"),
-    ("s", "toggle sidebar"),
-    ("n / m", "toggle notifications / audio chime"),
-    ("c / C", "clear / restore alerts"),
-    ("r", "hand-offs: briefs, reports, results (selected agent's, or all)"),
-    ("i", "boss inbox: results and escalations addressed to you (enter on the card reads)"),
-    ("?", "this help"),
+/// Help sections: (title, [(keys, what it does)]).
+pub const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Moving around",
+        &[
+            ("↑ ↓ / j k", "pick an agent (or click one in the office or the list)"),
+            ("g / G", "jump to the first / last agent"),
+            ("Tab", "jump to the next agent that needs attention"),
+            ("enter", "open the selected agent's details (PgUp/PgDn scrolls)"),
+        ],
+    ),
+    (
+        "Reading work",
+        &[
+            ("r", "reports: what agents were asked and sent back"),
+            ("i", "inbox: results and plans addressed to you"),
+            ("enter", "on the inbox card or in a list: read it in full"),
+        ],
+    ),
+    (
+        "Acting on agents",
+        &[
+            ("a / d", "approve / deny what the agent is asking permission for"),
+            ("x", "cancel the selected agy call (asks y/n first)"),
+            ("o", "resume the selected Claude session in a terminal"),
+            ("g", "inside a report: go to the agent that wrote it"),
+        ],
+    ),
+    (
+        "Display",
+        &[
+            ("v", "view menu: choose what the office shows (names, zones, ...)"),
+            ("L", "show / hide name tags and speech bubbles"),
+            ("t", "theme picker (live preview; enter keeps, esc undoes)"),
+            ("[ ]", "previous / next theme"),
+            ("T", "theme mixer: a different theme per layer"),
+            ("s", "show / hide the sidebar"),
+        ],
+    ),
+    (
+        "Alerts & sound",
+        &[
+            ("n", "desktop notifications on / off"),
+            ("m", "sound chimes on / off (plays a test chime when turned on)"),
+            ("c / C", "clear alerts / bring them back"),
+        ],
+    ),
+    ("Quit", &[("q / ctrl-c", "leave the office (agents keep working)")]),
+];
+
+/// The help popup text, section by section.
+pub fn help_lines() -> Vec<Line<'static>> {
+    let mut v: Vec<Line<'static>> = Vec::new();
+    for (i, (title, rows)) in HELP.iter().enumerate() {
+        if i > 0 {
+            v.push(Line::raw(""));
+        }
+        v.push(Line::from(Span::styled(title.to_string(), Style::new().fg(Color::LightCyan).bold())));
+        for (k, d) in rows.iter() {
+            v.push(Line::from(vec![Span::styled(format!("  {k:<11}"), Style::new().fg(Color::Yellow)), Span::raw(d.to_string())]));
+        }
+    }
+    v.push(Line::raw(""));
+    v.push(Line::from(Span::styled("full guide: docs/GUIDE.md · esc or ? closes", Style::new().fg(Color::DarkGray))));
+    v
+}
+
+/// What each View menu row means (label, one-line explanation), in `ShowConfig::ITEMS` order.
+pub const VIEW_INFO: [(&str, &str); 12] = [
+    ("names", "the name tag above each agent"),
+    ("bubbles", "what each agent is doing right now (speech bubble)"),
+    ("icons", "small !, ?, … and ✓ above heads"),
+    ("nameplates", "the session name on each coloured floor"),
+    ("zones", "the coloured floor under each session"),
+    ("couriers", "postmen carrying briefs and reports"),
+    ("boss visits", "sessions walking to your office with results or plans"),
+    ("cat", "the office cat wandering the aisles"),
+    ("CEO corner", "your corner office (you are the CEO)"),
+    ("council cabin", "meeting room for council members"),
+    ("ambient", "coffee steam, server lights, idle walks"),
+    ("selected only", "show tags and bubbles only for the selected agent and alerts"),
 ];
 
 pub fn detail_lines(app: &App, a: &Agent, scene: &Scene, now_ms: u64) -> Vec<Line<'static>> {
@@ -944,16 +1041,19 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             app.layout.detail_max_scroll = 0;
         }
         Popup::Help => {
-            app.layout.detail_max_scroll = 0;
-            let r = centered(area, 62, (HELP.len() as u16 + 4).min(max_h));
+            let lines = help_lines();
+            let r = centered(area, 78, (lines.len() as u16 + 2).min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " help ".into());
-            let mut lines: Vec<Line> = HELP
-                .iter()
-                .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:<16}"), Style::new().fg(Color::Yellow)), Span::raw(*d)]))
-                .collect();
-            lines.push(Line::from(Span::styled("esc / ? to close", Style::new().fg(Color::DarkGray))));
-            f.render_widget(Paragraph::new(lines), inner);
+            f.render_widget(Clear, r);
+            let mut b = Block::bordered().borders(Borders::ALL).title(" help ").style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+            if lines.len() + 2 > r.height as usize {
+                b = b.title_bottom(Line::from(" ↑↓ / PgUp PgDn scroll · esc close ").right_aligned());
+            }
+            let inner = b.inner(r);
+            app.layout.detail_max_scroll = (lines.len().min(u16::MAX as usize) as u16).saturating_sub(inner.height);
+            app.detail_scroll = app.detail_scroll.min(app.layout.detail_max_scroll);
+            f.render_widget(b, r);
+            f.render_widget(Paragraph::new(lines).scroll((app.detail_scroll, 0)), inner);
         }
         Popup::Detail(id) => {
             let Some(a) = scene.agents.get(id) else {
@@ -1030,24 +1130,20 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 app.layout.popup = Rect::default();
                 return;
             };
-            let lines = report_lines(rep, now_ms);
-            let r = centered(area, 100, max_h);
+            let r = centered(area, 104, max_h);
             app.layout.popup = r;
             let b = Block::bordered()
                 .borders(Borders::ALL)
                 .title(format!(" {} ", trunc(&rep.title, 60)))
-                .title_bottom(Line::from(" ↑↓ scroll · g go · o resume · a/d approve/deny · n/p next/prev · esc back · q close ").right_aligned())
+                .title_bottom(Line::from(" ↑↓ scroll · n/p next/prev · g go to sender · o resume · a/d approve/deny · esc back ").right_aligned())
                 .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
             let inner = b.inner(r);
-            let wrapped: usize = lines
-                .iter()
-                .map(|l| (l.width().max(1) + inner.width.max(1) as usize - 1) / inner.width.max(1) as usize)
-                .sum();
-            app.layout.detail_max_scroll = (wrapped.min(u16::MAX as usize) as u16).saturating_sub(inner.height);
+            let lines = report_lines(rep, now_ms, inner.width as usize);
+            app.layout.detail_max_scroll = (lines.len().min(u16::MAX as usize) as u16).saturating_sub(inner.height);
             app.detail_scroll = app.detail_scroll.min(app.layout.detail_max_scroll);
             f.render_widget(Clear, r);
             f.render_widget(b, r);
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((app.detail_scroll, 0)), inner);
+            f.render_widget(Paragraph::new(lines).scroll((app.detail_scroll, 0)), inner);
         }
         Popup::ConfirmCancel { label, pid, .. } => {
             let text = format!("Cancel {label} (pid {pid})? y/n");
@@ -1058,13 +1154,14 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
         }
         Popup::View { sel } => {
             let items = office_core::config::ShowConfig::ITEMS;
-            let r = centered(area, 56, (items.len() as u16 + 5).min(max_h));
+            let r = centered(area, 66, (items.len() as u16 + 8).min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " view ".into());
-            let mut lines: Vec<Line> = items
+            let inner = popup_frame(f, r, " view: what the office shows ".into());
+            let w = inner.width as usize;
+            let mut lines: Vec<Line> = VIEW_INFO
                 .iter()
                 .enumerate()
-                .map(|(i, (_, label))| {
+                .map(|(i, (label, _))| {
                     let style = if i == *sel { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
                     let mark = if i == *sel { "▶" } else { " " };
                     let b = if app.show.get(i) { "[x]" } else { "[ ]" };
@@ -1072,8 +1169,11 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 })
                 .collect();
             lines.push(Line::raw(""));
+            let desc = VIEW_INFO.get(*sel).map(|(l, d)| format!("{l} — {d}")).unwrap_or_default();
+            lines.push(Line::from(Span::styled(trunc(&desc, w * 2), Style::new().fg(Color::LightCyan))));
+            lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled("↑↓ move  space toggle  a all  h hide overlays  esc save", Style::new().fg(Color::DarkGray))));
-            f.render_widget(Paragraph::new(lines), inner);
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         Popup::Theme { sel, names, .. } => {
             let r = centered(area, 36, (names.len() as u16 + 4).min(max_h));
@@ -1206,7 +1306,7 @@ mod tests {
         let (mut app, scene) = test_app();
         let mut office = OfficeCtx::new(None, None);
         app.popup = Popup::Help;
-        assert!(render(&mut app, &scene, &mut office, 120, 40).contains("theme mixer (per layer)"));
+        assert!(render(&mut app, &scene, &mut office, 120, 40).contains("a different theme per layer") && render(&mut app, &scene, &mut office, 120, 40).contains("docs/GUIDE.md"));
         app.popup = Popup::Detail("cc:office".into());
         let s = render(&mut app, &scene, &mut office, 120, 40);
         assert!(s.contains("perm-1") && s.contains("recent activity") && s.contains("/tmp/office"), "{s}");
@@ -1214,7 +1314,7 @@ mod tests {
         assert!(render(&mut app, &scene, &mut office, 120, 40).contains("Cancel agy-worker (pid 4242)? y/n"));
         app.popup = Popup::View { sel: 1 };
         let s = render(&mut app, &scene, &mut office, 120, 40);
-        assert!(s.contains("▶ [x] speech bubbles") && s.contains("[ ] labels: selected/alert only"), "{s}");
+        assert!(s.contains("▶ [x] bubbles") && s.contains("[ ] selected only") && s.contains("bubbles — what each agent is doing"), "{s}");
         app.popup = Popup::Theme { sel: 2, names: vec!["procedural".into(), "modern".into(), "cozy".into()], orig: crate::app::state::MixSnap(app.mix.clone()) };
         let s = render(&mut app, &scene, &mut office, 120, 40);
         assert!(s.contains("▶ 3 cozy") && s.contains("●1 procedural") && s.contains("custom mix…"), "{s}");
@@ -1234,14 +1334,32 @@ mod tests {
         app.observe(&scene, 62_000, &mut FakeControl::default());
         let s = render(&mut app, &scene, &mut office, 120, 40);
         assert!(s.contains("enter read · esc dismiss · i inbox"), "{s}");
-        assert!(s.contains("from cc·DICE") && s.contains("Turn done") && s.contains("alpha") && s.contains("beta"), "{s}");
-        assert!(!s.contains("gamma"), "only two body lines");
+        assert!(s.contains("from cc·DICE") && s.contains("Turn done") && s.contains("alpha"), "{s}");
+        assert!(!s.contains("gamma"), "summary only");
         assert!(s.contains("✉ 1"), "{s}");
         assert!(app.layout.card.width > 0);
         app.popup = Popup::Reports { sel: 0, only: None, inbox: true };
         let s = render(&mut app, &scene, &mut office, 120, 40);
         assert!(s.contains("inbox · 1 unread") && s.contains("• "), "{s}");
         assert!(!s.contains("enter read ·"), "no card behind a popup");
+    }
+
+    #[test]
+    fn report_view_is_friendly() {
+        let (mut app, mut scene) = test_app();
+        let body = "STATUS: OK\nMODEL: gemini-4-neon-xhigh\nROLE: council-architect\nDURATION_MS: 238000\nRESPONSE:\n# Plan\nFirst **bold** thing with `code`.\n- a\n- b\n";
+        scene.reports.push(office_core::Report {
+            id: 1, at_ms: 60_000, kind: office_core::ReportKind::Result, from: "cc:dice".into(), from_label: "cc·DICE".into(),
+            to: None, to_label: "you".into(), title: "Plan".into(), body: body.into(), brief: "do it".into(),
+        });
+        let mut office = OfficeCtx::new(None, None);
+        app.popup = Popup::ReportView { id: 1, only: None, inbox: true };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("✓ OK · Chief Architect (neon-xhigh) · 3 m 58 s"), "{s}");
+        assert!(s.contains("What it was asked") && s.contains("What it sent back") && s.contains("• a"), "{s}");
+        assert!(!s.contains("STATUS:") && !s.contains("**") && !s.contains("RESPONSE:"), "{s}");
+        let lines = report_lines(&scene.reports[0], 65_000, 100);
+        assert!(lines.iter().all(|l| l.width() <= 100));
     }
 
     #[test]

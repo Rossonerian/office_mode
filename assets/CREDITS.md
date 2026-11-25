@@ -21,9 +21,6 @@ The `procedural` theme, all characters, the 3×5 font and every fallback sprite 
 All by **Kenney (Kenney Vleugels, kenney.nl)**, licence **Creative Commons Zero (CC0 1.0)**. Each folder keeps the
 pack's own `LICENSE.txt` with the source URL appended. Coordinates are catalogued in `vendor/INDEX.md`.
 
-### Roguelike Indoors (`vendor/kenney-roguelike-indoors/`)
-- Source: https://kenney.nl/assets/roguelike-indoors, author Kenney, CC0.
-- Files kept: `roguelikeIndoor_transparent.png` (458x305, 16 px tiles, 1 px gap), `LICENSE.txt`.
 
 ### 1-Bit Pack (`vendor/kenney-1-bit-pack/`)
 - Source: https://kenney.nl/assets/1-bit-pack, author Kenney, CC0.
@@ -36,7 +33,6 @@ pack's own `LICENSE.txt` with the source URL appended. Coordinates are catalogue
 ### Which theme uses which Kenney pack
 | Theme | Packs |
 |---|---|
-| `kenney-cozy` | Roguelike Indoors (plant, chair, sofa, shelf, candle lamp, desk) + Tiny Town (window view) |
 | `retro-1bit`, `retro-amber`, `retro-gameboy` | 1-Bit Pack coloured sheet (door, chair, sofa, plant, shelf), palette-remapped, + Tiny Town (window view) |
-| `cozy`, `midnight` | Tiny Town (window view; `cozy` also Roguelike Indoors as before) |
+| `cozy`, `midnight` | Tiny Town (window view; `cozy` also uses its own `roguelikeIndoor.png`) |
 Theme atlases reference the vendored sheets via `../../vendor/<pack>/<sheet>.png`.

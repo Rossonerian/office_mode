@@ -83,24 +83,6 @@ pub fn resume_claude(cwd: Option<&str>, session_id: &str) -> anyhow::Result<Stri
     Ok(cmd)
 }
 
-/// Non-blocking macOS chime when `sound = true` (no-op elsewhere).
-pub fn play_sound(critical: bool) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    let path = if critical {
-        "/System/Library/Sounds/Sosumi.aiff"
-    } else {
-        "/System/Library/Sounds/Glass.aiff"
-    };
-    if !std::path::Path::new(path).exists() {
-        return;
-    }
-    if let Ok(child) = Command::new("afplay").arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        reap(child);
-    }
-}
-
 fn reap(mut child: std::process::Child) {
     std::thread::spawn(move || {
         let _ = child.wait();

@@ -6,30 +6,9 @@ Cell indices were read off gridded 5-9x enlargements, so they are exact; the nam
 
 | Sheet | File | Size (px) | Grid | Tile | Gap/margin | pitch |
 |---|---|---|---|---|---|---|
-| Roguelike Indoors | `kenney-roguelike-indoors/roguelikeIndoor_transparent.png` | 458x305 | 27 x 18 | 16 | 1 px gap, 0 margin | 17 |
 | 1-Bit Pack (colored) | `kenney-1-bit-pack/colored-transparent_packed.png` | 784x352 | 49 x 22 | 16 | none (packed) | 16 |
 | Tiny Town | `kenney-tiny-town/tilemap_packed.png` | 192x176 | 12 x 11 | 16 | none (packed) | 16 |
 
-## 1. Roguelike Indoors (pitch 17: x = col*17, y = row*17)
-
-Furniture and props only. It has NO floors, walls, doors, windows, clocks, computers or outdoor tiles. Use Tiny Town
-(floors/walls/doors/windows/roofs/trees) or solid colours for the room shell.
-
-- Tables, wooden (3 cells wide = left/mid/right; top row, leg row below): rect (0..2,0)+(0..2,1); oval (3..4,0)+(3..4,1); narrow vertical (5,0)+(5,1); round (6,0)+(6,1), round top (7,0). More plain tables (4..7,2..5) (various leg styles), long benches/tables (4..7,6..8).
-- Tables with tablecloth: orange (0..6,9..11), green (7..13,9..11): long (0..2,9)+(0..2,10), oval (3..4,9..10), vertical (5,9..10), round (6,9..10), small square (0,11), (4..6,11).
-- Cloth runner overlays (table + runner, orange/green) (16..20,8..11) (?).
-- Chairs: front-facing with cushion (0,2),(0,3),(0,7); back-facing (1,2..5); right-facing (2,2..8); left-facing (3,2..8). Plain wood (0..3,4..5), high back (0..1,6..7), grey/white (0..3,8). Top-down cushioned chairs (14..15,9..12) (?).
-- Beds, side view: orange/green (8..9,0..3),(12..15,0..3) (14..15,0..3 green); top-down beds (8..13,6..8) orange/green/cream; plain headboards (8..9,4..5) tan, (12..13,4..5) cream.
-- Sofas/benches: (4..7,6..8) long wooden benches (?); (10..11,3..5) short benches (?).
-- Plants: potted plant (16,0),(17,0) (only plants in the sheet).
-- Lamps: candelabra (19,0),(20,0), lit (19,1),(20,1); floor candle posts (19..20,2..5); wall candles (21..22,0..3); chandeliers (16..18,4..5); table candles (16..19,6); candelabras (16..19,7); wall torches (20..22,6..7).
-- Shelves/bookcases: (19,17) low shelf with potions; (20,17),(21,17) bookcase with potions (last row; bottom may be partly cropped by sheet edge) (?).
-- Kitchen counters/cabinets (grey top + wood front): rows 12..17, cols 0..9 (drawers (1,12), stove grating (4,12..17), jars (5..6,12..17), plates (7,12..17), sink (8,12),(8,14)); wood counters (8..10,15..16); fridge-like (11,15..16) (?).
-- Desks / wide wooden tables: (23..26,10),(23..26,13..14),(23..26,17) plain brown (?); L-shaped orange (23..24,11..12) and green (23..24,15..16) (?).
-- Wall decor: small frames (16..18,12..13); framed paintings/maps (19..21,12..14); wide banner paintings (16..18,14..17); portraits (19..21,15..16); mirrors (22,14..17).
-- Rugs/carpets (?): orange (23..26,0..3), green (23..26,4..7); col 23 and 26 carry fringe/side trim.
-- Dark grey: piano (23..24,8) + (23..24,9) (?); stoves (14..15,14..15), (12..13,17) (?).
-- Misc: ladders (21,8..11), shields (22,8..11), clotheslines (16..18,1..2), pots (16..18,3), barrels/backpacks (21..22,4..5).
 
 ## 2. 1-Bit Pack colored-transparent_packed (pitch 16: x = col*16, y = row*16)
 
@@ -63,4 +42,4 @@ Best sheet for outdoor/window-view scenery and room shells. Colourful with dark 
 - Castle/stone: stone floor 3x3 (0..2,8..10); battlements (3..6,8); tower window (7,8); portcullis gate (3..4,9..10); arch gate (5..6,9); slit wall (5..7,10).
 - Fences: pen 3x3 (8..10,3..5); horizontal (8..10,6); vertical (11,3..5); signpost (11,6); cart/stall (9,4) (?).
 - Props: hay (9,7), beehive (10,7), target (11,7), well/bucket (8,7..8) (?), bomb (9,8), log (10,8), pot (11,8), tools/weapons (7..11,9..10), barrels (10..11,10).
-- Missing: indoor floors/furniture, clocks, computers, lamps (take from Roguelike Indoors / 1-Bit).
+- Missing: indoor floors/furniture, clocks, computers, lamps (take from the 1-Bit pack).

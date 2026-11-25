@@ -1,7 +1,9 @@
 //! Workstream C. TUI: event loop, office widget (ratatui-image), sidebar, keys, control actions, notifications.
+pub mod chime;
 pub mod demo;
 pub mod fmt;
 pub mod kitty;
+pub mod reader;
 pub mod state;
 pub mod ui;
 
@@ -262,8 +264,9 @@ impl Control for RealControl {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
     }
-    fn play_sound(&mut self, critical: bool) {
-        let _ = guarded(|| sources::control::play_sound(critical));
+    fn play_sound(&mut self, chime: chime::Chime) {
+        use chime::SoundPlayer;
+        let _ = guarded(|| chime::AfPlayer.play(chime));
     }
 }
 
@@ -302,8 +305,9 @@ impl Control for DemoControl {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
     }
-    fn play_sound(&mut self, critical: bool) {
-        let _ = guarded(|| sources::control::play_sound(critical));
+    fn play_sound(&mut self, chime: chime::Chime) {
+        use chime::SoundPlayer;
+        let _ = guarded(|| chime::AfPlayer.play(chime));
     }
 }
 
@@ -705,7 +709,7 @@ pub mod testutil {
     pub struct FakeControl {
         pub calls: Vec<String>,
         pub notes: Vec<(String, String)>,
-        pub sounds: Vec<bool>,
+        pub sounds: Vec<chime::Chime>,
         pub fail: bool,
     }
     impl Control for FakeControl {
@@ -733,8 +737,8 @@ pub mod testutil {
         fn notify(&mut self, title: &str, body: &str) {
             self.notes.push((title.into(), body.into()));
         }
-        fn play_sound(&mut self, critical: bool) {
-            self.sounds.push(critical);
+        fn play_sound(&mut self, chime: chime::Chime) {
+            self.sounds.push(chime);
         }
     }
 }
