@@ -2,6 +2,7 @@
 //! message) and its final report (its hand-back, or its last assistant text), and a session's
 //! last answer. Bounded reads only; every function returns None rather than failing.
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -80,6 +81,62 @@ pub fn last_report(path: &Path) -> Option<String> {
     None
 }
 
+/// The final report in an Antigravity CLI transcript: the last PLANNER_RESPONSE / MODEL content,
+/// falling back to `last_report`.
+pub fn last_agy_report(path: &Path) -> Option<String> {
+    let text = read_range(path, true, TAIL_BYTES)?;
+    for line in text.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let is_planner = v.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE");
+        let is_model = v.get("source").and_then(Value::as_str) == Some("MODEL");
+        if !is_planner && !is_model {
+            continue;
+        }
+        if let Some(c) = v.get("content").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            return Some(c.to_string());
+        }
+    }
+    last_report(path)
+}
+
+/// Sum token usage (`(input_tokens, cache_read_tokens, output_tokens, latest_model)`) from an
+/// Antigravity CLI transcript, deduplicating repeated `step_index` entries (keeping the latest).
+pub fn agy_usage(path: &Path) -> Option<(u64, u64, u64, Option<String>)> {
+    let text = read_range(path, true, TAIL_BYTES)?;
+    let mut seen_steps = HashSet::new();
+    let mut tokens_in = 0u64;
+    let mut cache_read = 0u64;
+    let mut tokens_out = 0u64;
+    let mut latest_model: Option<String> = None;
+    let mut found_tokens = false;
+
+    for line in text.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if latest_model.is_none() {
+            if let Some(m) = v.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()) {
+                latest_model = Some(m.to_string());
+            }
+        }
+        let ti = v.get("input_tokens").and_then(Value::as_u64);
+        let cr = v.get("cache_read_tokens").and_then(Value::as_u64);
+        let to = v.get("output_tokens").and_then(Value::as_u64);
+        if ti.is_none() && cr.is_none() && to.is_none() {
+            continue;
+        }
+        if let Some(idx) = v.get("step_index").and_then(Value::as_u64) {
+            if !seen_steps.insert(idx) {
+                continue;
+            }
+        }
+        found_tokens = true;
+        tokens_in += ti.unwrap_or(0);
+        cache_read += cr.unwrap_or(0);
+        tokens_out += to.unwrap_or(0);
+    }
+
+    found_tokens.then_some((tokens_in, cache_read, tokens_out, latest_model))
+}
+
 /// The brief a subagent was given: its first user message.
 pub fn first_brief(path: &Path) -> Option<String> {
     let text = read_range(path, false, HEAD_BYTES)?;
@@ -122,6 +179,35 @@ mod tests {
         assert_eq!(last_report(&agent).as_deref(), Some("STATUS: OK\nWork order ready"));
         assert_eq!(subagent_description(&agent).as_deref(), Some("Backend work order"));
         assert_eq!(title_of("\n## Plan: fix it\nmore", 40), "Plan: fix it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_agy_report_and_usage() {
+        let dir = std::env::temp_dir().join(format!("office-agy-reports-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let agy = dir.join("agy.jsonl");
+        let agy_lines = [
+            r#"{"step_index":1,"source":"USER","type":"GENERIC","content":"hi"}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"RUNNING","model":"gemini-3-pro","input_tokens":100,"cache_read_tokens":200,"output_tokens":50,"content":"partial"}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","model":"gemini-3-pro","input_tokens":120,"cache_read_tokens":300,"output_tokens":80,"content":"Step 2 answer"}"#,
+            r#"{"step_index":3,"type":"GENERIC","content":"tool output"}"#,
+            r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","model":"gemini-4-neon-high","input_tokens":3064,"cache_read_tokens":23353,"output_tokens":4010,"content":"Final agy summary\nDetails here","thinking":"..."}"#,
+            r#"{"step_index":6,"source":"MODEL","type":"GENERIC","content":"   "}"#,
+        ];
+        std::fs::write(&agy, agy_lines.join("\n")).unwrap();
+        assert_eq!(last_agy_report(&agy).as_deref(), Some("Final agy summary\nDetails here"));
+        assert_eq!(
+            agy_usage(&agy),
+            Some((120 + 3064, 300 + 23353, 80 + 4010, Some("gemini-4-neon-high".to_string())))
+        );
+
+        let fallback = dir.join("claude_fallback.jsonl");
+        std::fs::write(&fallback, r#"{"message":{"role":"assistant","content":"Claude fallback report"}}"#).unwrap();
+        assert_eq!(last_agy_report(&fallback).as_deref(), Some("Claude fallback report"));
+        assert_eq!(agy_usage(&fallback), None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

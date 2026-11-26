@@ -1,6 +1,6 @@
 //! ROSSO watcher: tails every recent job's `logbook.jsonl` (deliveries) and `mailroom.jsonl`
 //! (escalations, refusals) under `~/.claude/run/rosso/` and emits `EventKind::RossoMail`.
-use office_core::model::{Alert, AlertLevel, WaveCall, WaveState};
+use office_core::model::{Alert, AlertLevel, AutoJob, ReportKind, WaveCall, WaveState};
 use office_core::{config::Config, paths, Event, EventKind, SourceKind};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -29,6 +29,9 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
         let mut initial = true;
         let mut last_trays: Option<std::time::Instant> = None;
         let mut last_waves: BTreeMap<String, WaveState> = BTreeMap::new();
+        let mut last_auto_jobs: Vec<AutoJob> = Vec::new();
+        let mut seen_auto_docs: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+        let mut auto_initial = true;
         loop {
             let mut evs = poll(&dir, &mut tails, initial);
             if last_trays.map_or(true, |t| t.elapsed() >= TRAY_EVERY) {
@@ -38,6 +41,13 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
                 if waves != last_waves {
                     last_waves = waves.clone();
                     evs.push(EventKind::Waves(waves));
+                }
+                let auto_jobs = scan_auto_jobs(&dir);
+                evs.extend(auto_doc_events(&dir, &auto_jobs, &mut seen_auto_docs, auto_initial));
+                auto_initial = false;
+                if auto_jobs != last_auto_jobs {
+                    last_auto_jobs = auto_jobs.clone();
+                    evs.push(EventKind::AutoJobs(auto_jobs));
                 }
             }
             for k in evs {
@@ -341,6 +351,154 @@ pub fn scan_waves(dir: &Path, now_ms: u64) -> BTreeMap<String, WaveState> {
     out
 }
 
+fn u32_field(v: &Value, k: &str) -> u32 {
+    v.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0)
+}
+
+fn read_doc_bounded(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(128 * 1024).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).chars().take(MAX_BODY_CHARS).collect())
+}
+
+/// Scan `<rosso_dir>/<job>/auto.json` for `rosso-auto` autonomous pipeline snapshots.
+pub fn scan_auto_jobs(rosso_dir: &Path) -> Vec<AutoJob> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(rosso_dir) else { return out };
+    for e in rd.flatten().take(256) {
+        let jd = e.path();
+        if !jd.is_dir() {
+            continue;
+        }
+        let Some(v) = read_json_bounded(&jd.join("auto.json")) else { continue };
+        let dir_name = e.file_name().to_string_lossy().into_owned();
+        let job = s(&v, "job").unwrap_or(&dir_name).to_string();
+        let started_at = v
+            .get("startedAt")
+            .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(parse_iso_ms)))
+            .unwrap_or(0);
+        out.push(AutoJob {
+            job,
+            task: s(&v, "task").unwrap_or("").to_string(),
+            flow: s(&v, "flow").unwrap_or("").to_string(),
+            phase: s(&v, "phase").unwrap_or("").to_string(),
+            status: s(&v, "status").unwrap_or("").to_string(),
+            calls_used: u32_field(&v, "callsUsed"),
+            max_calls: u32_field(&v, "maxCalls"),
+            started_at,
+            elapsed_base_ms: v.get("elapsedBaseMs").and_then(Value::as_u64).unwrap_or(0),
+            max_minutes: u32_field(&v, "maxMinutes"),
+            driver_pid: v.get("driverPid").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+            abort_requested: v.get("abortRequested").and_then(Value::as_bool).unwrap_or(false),
+            active_calls: v.get("activeCalls").and_then(Value::as_object).map(|m| m.len()).unwrap_or(0),
+            ruling: v.get("arbitration").and_then(|a| s(a, "ruling")).map(str::to_string),
+            branch: s(&v, "branch").map(str::to_string),
+            worktree_path: s(&v, "worktreePath").map(str::to_string),
+            report_path: s(&v, "reportPath").map(str::to_string),
+            needs_path: s(&v, "needsPath").map(str::to_string),
+            last_error: s(&v, "lastError").map(str::to_string),
+        });
+    }
+    out.sort_by(|a, b| {
+        (b.status == "running")
+            .cmp(&(a.status == "running"))
+            .then_with(|| b.started_at.cmp(&a.started_at))
+            .then_with(|| a.job.cmp(&b.job))
+    });
+    out
+}
+
+/// Scan `REPORT.md` / `NEEDS_USER_INPUT.md` for `AutoJob`s, emitting Boss Inbox `Report` handoffs
+/// and non-initial `Alert`s while deduplicating unchanged files across polls.
+pub fn auto_doc_events(
+    rosso_dir: &Path,
+    jobs: &[AutoJob],
+    seen: &mut HashMap<PathBuf, (u64, u64)>,
+    initial: bool,
+) -> Vec<EventKind> {
+    let mut out = Vec::new();
+    for j in jobs {
+        let report_path = j
+            .report_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| rosso_dir.join(&j.job).join("REPORT.md"));
+        let needs_path = j
+            .needs_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| rosso_dir.join(&j.job).join("NEEDS_USER_INPUT.md"));
+
+        for (path, is_needs) in [(report_path, false), (needs_path, true)] {
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta.modified().ok();
+            let sig = (modified.map(mtime_ms).unwrap_or(0), meta.len());
+            if seen.get(&path) == Some(&sig) {
+                continue;
+            }
+            seen.insert(path.clone(), sig);
+
+            if initial && !modified.is_some_and(is_fresh_time) {
+                continue;
+            }
+            let Some(body) = read_doc_bounded(&path) else { continue };
+            let title = if is_needs {
+                format!("rosso-auto {}: NEEDS_USER_INPUT", j.job)
+            } else if let Some(ruling) = j.ruling.as_deref().filter(|s| !s.is_empty()) {
+                format!("rosso-auto {}: REPORT ({ruling})", j.job)
+            } else if !j.status.is_empty() {
+                format!("rosso-auto {}: REPORT ({})", j.job, j.status)
+            } else {
+                format!("rosso-auto {}: REPORT", j.job)
+            };
+            out.push(EventKind::Handoff {
+                from: format!("rosso-auto:{}", j.job),
+                to: None,
+                kind: ReportKind::Report,
+                title,
+                body,
+                brief: j.task.clone(),
+            });
+            if !initial {
+                let (level, code, message) = if is_needs {
+                    let phase = if j.phase.is_empty() { "stopped" } else { &j.phase };
+                    (
+                        AlertLevel::Warn,
+                        "rosso_needs_input",
+                        format!("rosso-auto {}: needs user input ({phase})", j.job),
+                    )
+                } else {
+                    let level = if j.status == "done" { AlertLevel::Info } else { AlertLevel::Warn };
+                    let status = if j.status.is_empty() { "done" } else { &j.status };
+                    (
+                        level,
+                        "rosso_report",
+                        format!("rosso-auto {}: report ready ({status})", j.job),
+                    )
+                };
+                out.push(EventKind::Alert(Alert {
+                    at_ms: paths::now_ms(),
+                    level,
+                    agent: None,
+                    code: code.into(),
+                    message,
+                }));
+            }
+        }
+    }
+    if seen.len() > 512 {
+        let keep: std::collections::HashSet<&str> = jobs.iter().map(|j| j.job.as_str()).collect();
+        seen.retain(|p, _| p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| keep.contains(n)));
+    }
+    out
+}
+
 fn new_lines(path: &Path, tails: &mut Tails, initial: bool) -> Vec<String> {
     let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -605,6 +763,157 @@ mod tests {
         assert_eq!(w2.done, 1);
         assert_eq!(w2.relay_inflight, 0);
         assert_eq!(w2.pending, 2); // 3 Seat participants - 1 done = 2
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scans_auto_jobs_and_parses_camel_case_fields() {
+        let d = std::env::temp_dir().join(format!("office-auto-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let j1 = d.join("auto-login-1");
+        let j2 = d.join("auto-done-2");
+        std::fs::create_dir_all(&j1).unwrap();
+        std::fs::create_dir_all(&j2).unwrap();
+        std::fs::write(
+            j1.join("auto.json"),
+            r#"{
+                "job": "auto-login-1",
+                "task": "Fix auth flow",
+                "flow": "council",
+                "phase": "execute",
+                "status": "running",
+                "callsUsed": 7,
+                "maxCalls": 25,
+                "startedAt": "2026-11-25T15:10:00Z",
+                "elapsedBaseMs": 12000,
+                "maxMinutes": 90,
+                "driverPid": 4321,
+                "abortRequested": false,
+                "activeCalls": {
+                    "worker-1": {"role": "worker", "pid": 5001},
+                    "tester-1": {"role": "tester", "pid": 5002}
+                },
+                "arbitration": {"ruling": "APPROVE"},
+                "branch": "agy/auto-login-1",
+                "worktreePath": "/tmp/wt",
+                "reportPath": "",
+                "needsPath": "",
+                "lastError": ""
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            j2.join("auto.json"),
+            r#"{
+                "job": "auto-done-2",
+                "task": "Refactor cache",
+                "flow": "simple",
+                "phase": "report",
+                "status": "done",
+                "callsUsed": 4,
+                "maxCalls": 25,
+                "startedAt": "bad-timestamp",
+                "elapsedBaseMs": 45000,
+                "maxMinutes": 90,
+                "driverPid": null,
+                "abortRequested": true,
+                "activeCalls": {},
+                "reportPath": "/tmp/r2/REPORT.md",
+                "lastError": "boom"
+            }"#,
+        )
+        .unwrap();
+
+        let jobs = scan_auto_jobs(&d);
+        assert_eq!(jobs.len(), 2);
+        // Running job comes first
+        assert_eq!(jobs[0].job, "auto-login-1");
+        assert_eq!(jobs[0].task, "Fix auth flow");
+        assert_eq!(jobs[0].flow, "council");
+        assert_eq!(jobs[0].phase, "execute");
+        assert_eq!(jobs[0].status, "running");
+        assert_eq!((jobs[0].calls_used, jobs[0].max_calls), (7, 25));
+        assert_eq!(jobs[0].started_at, parse_iso_ms("2026-11-25T15:10:00Z").unwrap());
+        assert_eq!((jobs[0].elapsed_base_ms, jobs[0].max_minutes), (12_000, 90));
+        assert_eq!(jobs[0].driver_pid, Some(4321));
+        assert!(!jobs[0].abort_requested);
+        assert_eq!(jobs[0].active_calls, 2);
+        assert_eq!(jobs[0].ruling.as_deref(), Some("APPROVE"));
+        assert_eq!(jobs[0].branch.as_deref(), Some("agy/auto-login-1"));
+        assert_eq!(jobs[0].worktree_path.as_deref(), Some("/tmp/wt"));
+        assert_eq!(jobs[0].report_path, None);
+        assert_eq!(jobs[0].needs_path, None);
+        assert_eq!(jobs[0].last_error, None);
+
+        assert_eq!(jobs[1].job, "auto-done-2");
+        assert_eq!(jobs[1].started_at, 0);
+        assert_eq!(jobs[1].driver_pid, None);
+        assert!(jobs[1].abort_requested);
+        assert_eq!(jobs[1].active_calls, 0);
+        assert_eq!(jobs[1].report_path.as_deref(), Some("/tmp/r2/REPORT.md"));
+        assert_eq!(jobs[1].last_error.as_deref(), Some("boom"));
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn emits_auto_doc_reports_and_non_initial_alerts_without_duplicates() {
+        let d = std::env::temp_dir().join(format!("office-auto-docs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let jdir = d.join("auto-doc-1");
+        std::fs::create_dir_all(&jdir).unwrap();
+        let report_file = jdir.join("REPORT.md");
+        std::fs::write(&report_file, "# Final Report\nAll green.").unwrap();
+
+        let job = AutoJob {
+            job: "auto-doc-1".into(),
+            task: "Ship feature".into(),
+            flow: "council".into(),
+            phase: "report".into(),
+            status: "done".into(),
+            ruling: Some("APPROVE".into()),
+            report_path: Some(report_file.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let jobs = vec![job];
+        let mut seen = HashMap::new();
+
+        // Initial poll emits Boss Inbox Report Handoff, but NO Alert
+        let evs1 = auto_doc_events(&d, &jobs, &mut seen, true);
+        assert_eq!(evs1.len(), 1, "{evs1:?}");
+        assert!(matches!(
+            &evs1[0],
+            EventKind::Handoff { from, to: None, kind: ReportKind::Report, title, body, brief }
+            if from == "rosso-auto:auto-doc-1"
+                && title == "rosso-auto auto-doc-1: REPORT (APPROVE)"
+                && body.contains("All green.")
+                && brief == "Ship feature"
+        ));
+
+        // Second poll with unchanged files emits nothing (no duplicate spam)
+        assert!(auto_doc_events(&d, &jobs, &mut seen, false).is_empty());
+
+        // New NEEDS_USER_INPUT.md written later -> emits Report Handoff + Warn Alert
+        let needs_file = jdir.join("NEEDS_USER_INPUT.md");
+        std::fs::write(&needs_file, "Security VETO: confirm override").unwrap();
+        let evs3 = auto_doc_events(&d, &jobs, &mut seen, false);
+        assert_eq!(evs3.len(), 2, "{evs3:?}");
+        assert!(matches!(
+            &evs3[0],
+            EventKind::Handoff { from, to: None, kind: ReportKind::Report, title, body, .. }
+            if from == "rosso-auto:auto-doc-1"
+                && title == "rosso-auto auto-doc-1: NEEDS_USER_INPUT"
+                && body.contains("Security VETO")
+        ));
+        assert!(matches!(
+            &evs3[1],
+            EventKind::Alert(Alert { level: AlertLevel::Warn, code, message, .. })
+            if code == "rosso_needs_input" && message.contains("auto-doc-1")
+        ));
+
+        // Unchanged on next poll -> nothing
+        assert!(auto_doc_events(&d, &jobs, &mut seen, false).is_empty());
 
         let _ = std::fs::remove_dir_all(&d);
     }

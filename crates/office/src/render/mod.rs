@@ -1073,7 +1073,12 @@ impl Renderer {
         }
 
         if self.show.ambient {
-            if let Some(w) = office_core::rosso::latest_wave(scene) {
+            let wave = office_core::rosso::latest_wave(scene);
+            if let Some(aj) = office_core::rosso::latest_auto_job(scene).filter(|aj| aj.status == "running" || wave.is_none()) {
+                let t_sec = ((t % 1_000_000) as f32) / 1000.0;
+                let ar = extras::draw_auto_strip(img, furn_t, lay.w / 2, WALL_H + 2, aj, t_sec);
+                reserved.push(ar);
+            } else if let Some(w) = wave {
                 let wr = extras::draw_wave_strip(img, furn_t, lay.w / 2, WALL_H + 2, w, t);
                 reserved.push(wr);
             }
@@ -2759,5 +2764,64 @@ mod tests {
         assert_ne!(extras::chip_colors("FAIL", 0).0, extras::chip_colors("FAIL", 400).0, "red pulses");
         assert_eq!(extras::entry_tag("claude-desktop"), "DESKTOP");
         assert_eq!(extras::entry_tag("cli"), "CLI");
+    }
+
+    #[test]
+    fn auto_strip_priority_over_wave_strip() {
+        let now = 9_000_000;
+        let mut r = quiet_renderer();
+        let base = rosso_scene(now);
+
+        let mut with_wave = base.clone();
+        with_wave.waves.insert(
+            "w1".into(),
+            office_core::WaveState {
+                job: "w1".into(),
+                plan: "council".into(),
+                updated_ms: now,
+                done: 1,
+                relay_inflight: 0,
+                pending: 2,
+                calls: vec![],
+            },
+        );
+        let wave_img = r.compose(&with_wave, None, 1280, 720, now);
+
+        // Running AutoJob overrides wave strip
+        let mut with_running = with_wave.clone();
+        with_running.auto_jobs.push(office_core::AutoJob {
+            job: "a1".into(),
+            flow: "council".into(),
+            phase: "critique".into(),
+            status: "running".into(),
+            calls_used: 3,
+            max_calls: 10,
+            started_at: now,
+            ..Default::default()
+        });
+        let running_img = r.compose(&with_running, None, 1280, 720, now);
+        assert_ne!(running_img.as_raw(), wave_img.as_raw());
+
+        // Non-running AutoJob defers to wave strip when a wave is present
+        let mut with_done_and_wave = with_wave.clone();
+        with_done_and_wave.auto_jobs.push(office_core::AutoJob {
+            job: "a1".into(),
+            flow: "council".into(),
+            phase: "report".into(),
+            status: "done".into(),
+            calls_used: 8,
+            max_calls: 10,
+            started_at: now,
+            ..Default::default()
+        });
+        let done_wave_img = r.compose(&with_done_and_wave, None, 1280, 720, now);
+        assert_eq!(done_wave_img.as_raw(), wave_img.as_raw());
+
+        // Non-running AutoJob renders when no wave is present
+        let mut with_done_only = base;
+        with_done_only.auto_jobs = with_done_and_wave.auto_jobs;
+        let base_img = r.compose(&rosso_scene(now), None, 1280, 720, now);
+        let done_only_img = r.compose(&with_done_only, None, 1280, 720, now);
+        assert_ne!(done_only_img.as_raw(), base_img.as_raw());
     }
 }

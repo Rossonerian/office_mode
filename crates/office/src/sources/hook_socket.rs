@@ -402,14 +402,23 @@ fn cwd_hash6(c: &str) -> u32 {
     (h & 0x00ff_ffff) as u32
 }
 
-/// Antigravity CLI hook payloads: field names vary, so accept snake/camel variants.
+/// Antigravity CLI hook payloads: protojson camelCase + snake_case variants.
 fn decode_antigravity(p: &Value, hook_event: Option<&str>, _request_id: Option<String>, at: u64) -> Vec<Event> {
     let name = hook_event.or_else(|| s(p, &["hook_event_name", "hookEventName", "event"])).unwrap_or("");
-    let cwd = s(p, &["cwd", "workspace", "workspaceRoot"]).map(str::to_string);
-    let sid = s(p, &["session_id", "sessionId", "conversation_id", "conversationId"])
+    let cwd = s(p, &["cwd", "workspace", "workspaceRoot"])
+        .or_else(|| {
+            p.get("workspacePaths")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.iter().filter_map(Value::as_str).find(|x| !x.is_empty()))
+        })
+        .map(str::to_string);
+    let raw_sid = s(p, &["conversationId", "conversation_id", "sessionId", "session_id"]);
+    let sid = raw_sid
         .map(str::to_string)
         .or_else(|| cwd.clone().map(|c| format!("cwd-{}-{:06x}", paths::sanitize_id(&basename(&c)), cwd_hash6(&c))));
     let Some(sid) = sid else { return vec![] };
+    let resume_id = raw_sid.map(str::to_string);
+    let model = s(p, &["modelName", "model"]).filter(|m| *m != "auto").map(str::to_string);
     let id = format!("ag:{sid}");
     let src = SourceKind::AgyHook;
     let mut out = vec![ev(
@@ -420,29 +429,92 @@ fn decode_antigravity(p: &Value, hook_event: Option<&str>, _request_id: Option<S
             kind: AgentKind::Other,
             label: Some(format!("ag·{}", cwd.as_deref().map(basename).unwrap_or_else(|| "agy".into()))),
             parent: None,
-            cwd: cwd.clone(),
+            cwd,
             role: None,
-            model: s(p, &["model"]).map(str::to_string),
+            model,
             slot: None,
             pid: p.get("pid").and_then(Value::as_u64).map(|x| x as u32),
-            resume_id: None,
+            resume_id,
         },
     )];
-    let tool = s(p, &["tool_name", "toolName", "tool"]).unwrap_or("").to_string();
-    let input = p.get("tool_input").or_else(|| p.get("toolInput")).or_else(|| p.get("args")).cloned().unwrap_or(Value::Null);
+    let tool_call = p.get("toolCall");
+    let tool = tool_call
+        .and_then(|tc| s(tc, &["name"]))
+        .or_else(|| s(p, &["tool_name", "toolName", "tool"]))
+        .unwrap_or("")
+        .to_string();
+    let input = tool_call
+        .and_then(|tc| tc.get("args"))
+        .or_else(|| p.get("tool_input"))
+        .or_else(|| p.get("toolInput"))
+        .or_else(|| p.get("args"))
+        .cloned()
+        .unwrap_or(Value::Null);
     match name {
         "PreToolUse" | "BeforeTool" => {
-            out.push(ev(at, src, EventKind::ToolStart { id: id.clone(), tool: tool.clone(), summary: tool_summary(&tool, &input) }))
+            out.push(ev(at, src, EventKind::ToolStart { id: id.clone(), tool: tool.clone(), summary: tool_summary(&tool, &input) }));
         }
         "PostToolUse" | "AfterTool" => {
-            let ok = p.get("error").map(Value::is_null).unwrap_or(true);
-            out.push(ev(at, src, EventKind::ToolEnd { id: id.clone(), tool, ok }))
+            let ok = match p.get("error") {
+                None | Some(Value::Null) | Some(Value::Bool(false)) => true,
+                Some(Value::String(st)) => st.trim().is_empty(),
+                _ => false,
+            };
+            out.push(ev(at, src, EventKind::ToolEnd { id: id.clone(), tool, ok }));
         }
-        "UserPromptSubmit" | "BeforeAgent" => {
-            out.push(ev(at, src, EventKind::State { id: id.clone(), state: AgentState::Thinking, activity: None }))
+        "UserPromptSubmit" | "PreInvocation" | "BeforeAgent" => {
+            let activity = s(p, &["lastUserInput", "prompt"]).map(|x| short(x, 40));
+            out.push(ev(at, src, EventKind::State { id: id.clone(), state: AgentState::Thinking, activity }));
+        }
+        "PostInvocation" => {
+            out.push(ev(at, src, EventKind::State { id: id.clone(), state: AgentState::Thinking, activity: None }));
         }
         "Stop" | "AfterAgent" => {
-            out.push(ev(at, src, EventKind::State { id: id.clone(), state: AgentState::Idle, activity: Some(String::new()) }))
+            let err_str = s(p, &["error"]).filter(|e| !e.trim().is_empty());
+            let term = s(p, &["terminationReason"]).unwrap_or("");
+            if err_str.is_some() || term == "ERROR" {
+                let activity = err_str.or((!term.is_empty()).then_some(term)).map(|x| short(x, 40));
+                out.push(ev(at, src, EventKind::State { id: id.clone(), state: AgentState::Error, activity }));
+            } else {
+                out.push(ev(at, src, EventKind::State { id: id.clone(), state: AgentState::Idle, activity: Some(String::new()) }));
+            }
+            let tp = s(p, &["transcriptPath", "transcript_path"]);
+            if let Some(tp_str) = tp {
+                if let Some((ti, cr, to, um)) = reports::agy_usage(Path::new(tp_str)) {
+                    out.push(ev(
+                        at,
+                        src,
+                        EventKind::Usage {
+                            id: id.clone(),
+                            tokens_in: ti,
+                            tokens_out: to,
+                            tokens_cache_read: cr,
+                            tokens_cache_write: 0,
+                            cost_usd: 0.0,
+                            context_pct: None,
+                            model: um,
+                        },
+                    ));
+                }
+            }
+            let body = s(p, &["last_assistant_message", "lastAssistantMessage", "response"])
+                .filter(|b| !b.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| tp.and_then(|t| reports::last_agy_report(Path::new(t))));
+            if let Some(body) = body.filter(|b| !b.trim().is_empty()) {
+                out.push(ev(
+                    at,
+                    src,
+                    EventKind::Handoff {
+                        from: id,
+                        to: None,
+                        kind: ReportKind::Result,
+                        title: reports::title_of(&body, 60),
+                        body,
+                        brief: s(p, &["lastUserInput", "prompt"]).unwrap_or("").to_string(),
+                    },
+                ));
+            }
         }
         "SessionEnd" => out.push(ev(at, src, EventKind::Gone { id })),
         _ => {}
@@ -541,6 +613,79 @@ mod tests {
         assert!(matches!(&evs[1].kind, EventKind::ToolStart { summary, .. } if summary == "a.rs"));
     }
 
+    #[test]
+    fn decodes_antigravity_camel_case_events() {
+        // PreInvocation with conversationId, workspacePaths, lastUserInput, modelName
+        let pre_inv = r#"{"source":"antigravity","hook_event":"PreInvocation","payload":{"conversationId":"conv-123","workspacePaths":["/work/my-proj"],"lastUserInput":"fix the login bug","modelName":"gemini-4-neon-high"}}"#;
+        let evs = decode_line(pre_inv, 10);
+        assert_eq!(kinds(&evs), vec!["AgentSeen", "State"]);
+        assert!(matches!(
+            &evs[0].kind,
+            EventKind::AgentSeen { id, cwd: Some(cwd), label: Some(label), model: Some(model), resume_id: Some(rid), .. }
+            if id == "ag:conv-123" && cwd == "/work/my-proj" && label == "ag·my-proj" && model == "gemini-4-neon-high" && rid == "conv-123"
+        ));
+        assert!(matches!(
+            &evs[1].kind,
+            EventKind::State { id, state: AgentState::Thinking, activity: Some(act) }
+            if id == "ag:conv-123" && act == "fix the login bug"
+        ));
+
+        // PreToolUse with toolCall
+        let pre_tool = r#"{"source":"antigravity","hook_event":"PreToolUse","payload":{"conversationId":"conv-123","workspacePaths":["/work/my-proj"],"toolCall":{"name":"run_command","args":{"CommandLine":"cargo test"}}}}"#;
+        let evs = decode_line(pre_tool, 11);
+        assert_eq!(kinds(&evs), vec!["AgentSeen", "ToolStart"]);
+        assert!(matches!(
+            &evs[1].kind,
+            EventKind::ToolStart { id, tool, summary }
+            if id == "ag:conv-123" && tool == "run_command" && summary == "cargo test"
+        ));
+
+        // PostToolUse: empty string error -> ok: true; non-empty error -> ok: false
+        let post_ok = r#"{"source":"antigravity","hook_event":"PostToolUse","payload":{"conversationId":"conv-123","toolCall":{"name":"run_command"},"error":""}}"#;
+        let evs = decode_line(post_ok, 12);
+        assert!(matches!(&evs[1].kind, EventKind::ToolEnd { tool, ok: true, .. } if tool == "run_command"));
+
+        let post_err = r#"{"source":"antigravity","hook_event":"PostToolUse","payload":{"conversationId":"conv-123","toolCall":{"name":"run_command"},"error":"exit 1"}}"#;
+        let evs = decode_line(post_err, 13);
+        assert!(matches!(&evs[1].kind, EventKind::ToolEnd { tool, ok: false, .. } if tool == "run_command"));
+
+        // Stop with transcriptPath -> Usage + Boss Inbox Handoff
+        let dir = std::env::temp_dir().join(format!("office-ag-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tp = dir.join("transcript.jsonl");
+        let t_lines = [
+            r###"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","model":"gemini-4-neon-high","input_tokens":100,"cache_read_tokens":500,"output_tokens":40,"content":"## All fixed\nPatched auth."}"###,
+        ];
+        std::fs::write(&tp, t_lines.join("\n")).unwrap();
+        let stop = serde_json::json!({
+            "source": "antigravity",
+            "hook_event": "Stop",
+            "payload": {
+                "conversationId": "conv-123",
+                "workspacePaths": ["/work/my-proj"],
+                "modelName": "auto",
+                "lastUserInput": "fix the login bug",
+                "transcriptPath": tp.to_string_lossy(),
+            }
+        })
+        .to_string();
+        let evs = decode_line(&stop, 14);
+        assert_eq!(kinds(&evs), vec!["AgentSeen", "State", "Usage", "Handoff"]);
+        assert!(matches!(&evs[0].kind, EventKind::AgentSeen { model: None, .. }));
+        assert!(matches!(&evs[1].kind, EventKind::State { state: AgentState::Idle, .. }));
+        assert!(matches!(
+            &evs[2].kind,
+            EventKind::Usage { id, tokens_in: 100, tokens_out: 40, tokens_cache_read: 500, model: Some(m), .. }
+            if id == "ag:conv-123" && m == "gemini-4-neon-high"
+        ));
+        assert!(matches!(
+            &evs[3].kind,
+            EventKind::Handoff { from, to: None, kind: ReportKind::Result, title, body, brief }
+            if from == "ag:conv-123" && title == "All fixed" && body == "## All fixed\nPatched auth." && brief == "fix the login bug"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Integration: listener on a temp socket <- built office-hook binary <- sample PreToolUse JSON.
     #[test]
     fn office_hook_binary_delivers_event() {
@@ -598,6 +743,25 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"{}").unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    #[test]
+    fn office_hook_antigravity_exits_silently() {
+        let bin = office_hook_bin();
+        let mut child = Command::new(&bin)
+            .env("OFFICE_SOCKET", "/nonexistent/dir/x.sock")
+            .env("OFFICE_SOURCE", "antigravity")
+            .args(["--hook-event", "Stop"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{}").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.is_empty());
     }
 
     #[test]

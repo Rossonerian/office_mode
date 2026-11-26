@@ -190,6 +190,9 @@ pub struct Scene {
     /// Explicit dispatch mode per top-level session id.
     #[serde(default)]
     pub dispatch_modes: BTreeMap<AgentId, DispatchMode>,
+    /// Active/recent `rosso-auto` autonomous pipeline jobs.
+    #[serde(default)]
+    pub auto_jobs: Vec<AutoJob>,
     pub alerts: Vec<Alert>,
     pub router: RouterStatus,
     pub total_tokens: u64,
@@ -268,4 +271,29 @@ pub enum DispatchMode {
     Direct,
     Relay,
     Hybrid,
+}
+
+/// Snapshot of a `rosso-auto` autonomous pipeline job (`~/.claude/run/rosso/<job>/auto.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoJob {
+    pub job: String,
+    pub task: String,
+    pub flow: String,
+    pub phase: String,
+    pub status: String,
+    pub calls_used: u32,
+    pub max_calls: u32,
+    /// Unix epoch milliseconds when the job started (0 if unknown).
+    pub started_at: u64,
+    pub elapsed_base_ms: u64,
+    pub max_minutes: u32,
+    pub driver_pid: Option<u32>,
+    pub abort_requested: bool,
+    pub active_calls: usize,
+    pub ruling: Option<String>,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub report_path: Option<String>,
+    pub needs_path: Option<String>,
+    pub last_error: Option<String>,
 }

@@ -6,8 +6,8 @@ use super::character::{self, Arms, Legs, Pose};
 use super::font;
 use super::theme::Theme;
 use image::RgbaImage;
-use office_core::rosso::verdict_class;
-use office_core::{DispatchMode, QueueTicket, WaveState};
+use office_core::rosso::{auto_phase_progress, verdict_class};
+use office_core::{AutoJob, DispatchMode, QueueTicket, WaveState};
 
 /// How long the guard keeps his hand up after a denial.
 pub const GUARD_ALERT_MS: u64 = 6_000;
@@ -346,6 +346,99 @@ pub fn draw_wave_strip(img: &mut RgbaImage, th: &Theme, cx: i32, y: i32, wave: &
     [x, y, w, h]
 }
 
+fn lerp_col(a: Col, b: Col, t: f32) -> Col {
+    let k = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k).round().clamp(0.0, 255.0) as u8;
+    [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]), 255]
+}
+
+fn auto_status_colors(status: &str, t: f32) -> (Col, Col) {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "running" => {
+            let pulse = (t * 0.713 * std::f32::consts::TAU).cos() * 0.5 + 0.5;
+            (rgb(0x3fae6a), lerp_col(rgb(0x1f6b43), rgb(0x52f296), pulse))
+        }
+        "needs_user_input" => (rgb(0xf2b134), rgb(0xffd23f)),
+        "done" => (rgb(0x4aa3df), rgb(0x7cc4f5)),
+        _ => (rgb(0xe03c3c), rgb(0xff6b6b)),
+    }
+}
+
+fn auto_phase_label(phase: &str) -> String {
+    let cleaned: String = phase
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c.to_ascii_uppercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "INIT".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `rosso-auto` back-wall status pill centered horizontally at `cx` with top `y` (clamped inside
+/// image bounds). Returns its `[x, y, w, h]` rect for overlay collision avoidance.
+pub fn draw_auto_strip(img: &mut RgbaImage, th: &Theme, cx: i32, y: i32, aj: &AutoJob, t: f32) -> [i32; 4] {
+    let h = 12;
+    let max_y = (img.height() as i32 - h - 2).max(2);
+    let y = y.clamp(2, max_y);
+    let max_w = (img.width() as i32 - 4).max(16);
+    let (step, total) = auto_phase_progress(&aj.flow, &aj.phase);
+    let min_bar_w = if total > 0 { (6 + total as i32 * 4).min(max_w) } else { 24.min(max_w) };
+
+    let phase = auto_phase_label(&aj.phase);
+    let raw_txt = format!("AUTO {} {}/{}", phase, aj.calls_used, aj.max_calls);
+    let txt = font::truncate(&raw_txt, (max_w - 12).max(0));
+    let tw = font::text_width(&txt);
+    let w = (12 + tw).max(min_bar_w).min(max_w);
+    let max_x = (img.width() as i32 - w - 2).max(2);
+    let x = (cx - w / 2).clamp(2, max_x);
+
+    let f = |c: Col| th.fx.apply(c);
+    let (border, dot) = auto_status_colors(&aj.status, t);
+    let is_done = aj.status.trim().eq_ignore_ascii_case("done");
+
+    fill(img, x, y, w, h, f(rgb(0x181c24)));
+    outline(img, x, y, w, h, f(border));
+    fill(img, x + 3, y + 3, 3, 3, f(dot));
+    font::draw_text(img, x + 8, y + 2, &txt, f(rgb(0xfbfaf5)));
+
+    let bar_x = x + 3;
+    let bar_w = (w - 6).max(1);
+    if total > 0 {
+        for i in 0..total {
+            let sx0 = bar_x + (i as i32 * (bar_w + 1)) / total as i32;
+            let sx1 = bar_x + ((i as i32 + 1) * (bar_w + 1)) / total as i32 - 1;
+            let sw = (sx1 - sx0).max(1);
+            let idx = i + 1;
+            let col = if idx < step || (idx == step && is_done) {
+                border
+            } else if idx == step {
+                dot
+            } else {
+                rgb(0x2c3444)
+            };
+            fill(img, sx0, y + 8, sw, 2, f(col));
+        }
+    } else {
+        fill(img, bar_x, y + 8, bar_w, 2, f(rgb(0x2c3444)));
+        if aj.max_calls > 0 && aj.calls_used > 0 {
+            let filled = ((aj.calls_used as i64 * bar_w as i64) / aj.max_calls as i64).clamp(1, bar_w as i64) as i32;
+            fill(img, bar_x, y + 8, filled, 2, f(border));
+        }
+    }
+
+    [x, y, w, h]
+}
+
 /// Dispatch route tag (`DIRECT`, `RELAY`, `DIR+RLY`) centered at `cx` with top `y`.
 pub fn draw_dispatch_tag(img: &mut RgbaImage, th: &Theme, cx: i32, y: i32, mode: DispatchMode) {
     let (txt, bg) = match mode {
@@ -457,5 +550,56 @@ mod tests {
         let tag = guard_tag_candidates(100, 100)[0];
         let icon = guard_icon_candidates(100, 100)[0];
         assert!(!super::super::rects_overlap(tag, icon));
+    }
+
+    #[test]
+    fn auto_strip_draws_pill_and_clamps_y() {
+        let mut img = RgbaImage::new(240, 40);
+        let th = super::super::theme::procedural();
+        let aj = AutoJob {
+            job: "auto-1".into(),
+            flow: "council".into(),
+            phase: "critique".into(),
+            status: "running".into(),
+            calls_used: 4,
+            max_calls: 12,
+            ..Default::default()
+        };
+
+        let rect = draw_auto_strip(&mut img, &th, 120, 0, &aj, 0.0);
+        assert_eq!(rect[1], 2);
+        assert_eq!(rect[3], 12);
+        assert!(rect[2] > 60);
+        assert_eq!(img.get_pixel(rect[0] as u32, rect[1] as u32).0, rgb(0x3fae6a));
+        assert_eq!(img.get_pixel((rect[0] + 1) as u32, (rect[1] + 1) as u32).0, rgb(0x181c24));
+        // segmented bar: first segment completed (green), last segment pending (dark slate)
+        assert_eq!(img.get_pixel((rect[0] + 3) as u32, (rect[1] + 8) as u32).0, rgb(0x3fae6a));
+        assert_eq!(img.get_pixel((rect[0] + rect[2] - 4) as u32, (rect[1] + 8) as u32).0, rgb(0x2c3444));
+
+        // pulsing dot changes with time t while status is running
+        let dot_t0 = img.get_pixel((rect[0] + 3) as u32, (rect[1] + 3) as u32).0;
+        let mut img_t1 = RgbaImage::new(240, 40);
+        draw_auto_strip(&mut img_t1, &th, 120, 0, &aj, 0.5);
+        let dot_t1 = img_t1.get_pixel((rect[0] + 3) as u32, (rect[1] + 3) as u32).0;
+        assert_ne!(dot_t0, dot_t1);
+
+        // bottom y clamping inside image bounds
+        let mut img_bot = RgbaImage::new(240, 40);
+        let bot_rect = draw_auto_strip(&mut img_bot, &th, 120, 100, &aj, 0.0);
+        assert_eq!(bot_rect[1], 40 - 12 - 2);
+        assert!(bot_rect[1] + bot_rect[3] <= 40);
+
+        // status border color coding for warn / done / error
+        for (status, expected) in [
+            ("needs_user_input", rgb(0xf2b134)),
+            ("done", rgb(0x4aa3df)),
+            ("timeout", rgb(0xe03c3c)),
+        ] {
+            let mut s_img = RgbaImage::new(240, 40);
+            let mut s_aj = aj.clone();
+            s_aj.status = status.into();
+            let r = draw_auto_strip(&mut s_img, &th, 120, 4, &s_aj, 0.0);
+            assert_eq!(s_img.get_pixel(r[0] as u32, r[1] as u32).0, expected, "status {status}");
+        }
     }
 }

@@ -20,7 +20,7 @@ pub const CLAUDE_EVENTS: &[&str] = &[
     "SessionEnd",
     "StopFailure",
 ];
-const AG_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"];
+const AG_EVENTS: &[&str] = &["SessionStart", "PreInvocation", "PostInvocation", "PreToolUse", "PostToolUse", "Stop"];
 const AG_PLUGIN: &str = "agent-office";
 /// Every command we install contains this marker; uninstall removes exactly those.
 const MARKER: &str = "OFFICE_SOURCE=";
@@ -300,7 +300,29 @@ pub fn doctor() -> anyhow::Result<()> {
         },
     }
     let ag = gemini_plugins_dir().join(AG_PLUGIN).join("hooks.json");
-    println!("{}antigravity  {}", ok(ag.exists()), ag.display());
+    match std::fs::read_to_string(&ag) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("-- antigravity  {} missing", ag.display()),
+        Err(e) => println!("-- antigravity  {} unreadable: {e}", ag.display()),
+        Ok(s) => match serde_json::from_str::<Value>(&s) {
+            Err(e) => println!("-- antigravity  {} invalid JSON: {e}", ag.display()),
+            Ok(v) => {
+                let events = v.get(AG_PLUGIN).and_then(Value::as_object);
+                let present = events.map(|m| m.len()).unwrap_or(0);
+                let missing: Vec<&str> = AG_EVENTS
+                    .iter()
+                    .copied()
+                    .filter(|e| !events.is_some_and(|m| m.contains_key(*e)))
+                    .collect();
+                println!(
+                    "{}antigravity  {} [{present}/{} events{}]",
+                    ok(missing.is_empty()),
+                    ag.display(),
+                    AG_EVENTS.len(),
+                    if missing.is_empty() { String::new() } else { format!(", missing: {}", missing.join(",")) }
+                );
+            }
+        },
+    }
 
     let route = Path::new(&cfg.agy_route);
     if route.exists() {
@@ -411,8 +433,21 @@ mod tests {
         let d = tmpdir("ag");
         write_antigravity_plugin(&d.join(AG_PLUGIN), Path::new("/x/office-hook")).unwrap();
         let h: Value = serde_json::from_str(&std::fs::read_to_string(d.join(AG_PLUGIN).join("hooks.json")).unwrap()).unwrap();
-        assert_eq!(h[AG_PLUGIN]["Stop"][0]["command"], "OFFICE_SOURCE=antigravity '/x/office-hook' --hook-event Stop");
-        assert_eq!(h[AG_PLUGIN]["PreToolUse"][0]["matcher"], "*");
+        let events = h[AG_PLUGIN].as_object().unwrap();
+        assert_eq!(events.len(), AG_EVENTS.len());
+        for ev in ["SessionStart", "PreInvocation", "PostInvocation", "Stop"] {
+            assert_eq!(
+                h[AG_PLUGIN][ev][0]["command"],
+                format!("OFFICE_SOURCE=antigravity '/x/office-hook' --hook-event {ev}")
+            );
+        }
+        for ev in ["PreToolUse", "PostToolUse"] {
+            assert_eq!(h[AG_PLUGIN][ev][0]["matcher"], "*");
+            assert_eq!(
+                h[AG_PLUGIN][ev][0]["hooks"][0]["command"],
+                format!("OFFICE_SOURCE=antigravity '/x/office-hook' --hook-event {ev}")
+            );
+        }
         let p: Value = serde_json::from_str(&std::fs::read_to_string(d.join(AG_PLUGIN).join("plugin.json")).unwrap()).unwrap();
         assert_eq!(p["name"], AG_PLUGIN);
         let _ = std::fs::remove_dir_all(&d);

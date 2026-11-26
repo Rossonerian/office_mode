@@ -1,7 +1,7 @@
 //! Data behind the sidebar tabs (Jobs, Activity, Stats): derived from the scene, pure and tested.
 use super::fmt::state_color;
 use super::reader::{self, Verdict};
-use office_core::{AgentId, AgentState, AlertLevel, Report, ReportKind, Scene};
+use office_core::{AgentId, AgentState, AlertLevel, AutoJob, Report, ReportKind, Scene};
 use ratatui::style::Color;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -124,15 +124,51 @@ pub struct JobRow {
     /// Report id of the newest document (what Enter opens).
     pub last_report: u64,
     pub wave: Option<office_core::WaveState>,
+    pub auto: Option<AutoJob>,
 }
 
-/// One row per ROSSO job seen in the scene's hand-offs, most recently active first.
+fn auto_status(aj: &AutoJob) -> JobStatus {
+    match aj.status.trim().to_ascii_lowercase().as_str() {
+        "running" | "active" => JobStatus::Active,
+        "done" | "completed" | "complete" => JobStatus::Done,
+        "needs_input" | "needs-input" | "blocked" | "paused" | "waiting" => JobStatus::Blocked,
+        "failed" | "error" | "aborted" | "timeout" | "timed_out" => JobStatus::Failed,
+        _ if aj.needs_path.is_some() => JobStatus::Blocked,
+        _ if aj.last_error.is_some() => JobStatus::Failed,
+        _ => JobStatus::Idle,
+    }
+}
+
+fn auto_ratio(aj: &AutoJob, status: JobStatus) -> f64 {
+    if status == JobStatus::Done {
+        return 1.0;
+    }
+    let (step, total) = office_core::rosso::auto_phase_progress(&aj.flow, &aj.phase);
+    if total > 0 {
+        step as f64 / total as f64
+    } else {
+        0.0
+    }
+}
+
+/// One row per ROSSO job seen in the scene's hand-offs, waves, or `rosso-auto` jobs, most recently active first.
 pub fn jobs(scene: &Scene) -> Vec<JobRow> {
     let mut by_job: BTreeMap<&str, Vec<&Report>> = BTreeMap::new();
     for r in &scene.reports {
         if let Some(j) = scene.report_jobs.get(&r.id) {
             by_job.entry(j.as_str()).or_default().push(r);
         }
+    }
+    let mut auto_by_name: BTreeMap<&str, &AutoJob> = BTreeMap::new();
+    for aj in &scene.auto_jobs {
+        auto_by_name
+            .entry(aj.job.as_str())
+            .and_modify(|cur| {
+                if (aj.status == "running", aj.started_at) > (cur.status == "running", cur.started_at) {
+                    *cur = aj;
+                }
+            })
+            .or_insert(aj);
     }
     let mut rows: Vec<JobRow> = Vec::new();
     for (name, reps) in &by_job {
@@ -174,6 +210,7 @@ pub fn jobs(scene: &Scene) -> Vec<JobRow> {
             ratio: stage.map(|s| (s + 1) as f64 / STAGES.len() as f64).unwrap_or(0.0),
             last_report: last.id,
             wave: scene.waves.get(*name).cloned(),
+            auto: None,
         });
     }
     for (name, w) in &scene.waves {
@@ -195,6 +232,60 @@ pub fn jobs(scene: &Scene) -> Vec<JobRow> {
             ratio: if tot > 0 { w.done as f64 / tot as f64 } else { 0.0 },
             last_report: 0,
             wave: Some(w.clone()),
+            auto: None,
+        });
+    }
+    for row in &mut rows {
+        if let Some(&aj) = auto_by_name.get(row.name.as_str()) {
+            let a_status = auto_status(aj);
+            if a_status != JobStatus::Idle {
+                row.status = a_status;
+            }
+            row.ratio = row.ratio.max(auto_ratio(aj, a_status));
+            if row.verdict.is_none() {
+                row.verdict = aj
+                    .ruling
+                    .as_deref()
+                    .and_then(|s| Verdict::from_word(&s.trim().to_ascii_uppercase(), false));
+            }
+            row.last_ms = row.last_ms.max(aj.started_at);
+            row.auto = Some(aj.clone());
+        }
+    }
+    for (name, aj) in auto_by_name {
+        if rows.iter().any(|r| r.name == name) {
+            continue;
+        }
+        let status = auto_status(aj);
+        let (step, total) = office_core::rosso::auto_phase_progress(&aj.flow, &aj.phase);
+        let title = if aj.task.trim().is_empty() {
+            format!("auto {}", aj.flow)
+        } else {
+            aj.task.clone()
+        };
+        let flow = if total > 0 {
+            format!("auto {} · {} ({}/{})", aj.flow, aj.phase, step, total)
+        } else if !aj.flow.is_empty() {
+            format!("auto {} · {}", aj.flow, aj.phase)
+        } else {
+            format!("auto {}", aj.phase)
+        };
+        rows.push(JobRow {
+            name: aj.job.clone(),
+            title,
+            flow,
+            status,
+            docs: 0,
+            verdict: aj
+                .ruling
+                .as_deref()
+                .and_then(|s| Verdict::from_word(&s.trim().to_ascii_uppercase(), false)),
+            last_ms: aj.started_at,
+            stage: None,
+            ratio: auto_ratio(aj, status),
+            last_report: 0,
+            wave: None,
+            auto: Some(aj.clone()),
         });
     }
     rows.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then_with(|| a.name.cmp(&b.name)));
@@ -525,6 +616,59 @@ mod tests {
         assert_eq!(wave_done.status, JobStatus::Done);
         assert_eq!(wave_done.verdict, Some(Verdict::Revise));
         assert!((wave_done.ratio - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn jobs_attach_auto_and_synthesize_auto_only_jobs() {
+        let mut s = job_scene();
+        // Make j-login appear idle by age, then attach an active AutoJob at phase execute (6/8 = 0.75).
+        s.now_ms = 2_000_000;
+        s.auto_jobs.push(AutoJob {
+            job: "j-login".into(),
+            task: "Add login".into(),
+            flow: "council".into(),
+            phase: "execute".into(),
+            status: "running".into(),
+            calls_used: 4,
+            max_calls: 12,
+            started_at: 96_000,
+            ..Default::default()
+        });
+        // Synthesize an auto-only job in the simple flow at phase design (2/5 = 0.4).
+        s.auto_jobs.push(AutoJob {
+            job: "j-auto-only".into(),
+            task: "Refactor auth".into(),
+            flow: "simple".into(),
+            phase: "design".into(),
+            status: "done".into(),
+            calls_used: 3,
+            max_calls: 6,
+            started_at: 120_000,
+            ruling: Some("APPROVE".into()),
+            ..Default::default()
+        });
+
+        let js = jobs(&s);
+        assert_eq!(js.len(), 3);
+
+        let auto_only = &js[0];
+        assert_eq!(auto_only.name, "j-auto-only");
+        assert_eq!(auto_only.title, "Refactor auth");
+        assert_eq!(auto_only.flow, "auto simple · design (2/5)");
+        assert_eq!(auto_only.status, JobStatus::Done);
+        assert_eq!(auto_only.verdict, Some(Verdict::Approve));
+        assert!((auto_only.ratio - 1.0).abs() < 1e-9);
+        assert_eq!(auto_only.last_report, 0);
+        assert_eq!(auto_only.auto.as_ref().map(|a| a.calls_used), Some(3));
+
+        let login = js.iter().find(|j| j.name == "j-login").unwrap();
+        assert_eq!(login.status, JobStatus::Active);
+        assert!((login.ratio - 0.75).abs() < 1e-9);
+        assert_eq!(login.last_ms, 96_000);
+        assert_eq!(login.auto.as_ref().map(|a| a.phase.as_str()), Some("execute"));
+
+        let cache = js.iter().find(|j| j.name == "j-cache").unwrap();
+        assert_eq!(cache.auto, None);
     }
 
     #[test]

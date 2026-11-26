@@ -227,6 +227,28 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
 }
 
+fn confirm_cancel_text(scene: &Scene, id: &str, label: &str, pid: u32) -> String {
+    match scene.agents.get(id).and_then(|a| a.rss_mb) {
+        Some(rss) => format!("Cancel {label} (pid {pid}, ~{rss} MB)? y/n"),
+        None => format!("Cancel {label} (pid {pid})? y/n"),
+    }
+}
+
+fn approve_all_text_and_w(items: &[(String, String, String)]) -> (String, String, u16) {
+    let msg = format!("Approve all {} pending permissions? y/n", items.len());
+    let names: String = items.iter().map(|(_, l, _)| l.as_str()).collect::<Vec<_>>().join(", ");
+    let w = msg.chars().count().max(names.chars().count().min(60)) as u16 + 6;
+    (msg, names, w.clamp(42, 72))
+}
+
+fn confirm_abort_auto_text(job: &str, phase: &str) -> String {
+    if phase.is_empty() {
+        format!("Abort auto job {job}?")
+    } else {
+        format!("Abort auto job {job} (phase {phase})?")
+    }
+}
+
 pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
     let max_h = area.height.saturating_sub(2).max(5);
     match &app.popup {
@@ -236,8 +258,8 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
             let lines = detail_lines(app, a, scene, scene.now_ms);
             centered(area, 72, (lines.len() as u16 + 2).min(max_h))
         }),
-        Popup::ConfirmCancel { label, pid, .. } => {
-            let text = format!("Cancel {label} (pid {pid})? y/n");
+        Popup::ConfirmCancel { id, label, pid } => {
+            let text = confirm_cancel_text(scene, id, label, *pid);
             Some(centered(area, text.chars().count() as u16 + 6, 3))
         }
         Popup::Theme { names, .. } => Some(centered(area, 36, (names.len() as u16 + 4).min(max_h))),
@@ -248,6 +270,25 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
             Some(centered(area, 100, (n + 4).clamp(6, max_h)))
         }
         Popup::ReportView { .. } => Some(centered(area, 104, max_h)),
+        Popup::FreeRam { targets, .. } => {
+            let rows = targets.len().max(1) as u16;
+            Some(centered(area, 78, (rows + 7).clamp(8, max_h)))
+        }
+        Popup::Dispatch { .. } => Some(centered(area, 76, 14.min(max_h))),
+        Popup::Actions { .. } => {
+            let n = super::state::ACTIONS.len() as u16;
+            Some(centered(area, 56, (n + 5).min(max_h)))
+        }
+        Popup::ConfirmApproveAll { items } => {
+            let (_, _, w) = approve_all_text_and_w(items);
+            Some(centered(area, w, 5.min(max_h)))
+        }
+        Popup::ConfirmAbortAuto { job, phase } => {
+            let msg = confirm_abort_auto_text(job, phase);
+            let hint = "Y / Enter abort · N / Esc cancel";
+            let w = msg.chars().count().max(hint.chars().count()) as u16 + 6;
+            Some(centered(area, w, 4.min(max_h)))
+        }
     }
 }
 
@@ -340,6 +381,7 @@ pub fn draw(f: &mut Frame, app: &mut App, scene: &Scene, office: &mut OfficeCtx,
             app.layout.alert_rows = Rect::default();
             app.layout.alert_agent_ids.clear();
             app.layout.side_tabs = Rect::default();
+            app.layout.free_ram_btn = Rect::default();
         }
     }
     draw_card(f, app, scene, office_area);
@@ -456,11 +498,21 @@ fn draw_footer(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
         }
         if a.kind == AgentKind::Agy {
             spans.push(Span::styled("  x cancel", Style::new().fg(Color::LightRed)));
-        } else if matches!(a.kind, AgentKind::Claude | AgentKind::ClaudeSub) {
+        } else if a.pid.is_some() {
+            spans.push(Span::styled("  x stop", Style::new().fg(Color::LightRed)));
+        }
+        if matches!(a.kind, AgentKind::Claude | AgentKind::ClaudeSub) || a.resume_id.as_deref().is_some_and(|s| !s.is_empty()) {
             spans.push(Span::styled("  o resume", Style::new().fg(Color::Cyan)));
         }
     }
-    spans.push(Span::styled("  1-4 tabs  Tab jump  r reports  t theme  [ ] cycle  T mix  v view  L labels  s side  ? help", dim));
+    if !scene.reports.is_empty() {
+        spans.push(Span::styled("  r reports", dim));
+    }
+    if scene.reports.iter().any(|r| r.to.is_none()) {
+        spans.push(Span::styled("  i inbox", Style::new().fg(Color::Yellow)));
+    }
+    spans.push(Span::styled("  p task  f reply  K ram  Space menu  ? help", dim));
+    spans.push(Span::styled("  1-4 tabs  Tab jump  t theme  [ ] cycle  T mix  v view  L labels  s side", dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -613,9 +665,15 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms:
             app.layout.alert_rows = Rect::default();
             app.layout.alert_agent_ids.clear();
             match other {
-                SideTab::Jobs => draw_jobs(f, app, scene, content, now_ms),
-                SideTab::Activity => draw_activity(f, app, scene, content, now_ms),
-                _ => draw_stats(f, app, scene, content),
+                SideTab::Jobs => {
+                    app.layout.free_ram_btn = Rect::default();
+                    draw_jobs(f, app, scene, content, now_ms);
+                }
+                SideTab::Activity => {
+                    app.layout.free_ram_btn = Rect::default();
+                    draw_activity(f, app, scene, content, now_ms);
+                }
+                _ => draw_stats(f, app, scene, content, now_ms),
             }
         }
     }
@@ -632,23 +690,65 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
+fn draw_free_ram_btn(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u64) {
+    if area.width == 0 || area.height == 0 {
+        app.layout.free_ram_btn = Rect::default();
+        return;
+    }
+    let cands = super::state::idle_kill_candidates(scene, now_ms);
+    let total_mb: u32 = cands.iter().map(|c| c.rss_mb).sum();
+    let orphans = scene.router_extra.orphans;
+    let text = if !cands.is_empty() && total_mb > 0 {
+        format!(" [K] Free RAM (~{total_mb} MB · {} idle) ", cands.len())
+    } else if !cands.is_empty() {
+        format!(" [K] Free RAM ({} idle) ", cands.len())
+    } else if orphans > 0 {
+        format!(" [K] Free RAM ({orphans} orphan agy) ")
+    } else {
+        " [K] Free RAM (0 idle) ".to_string()
+    };
+    let style = if !cands.is_empty() || orphans > 0 {
+        Style::new().bg(Color::Rgb(0x3a, 0x2e, 0x16)).fg(Color::Yellow).bold()
+    } else {
+        Style::new().bg(Color::Rgb(0x22, 0x25, 0x2c)).fg(Color::DarkGray)
+    };
+    app.layout.free_ram_btn = area;
+    f.render_widget(Paragraph::new(trunc(&text, area.width as usize)).style(style), area);
+}
+
 fn draw_agents_panel(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u64) {
     if area.height < 12 {
         app.layout.alert_rows = Rect::default();
         app.layout.alert_agent_ids.clear();
+        app.layout.free_ram_btn = Rect::default();
         draw_agents(f, app, scene, area, now_ms);
     } else if area.height < 18 {
         app.layout.alert_rows = Rect::default();
         app.layout.alert_agent_ids.clear();
+        app.layout.free_ram_btn = Rect::default();
         let [agents, router] = Layout::vertical([Constraint::Min(4), Constraint::Length(6)]).areas(area);
         draw_agents(f, app, scene, agents, now_ms);
         draw_router(f, scene, router);
-    } else {
+    } else if area.height < 20 {
+        app.layout.free_ram_btn = Rect::default();
         let alerts_h = (area.height / 3).clamp(4, 10);
         let [agents, router, alerts] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(6), Constraint::Length(alerts_h)]).areas(area);
         draw_agents(f, app, scene, agents, now_ms);
         draw_router(f, scene, router);
+        draw_alerts(f, app, scene, alerts, now_ms);
+    } else {
+        let alerts_h = (area.height / 3).clamp(4, 10);
+        let [agents, router, ram_btn, alerts] = Layout::vertical([
+            Constraint::Min(4),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(alerts_h),
+        ])
+        .areas(area);
+        draw_agents(f, app, scene, agents, now_ms);
+        draw_router(f, scene, router);
+        draw_free_ram_btn(f, app, scene, ram_btn, now_ms);
         draw_alerts(f, app, scene, alerts, now_ms);
     }
 }
@@ -677,7 +777,9 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
         return;
     }
     let w = inner.width as usize;
-    let row_h = |j: &panels::JobRow| -> u16 { if j.wave.is_some() { 4 } else { 3 } };
+    let row_h = |j: &panels::JobRow| -> u16 {
+        3 + u16::from(j.wave.is_some()) + if j.auto.is_some() { 2 } else { 0 }
+    };
     let sel = app.jobs_sel.min(rows.len() - 1);
     let mut offset = 0usize;
     let mut span: u16 = rows[..=sel].iter().map(row_h).sum();
@@ -725,7 +827,17 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
         if h >= 3 {
             let label = match j.stage {
                 Some(s) => format!("{}/{} {}", s + 1, panels::STAGES.len(), panels::STAGES[s]),
-                None => format!("0/{} no stage yet", panels::STAGES.len()),
+                None => match &j.auto {
+                    Some(aj) => {
+                        let (step, total) = office_core::rosso::auto_phase_progress(&aj.flow, &aj.phase);
+                        if total > 0 {
+                            format!("{step}/{total} {}", aj.phase)
+                        } else {
+                            aj.phase.clone()
+                        }
+                    }
+                    None => format!("0/{} no stage yet", panels::STAGES.len()),
+                },
             };
             let g = LineGauge::default()
                 .ratio(j.ratio.clamp(0.0, 1.0))
@@ -735,7 +847,8 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
                 .style(bg);
             f.render_widget(g, Rect::new(inner.x, y + 2, inner.width, 1));
         }
-        if h >= 4 {
+        let mut extra_y = y + 3;
+        if extra_y < y + h {
             if let Some(wave) = &j.wave {
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 let plan_max = w.saturating_sub(18).max(4);
@@ -777,7 +890,52 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
                     spans.push(Span::raw(" "));
                     spans.push(Span::styled(tok, Style::new().fg(col).bold()));
                 }
-                f.render_widget(Paragraph::new(Line::from(spans)).style(bg), Rect::new(inner.x, y + 3, inner.width, 1));
+                f.render_widget(Paragraph::new(Line::from(spans)).style(bg), Rect::new(inner.x, extra_y, inner.width, 1));
+                extra_y += 1;
+            }
+        }
+        if extra_y < y + h {
+            if let Some(aj) = &j.auto {
+                let (step, total) = office_core::rosso::auto_phase_progress(&aj.flow, &aj.phase);
+                let phase_str = if total > 0 {
+                    format!("{} ({step}/{total})", aj.phase)
+                } else {
+                    aj.phase.clone()
+                };
+                let rest = format!("{} {phase_str} {}/{}", aj.flow, aj.calls_used, aj.max_calls);
+                let status_line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("AUTO", Style::new().fg(Color::Cyan).bold()),
+                    Span::raw(" "),
+                    Span::styled(trunc(&rest, w.saturating_sub(7)), Style::new().fg(Color::Gray)),
+                ]);
+                f.render_widget(Paragraph::new(status_line).style(bg), Rect::new(inner.x, extra_y, inner.width, 1));
+                extra_y += 1;
+
+                if extra_y < y + h {
+                    let hint = "[R]esume / [X]abort";
+                    let hint_w = hint.chars().count();
+                    let detail_budget = w.saturating_sub(2 + 3 + hint_w);
+                    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+                    if let Some(err) = aj.last_error.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        let txt = trunc(&format!("err: {err}"), detail_budget);
+                        spans.push(Span::styled(txt, Style::new().fg(Color::LightRed)));
+                        spans.push(Span::styled(" · ", dim));
+                    } else if let Some(ruling) = aj.ruling.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        let col = reader::Verdict::from_word(&ruling.to_ascii_uppercase(), false)
+                            .map(|v| v.color())
+                            .unwrap_or(Color::Yellow);
+                        let txt = trunc(ruling, detail_budget);
+                        spans.push(Span::styled(txt, Style::new().fg(col).bold()));
+                        spans.push(Span::styled(" · ", dim));
+                    } else if aj.abort_requested {
+                        let txt = trunc("aborting…", detail_budget);
+                        spans.push(Span::styled(txt, Style::new().fg(Color::Yellow)));
+                        spans.push(Span::styled(" · ", dim));
+                    }
+                    spans.push(Span::styled(trunc(hint, w.saturating_sub(2)), dim));
+                    f.render_widget(Paragraph::new(Line::from(spans)).style(bg), Rect::new(inner.x, extra_y, inner.width, 1));
+                }
             }
         }
     }
@@ -814,18 +972,19 @@ fn draw_activity(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u6
     f.render_stateful_widget(l, area, &mut st);
 }
 
-fn draw_stats(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
+fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u64) {
     let block = Block::bordered().title(" Stats ");
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width < 10 {
+        app.layout.free_ram_btn = Rect::default();
         return;
     }
     let dim = Style::new().fg(Color::DarkGray);
     let h = inner.height as usize;
     let mut cons = vec![Constraint::Length(1); 4];
     let mut used = 4;
-    let (mut has_cost, mut has_active, mut has_bars) = (false, false, false);
+    let (mut has_cost, mut has_active, mut has_bars, mut has_ram_btn) = (false, false, false, false);
     if h >= used + 2 {
         cons.push(Constraint::Length(2));
         has_cost = true;
@@ -839,6 +998,10 @@ fn draw_stats(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
     if h >= used + 4 {
         cons.push(Constraint::Min(4));
         has_bars = true;
+        if h >= used + 5 {
+            cons.push(Constraint::Length(1));
+            has_ram_btn = true;
+        }
     }
     let areas = Layout::vertical(cons).split(inner);
     let w = inner.width as usize;
@@ -901,6 +1064,7 @@ fn draw_stats(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
     }
     if has_bars {
         let a = areas[next];
+        next += 1;
         let [l, chart] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(a);
         f.render_widget(Paragraph::new("cost per session").style(Style::new().fg(Color::Gray)), l);
         let costs = panels::session_costs(scene, (chart.height as usize).min(6));
@@ -924,6 +1088,11 @@ fn draw_stats(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
                 .data(BarGroup::default().bars(&bars)),
             chart,
         );
+    }
+    if has_ram_btn {
+        draw_free_ram_btn(f, app, scene, areas[next], now_ms);
+    } else {
+        app.layout.free_ram_btn = Rect::default();
     }
 }
 
@@ -1240,20 +1409,23 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Reading work",
         &[
-            ("r", "reports: what agents were asked and sent back"),
-            ("i", "inbox: results and plans addressed to you"),
+            ("r / i", "reports (hand-offs) / inbox addressed to you"),
             ("enter", "on the inbox card or in a list: read it in full"),
             ("tab ← →", "in a report: Summary / Full / Brief / Raw"),
             ("y / w", "in a report: copy the tab / save it as Markdown"),
         ],
     ),
     (
-        "Acting on agents",
+        "Command Center & actions",
         &[
-            ("a / d", "approve / deny what the agent is asking permission for"),
-            ("x", "cancel the selected agy call (asks y/n first)"),
-            ("o", "resume the selected Claude session in a terminal"),
-            ("g", "inside a report: go to the agent that wrote it"),
+            ("Space", "open the Command Center quick-actions menu"),
+            ("p", "dispatch a new task (agy role / claude)"),
+            ("f", "reply / follow-up to the selected agent (or in a report)"),
+            ("K", "Free RAM: stop idle agents or reap orphan agy"),
+            ("a / d / A", "approve / deny permission, or A to approve all pending"),
+            ("x", "stop / cancel the selected agent process (asks y/n first)"),
+            ("R / X", "on Jobs tab: resume / abort selected rosso-auto job"),
+            ("o / g", "resume session in a terminal / in a report: go to sender"),
         ],
     ),
     (
@@ -1261,20 +1433,19 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("v", "view menu: choose what the office shows (names, zones, ...)"),
             ("L", "show / hide name tags and speech bubbles"),
-            ("t", "theme picker (live preview; enter keeps, esc undoes)"),
-            ("[ ]", "previous / next theme"),
+            ("t / [ ]", "theme picker (live preview) / previous & next theme"),
             ("T", "theme mixer: a different theme per layer"),
             ("s", "show / hide the sidebar"),
         ],
     ),
     (
-        "Alerts & sound",
+        "Alerts & quit",
         &[
             ("n / m", "desktop notifications / sound chimes on or off"),
             ("c / C", "clear alerts / bring them back"),
+            ("q / ctrl-c", "leave the office (agents keep working)"),
         ],
     ),
-    ("Quit", &[("q / ctrl-c", "leave the office (agents keep working)")]),
 ];
 
 /// The help popup text, section by section.
@@ -1519,7 +1690,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let b = Block::bordered()
                 .borders(Borders::ALL)
                 .title(Line::from(vec![Span::styled(" report", Style::new().bold()), Span::styled(pos, Style::new().fg(Color::Yellow).bold())]))
-                .title_bottom(Line::from(" tab/←→ view · ↑↓ scroll · y copy · w save · n/p next/prev · g sender · esc back ").right_aligned())
+                .title_bottom(Line::from(" tab/←→ view · ↑↓ scroll · y copy · w save · n/p next/prev · f reply · g sender · esc back ").right_aligned())
                 .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
             let inner = b.inner(r);
             f.render_widget(Clear, r);
@@ -1560,8 +1731,8 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 );
             }
         }
-        Popup::ConfirmCancel { label, pid, .. } => {
-            let text = format!("Cancel {label} (pid {pid})? y/n");
+        Popup::ConfirmCancel { id, label, pid } => {
+            let text = confirm_cancel_text(scene, id, label, *pid);
             let r = centered(area, text.chars().count() as u16 + 6, 3);
             app.layout.popup = r;
             let inner = popup_frame(f, r, " confirm ".into());
@@ -1631,6 +1802,176 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(trunc(&format!("available: {}", themes.join(", ")), inner.width as usize), Style::new().fg(Color::DarkGray))));
             lines.push(Line::from(Span::styled("↑↓ layer  ←→ theme  esc save & close", Style::new().fg(Color::DarkGray))));
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Popup::FreeRam { sel, targets, checked } => {
+            let rows = targets.len().max(1) as u16;
+            let r = centered(area, 78, (rows + 7).clamp(8, max_h));
+            app.layout.popup = r;
+            let inner = popup_frame(f, r, " Free RAM — kill idle agents ".into());
+            let total_mb: u32 = targets.iter().zip(checked.iter()).filter(|(_, c)| **c).map(|(t, _)| t.rss_mb).sum();
+            let checked_n = checked.iter().filter(|&&c| c).count();
+            let orphans = scene.router_extra.orphans;
+            let [hdr_a, list_a, hint_a] =
+                Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+            let w = inner.width as usize;
+            let summary = format!("Reclaimable: ~{total_mb} MB ({checked_n} selected) · or press r to reap {orphans} orphans");
+            f.render_widget(
+                Paragraph::new(trunc(&summary, w)).style(Style::new().fg(Color::LightCyan).bold()),
+                hdr_a,
+            );
+            let list_lines: Vec<Line> = if targets.is_empty() {
+                vec![Line::from(Span::styled("  No idle agents with live PIDs.", Style::new().fg(Color::DarkGray)))]
+            } else {
+                let cap = list_a.height as usize;
+                let start = sel.saturating_sub(cap.saturating_sub(1));
+                targets
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(cap)
+                    .map(|(i, t)| {
+                        let chk = if *checked.get(i).unwrap_or(&false) { "[x]" } else { "[ ]" };
+                        let mark = if i == *sel { "▶" } else { " " };
+                        let badge = if t.is_orphan {
+                            "orphan".to_string()
+                        } else {
+                            scene
+                                .agents
+                                .get(&t.id)
+                                .and_then(|a| a.role.as_deref().filter(|r| !r.is_empty()).map(str::to_string).or_else(|| {
+                                    Some(match a.kind {
+                                        AgentKind::Claude => "claude".into(),
+                                        AgentKind::ClaudeSub => "sub".into(),
+                                        AgentKind::Agy => "agy".into(),
+                                        AgentKind::Other => "agent".into(),
+                                    })
+                                }))
+                                .unwrap_or_default()
+                        };
+                        let idle = fmt_elapsed_short(t.idle_ms);
+                        let rss = if t.rss_mb > 0 { format!("~{} MB", t.rss_mb) } else { "-".into() };
+                        let label_w = w.saturating_sub(30).max(8);
+                        let line_txt = format!(
+                            "{mark} {chk} {:<label_w$}  {:<10}  {:>4}  {:>7}",
+                            trunc(&t.label, label_w),
+                            trunc(&badge, 10),
+                            idle,
+                            rss
+                        );
+                        let st = if i == *sel {
+                            Style::new().bg(Color::Rgb(0x2a, 0x30, 0x40)).fg(Color::Yellow).bold()
+                        } else {
+                            Style::new()
+                        };
+                        Line::from(Span::styled(trunc(&line_txt, w), st))
+                    })
+                    .collect()
+            };
+            f.render_widget(Paragraph::new(list_lines), list_a);
+            f.render_widget(
+                Paragraph::new(trunc(" Space toggle · a all · r reap orphans · Enter kill · Esc cancel ", w))
+                    .style(Style::new().fg(Color::DarkGray)),
+                hint_a,
+            );
+        }
+        Popup::Dispatch { field, target_idx, cwd, prompt, followup } => {
+            let r = centered(area, 76, 14.min(max_h));
+            app.layout.popup = r;
+            let title = followup
+                .as_ref()
+                .map(|(_, l)| format!(" Reply to {l} "))
+                .unwrap_or_else(|| " Dispatch Task ".into());
+            let inner = popup_frame(f, r, title);
+            let w = inner.width as usize;
+            let [top_a, cwd_a, prompt_a, hint_a] =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(inner);
+            let f0_line = match followup {
+                Some((_, label)) => Line::from(Span::styled(trunc(&format!("Reply:   {label}"), w), Style::new().fg(Color::DarkGray))),
+                None => {
+                    let target_label = super::state::DISPATCH_TARGETS
+                        .get(*target_idx)
+                        .map(|t| t.1)
+                        .unwrap_or("unknown");
+                    let st = if *field == 0 { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
+                    Line::from(Span::styled(trunc(&format!("Target:  ◀ {target_label} ▶"), w), st))
+                }
+            };
+            f.render_widget(Paragraph::new(f0_line), top_a);
+
+            let cwd_cursor = if *field == 1 { "▌" } else { "" };
+            let cwd_st = if *field == 1 { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
+            f.render_widget(
+                Paragraph::new(Span::styled(trunc(&format!("CWD:     {cwd}{cwd_cursor}"), w), cwd_st)),
+                cwd_a,
+            );
+
+            let p_border = if *field == 2 { Color::Yellow } else { Color::DarkGray };
+            let p_block = Block::bordered()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(p_border))
+                .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+            let p_cursor = if *field == 2 { "▌" } else { "" };
+            let p_st = if *field == 2 { Style::new().fg(Color::Yellow).bold() } else { Style::new().fg(Color::DarkGray) };
+            let p_line = Line::from(vec![Span::styled("Prompt:  ", p_st), Span::raw(format!("{prompt}{p_cursor}"))]);
+            f.render_widget(Paragraph::new(p_line).block(p_block).wrap(Wrap { trim: false }), prompt_a);
+
+            f.render_widget(
+                Paragraph::new(trunc(" Tab field · ←→ target · Enter send · Esc cancel ", w))
+                    .style(Style::new().fg(Color::DarkGray)),
+                hint_a,
+            );
+        }
+        Popup::Actions { sel } => {
+            let n = super::state::ACTIONS.len() as u16;
+            let r = centered(area, 56, (n + 5).min(max_h));
+            app.layout.popup = r;
+            let inner = popup_frame(f, r, " Command Center ".into());
+            let w = inner.width as usize;
+            let mut lines: Vec<Line> = super::state::ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, (key, desc))| {
+                    let row_txt = format!("  [{key}]  {desc}");
+                    let st = if i == *sel {
+                        Style::new().bg(Color::Rgb(0x2a, 0x30, 0x40)).fg(Color::Yellow).bold()
+                    } else {
+                        Style::new()
+                    };
+                    Line::from(Span::styled(trunc(&row_txt, w), st))
+                })
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                trunc(" ↑↓/Enter run · or press shortcut · Esc close ", w),
+                Style::new().fg(Color::DarkGray),
+            )));
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Popup::ConfirmApproveAll { items } => {
+            let (msg, names, w) = approve_all_text_and_w(items);
+            let r = centered(area, w, 5.min(max_h));
+            app.layout.popup = r;
+            let inner = popup_frame(f, r, " confirm approve all ".into());
+            let iw = inner.width as usize;
+            let lines = vec![
+                Line::from(Span::styled(trunc(&msg, iw), Style::new().fg(Color::Yellow).bold())),
+                Line::from(Span::styled(trunc(&names, iw), Style::new().fg(Color::Gray))),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Popup::ConfirmAbortAuto { job, phase } => {
+            let msg = confirm_abort_auto_text(job, phase);
+            let hint = "Y / Enter abort · N / Esc cancel";
+            let w = msg.chars().count().max(hint.chars().count()) as u16 + 6;
+            let r = centered(area, w, 4.min(max_h));
+            app.layout.popup = r;
+            let inner = popup_frame(f, r, " confirm abort auto ".into());
+            let iw = inner.width as usize;
+            let lines = vec![
+                Line::from(Span::styled(trunc(&msg, iw), Style::new().fg(Color::LightRed).bold())),
+                Line::from(Span::styled(trunc(hint, iw), Style::new().fg(Color::DarkGray))),
+            ];
             f.render_widget(Paragraph::new(lines), inner);
         }
     }
@@ -2045,5 +2386,154 @@ mod tests {
         let extra = line_text(router_lines(&scene, 60));
         assert!(extra.contains("free RAM 1800 MB · per agy 280 MB · rsv 512M"), "{extra}");
         assert!(extra.contains("pressure warn · queued 1 · 2 orphan"), "{extra}");
+    }
+
+    #[test]
+    fn free_ram_btn_renders_and_records_hit_rect() {
+        let (mut app, mut scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+        // Idle candidate with PID & RSS makes the strip highlight reclaimable MB.
+        if let Some(a) = scene.agents.get_mut("agy:4242") {
+            a.state = office_core::AgentState::Idle;
+            a.pid = Some(4242);
+            a.rss_mb = Some(350);
+        }
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("[K] Free RAM (~350 MB · 1 idle)"), "{s}");
+        assert!(app.layout.free_ram_btn.width > 0 && app.layout.free_ram_btn.height == 1);
+
+        // Switching to Jobs clears free_ram_btn; hiding sidebar clears it too.
+        app.side_tab = SideTab::Jobs;
+        let _ = render(&mut app, &scene, &mut office, 120, 40);
+        assert_eq!(app.layout.free_ram_btn, Rect::default());
+
+        app.side_tab = SideTab::Agents;
+        app.sidebar = false;
+        let _ = render(&mut app, &scene, &mut office, 120, 40);
+        assert_eq!(app.layout.free_ram_btn, Rect::default());
+    }
+
+    #[test]
+    fn command_center_popups_render() {
+        let (mut app, mut scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+
+        // FreeRam popup
+        let targets = vec![crate::app::state::IdleTarget {
+            id: "agy:4242".into(),
+            label: "agy-worker".into(),
+            pid: 4242,
+            rss_mb: 320,
+            idle_ms: 90_000,
+            is_orphan: false,
+        }];
+        scene.router_extra.orphans = 2;
+        app.popup = Popup::FreeRam { sel: 0, targets, checked: vec![true] };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("Free RAM — kill idle agents"), "{s}");
+        assert!(s.contains("Reclaimable: ~320 MB (1 selected) · or press r to reap 2 orphans"), "{s}");
+        assert!(s.contains("[x] agy-worker"), "{s}");
+        assert!(s.contains("~320 MB"), "{s}");
+        assert!(s.contains("Space toggle · a all · r reap orphans · Enter kill · Esc cancel"), "{s}");
+
+        // Dispatch popup (new task & follow-up)
+        app.popup = Popup::Dispatch {
+            field: 0,
+            target_idx: 0,
+            cwd: "/tmp/repo".into(),
+            prompt: "audit tests".into(),
+            followup: None,
+        };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("Dispatch Task") && s.contains("Target:  ◀ agy worker (edit) ▶"), "{s}");
+        assert!(s.contains("CWD:     /tmp/repo") && s.contains("Prompt:  audit tests"), "{s}");
+
+        app.popup = Popup::Dispatch {
+            field: 2,
+            target_idx: 0,
+            cwd: "/tmp/repo".into(),
+            prompt: "continue".into(),
+            followup: Some(("cc:dice".into(), "cc·DICE".into())),
+        };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("Reply to cc·DICE") && s.contains("Reply:   cc·DICE"), "{s}");
+        assert!(s.contains("Prompt:  continue▌"), "{s}");
+
+        // Actions popup
+        app.popup = Popup::Actions { sel: 0 };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("Command Center") && s.contains("[p]  Dispatch new task"), "{s}");
+        assert!(s.contains("[K]  Free RAM — kill idle agents"), "{s}");
+
+        // ConfirmApproveAll popup
+        app.popup = Popup::ConfirmApproveAll {
+            items: vec![
+                ("cc:office".into(), "cc·office".into(), "req-1".into()),
+                ("cc:dice".into(), "cc·DICE".into(), "req-2".into()),
+            ],
+        };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("confirm approve all"), "{s}");
+        assert!(s.contains("Approve all 2 pending permissions? y/n"), "{s}");
+        assert!(s.contains("cc·office, cc·DICE"), "{s}");
+
+        // ConfirmCancel includes ~rss MB when present
+        scene.agents.get_mut("agy:4242").unwrap().rss_mb = Some(280);
+        app.popup = Popup::ConfirmCancel { id: "agy:4242".into(), label: "agy-worker".into(), pid: 4242 };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("Cancel agy-worker (pid 4242, ~280 MB)? y/n"), "{s}");
+
+        // ConfirmAbortAuto popup
+        app.popup = Popup::ConfirmAbortAuto { job: "j-auto".into(), phase: "execute".into() };
+        assert!(popup_rect(Rect::new(0, 0, 120, 40), &app, &scene).is_some());
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("confirm abort auto"), "{s}");
+        assert!(s.contains("Abort auto job j-auto (phase execute)?"), "{s}");
+        assert!(s.contains("Y / Enter abort · N / Esc cancel"), "{s}");
+    }
+
+    #[test]
+    fn jobs_panel_renders_auto_job_status_ruling_and_error() {
+        let (mut app, mut scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+        app.side_tab = SideTab::Jobs;
+
+        scene.auto_jobs.push(office_core::AutoJob {
+            job: "j-ruling".into(),
+            task: "Ship Stage 2C".into(),
+            flow: "council".into(),
+            phase: "execute".into(),
+            status: "running".into(),
+            calls_used: 4,
+            max_calls: 12,
+            started_at: 60_000,
+            ruling: Some("APPROVE".into()),
+            ..Default::default()
+        });
+        scene.auto_jobs.push(office_core::AutoJob {
+            job: "j-err".into(),
+            task: "Fix retry".into(),
+            flow: "simple".into(),
+            phase: "inspect".into(),
+            status: "failed".into(),
+            calls_used: 2,
+            max_calls: 8,
+            started_at: 50_000,
+            last_error: Some("timeout".into()),
+            ..Default::default()
+        });
+
+        let s = render(&mut app, &scene, &mut office, 140, 40);
+        for needle in [
+            "Jobs (2)",
+            "j-ruling",
+            "AUTO council execute (6/8) 4/12",
+            "APPROVE · [R]esume / [X]abort",
+            "j-err",
+            "AUTO simple inspect (4/5) 2/8",
+            "err: timeout · [R]esume / [X]abort",
+        ] {
+            assert!(s.contains(needle), "missing {needle:?}:\n{s}");
+        }
     }
 }

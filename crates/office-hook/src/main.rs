@@ -81,6 +81,8 @@ fn run() {
     let remaining = TOTAL_BUDGET.saturating_sub(start.elapsed()).min(SEND_CAP);
     let delivered = send_line(line.to_string(), remaining);
 
+    // Non-permission observer hooks must exit 0 silently: printing `{}` on Antigravity
+    // PreToolUse fails closed (missing `decision`), while `{"decision":"allow"}` would bypass prompts.
     let Some(request_id) = request_id else { return };
     // Office not running: never make the user wait; fall through to the normal Claude prompt.
     if !delivered {

@@ -1,5 +1,5 @@
 use crate::model::{
-    AgentId, AgentKind, AgentState, Alert, DispatchMode, FailureInfo, QueueTicket, ReportKind, RouterExtra,
+    AgentId, AgentKind, AgentState, Alert, AutoJob, DispatchMode, FailureInfo, QueueTicket, ReportKind, RouterExtra,
     RouterStatus, WaveState,
 };
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,8 @@ pub enum EventKind {
     Waves(BTreeMap<String, WaveState>),
     /// Explicit dispatch mode overrides per top-level session id.
     DispatchModes(BTreeMap<AgentId, DispatchMode>),
+    /// Active/recent `rosso-auto` autonomous pipeline jobs.
+    AutoJobs(Vec<AutoJob>),
     Alert(Alert),
     /// A document handed from one agent to another. `to: None` means "whoever asked": the
     /// sender's parent, or you (the boss) for a top-level session.

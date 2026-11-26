@@ -1,6 +1,6 @@
 //! ROSSO integration helpers: mapping between ROSSO office titles and the agents that play them.
 
-use crate::model::{AgentKind, AgentState, DispatchMode, Scene, WaveState};
+use crate::model::{AgentKind, AgentState, AutoJob, DispatchMode, Scene, WaveState};
 
 const WAVE_MAX_AGE_MS: u64 = 7_200_000;
 const WAVE_DIRECT_RECENT_MS: u64 = 120_000;
@@ -136,6 +136,47 @@ pub fn latest_wave(scene: &Scene) -> Option<&WaveState> {
         .values()
         .filter(|w| scene.now_ms == 0 || scene.now_ms.saturating_sub(w.updated_ms) <= WAVE_MAX_AGE_MS)
         .max_by_key(|w| w.updated_ms)
+}
+
+/// Most relevant `rosso-auto` job: prefers a `"running"` job first, otherwise the newest by `started_at`.
+pub fn latest_auto_job(scene: &Scene) -> Option<&AutoJob> {
+    scene
+        .auto_jobs
+        .iter()
+        .max_by_key(|j| (j.status == "running", j.started_at))
+}
+
+/// 1-based `(step, total)` progress for a `rosso-auto` flow (`"council"` or `"simple"`) and phase.
+/// Returns `(0, total)` for unknown phases within a known flow, or `(0, 0)` for unknown flows.
+pub fn auto_phase_progress(flow: &str, phase: &str) -> (u8, u8) {
+    match flow.trim().to_ascii_lowercase().as_str() {
+        "simple" => {
+            let step = match phase.trim().to_ascii_lowercase().as_str() {
+                "open" => 1,
+                "design" => 2,
+                "execute" => 3,
+                "inspect" | "fix" => 4,
+                "report" => 5,
+                _ => 0,
+            };
+            (step, 5)
+        }
+        "council" => {
+            let step = match phase.trim().to_ascii_lowercase().as_str() {
+                "open" => 1,
+                "proposal" => 2,
+                "critique" => 3,
+                "arbitrate" | "rebuttal" | "recheck" => 4,
+                "heads" => 5,
+                "execute" => 6,
+                "inspect" | "fix" => 7,
+                "report" => 8,
+                _ => 0,
+            };
+            (step, 8)
+        }
+        _ => (0, 0),
+    }
 }
 
 /// Effective dispatch mode (`Direct`, `Relay`, `Hybrid`, or `None`) for a top-level Claude session.
@@ -318,5 +359,70 @@ mod tests {
         assert_eq!(dispatch_mode(&scene, "cc:cos"), Some(DispatchMode::Relay));
         scene.dispatch_modes.insert("cc:cos".into(), DispatchMode::Hybrid);
         assert_eq!(dispatch_mode(&scene, "cc:cos"), Some(DispatchMode::Hybrid));
+    }
+
+    #[test]
+    fn latest_auto_job_prefers_running_then_newest() {
+        let mut scene = Scene::default();
+        assert_eq!(latest_auto_job(&scene), None);
+
+        scene.auto_jobs = vec![
+            AutoJob { job: "old-done".into(), status: "done".into(), started_at: 100, ..Default::default() },
+            AutoJob { job: "new-done".into(), status: "done".into(), started_at: 500, ..Default::default() },
+        ];
+        assert_eq!(latest_auto_job(&scene).map(|j| j.job.as_str()), Some("new-done"));
+
+        scene.auto_jobs.push(AutoJob {
+            job: "active".into(),
+            status: "running".into(),
+            started_at: 50,
+            ..Default::default()
+        });
+        assert_eq!(latest_auto_job(&scene).map(|j| j.job.as_str()), Some("active"));
+
+        scene.auto_jobs.push(AutoJob {
+            job: "active-newer".into(),
+            status: "running".into(),
+            started_at: 200,
+            ..Default::default()
+        });
+        assert_eq!(latest_auto_job(&scene).map(|j| j.job.as_str()), Some("active-newer"));
+    }
+
+    #[test]
+    fn auto_phase_progress_covers_council_simple_and_unknown() {
+        let council_expected = [
+            ("open", (1, 8)),
+            ("proposal", (2, 8)),
+            ("critique", (3, 8)),
+            ("arbitrate", (4, 8)),
+            ("rebuttal", (4, 8)),
+            ("recheck", (4, 8)),
+            ("heads", (5, 8)),
+            ("execute", (6, 8)),
+            ("inspect", (7, 8)),
+            ("fix", (7, 8)),
+            ("report", (8, 8)),
+            ("unknown", (0, 8)),
+        ];
+        for (phase, expected) in council_expected {
+            assert_eq!(auto_phase_progress("council", phase), expected, "council/{phase}");
+        }
+
+        let simple_expected = [
+            ("open", (1, 5)),
+            ("design", (2, 5)),
+            ("execute", (3, 5)),
+            ("inspect", (4, 5)),
+            ("fix", (4, 5)),
+            ("report", (5, 5)),
+            ("proposal", (0, 5)),
+            ("unknown", (0, 5)),
+        ];
+        for (phase, expected) in simple_expected {
+            assert_eq!(auto_phase_progress("simple", phase), expected, "simple/{phase}");
+        }
+
+        assert_eq!(auto_phase_progress("unknown", "open"), (0, 0));
     }
 }

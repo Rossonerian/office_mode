@@ -12,7 +12,7 @@ pub mod rosso;
 
 pub use event::{Event, EventKind, SourceKind};
 pub use model::{
-    Agent, AgentId, AgentState, Alert, AlertLevel, DispatchMode, FailureInfo, GuardStats, QueueTicket, Report,
+    Agent, AgentId, AgentState, Alert, AlertLevel, AutoJob, DispatchMode, FailureInfo, GuardStats, QueueTicket, Report,
     ReportKind, RouterExtra, RouterStatus, Scene, WaveCall, WaveState,
 };
 pub use reducer::Reducer;

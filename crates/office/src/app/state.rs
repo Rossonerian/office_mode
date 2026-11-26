@@ -33,6 +33,103 @@ pub trait Control {
     fn save_file(&mut self, _name: &str, _content: &str) -> anyhow::Result<String> {
         anyhow::bail!("saving not available")
     }
+    fn kill_agent(&mut self, agent: &Agent, pid: u32) -> anyhow::Result<()> {
+        self.cancel_agy(agent, pid)
+    }
+    fn reap_orphans(&mut self) -> anyhow::Result<(usize, u32)> {
+        Ok((0, 0))
+    }
+    fn resume_agent(&mut self, _agent: &Agent, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
+        self.resume_claude(cwd, session_id)
+    }
+    fn dispatch_task(&mut self, _target: &str, _cwd: &str, _prompt: &str) -> anyhow::Result<String> {
+        anyhow::bail!("dispatch not available")
+    }
+    fn followup_session(&mut self, _agent: &Agent, _prompt: &str) -> anyhow::Result<String> {
+        anyhow::bail!("follow-up not available")
+    }
+    fn prune_brain(&mut self) -> anyhow::Result<String> {
+        anyhow::bail!("prune not available")
+    }
+    fn resume_auto(&self, _job: &str) -> Result<String, String> {
+        Err("rosso-auto control not available".into())
+    }
+    fn abort_auto(&self, _job: &str) -> Result<String, String> {
+        Err("rosso-auto control not available".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleTarget {
+    pub id: AgentId,
+    pub label: String,
+    pub pid: u32,
+    pub rss_mb: u32,
+    pub idle_ms: u64,
+    pub is_orphan: bool,
+}
+
+pub const DISPATCH_TARGETS: &[(&str, &str)] = &[
+    ("agy:worker", "agy worker (edit)"),
+    ("agy:architect", "agy architect (plan)"),
+    ("agy:supervisor", "agy supervisor (review)"),
+    ("agy:tester", "agy tester (verify)"),
+    ("agy:fallback", "agy fallback (quick)"),
+    ("agy:manager", "agy manager (coordinate)"),
+    ("agy:git", "agy git (branch/commit)"),
+    ("agy-cli", "agy CLI (standalone)"),
+    ("claude", "claude (background -p)"),
+    ("claude-win", "claude (Ghostty window)"),
+    ("rosso-auto:council", "rosso-auto council (full pipeline)"),
+    ("rosso-auto:simple", "rosso-auto simple (fast pipeline)"),
+];
+
+pub const ACTIONS: &[(&str, &str)] = &[
+    ("p", "Dispatch new task (agy / claude)"),
+    ("f", "Reply / follow-up to selected agent"),
+    ("K", "Free RAM — kill idle agents"),
+    ("R", "Reap orphan agy processes"),
+    ("A", "Approve all pending permissions"),
+    ("i", "Open Boss Inbox"),
+    ("o", "Open selected session in Ghostty"),
+    ("B", "Prune old agy brain directories"),
+];
+
+/// Candidates for the Free RAM dialog: idle/done agents with live PIDs and no active children,
+/// sorted by RSS descending, then idle duration descending, then agent id ascending.
+pub fn idle_kill_candidates(scene: &Scene, now_ms: u64) -> Vec<IdleTarget> {
+    let mut out: Vec<IdleTarget> = scene
+        .agents
+        .values()
+        .filter_map(|a| {
+            let pid = a.pid.filter(|&p| p > 1)?;
+            if !matches!(a.state, AgentState::Idle | AgentState::Done) {
+                return None;
+            }
+            let has_active_child = scene.agents.values().any(|c| {
+                c.parent.as_deref() == Some(a.id.as_str())
+                    && !matches!(c.state, AgentState::Idle | AgentState::Done | AgentState::Leaving)
+            });
+            if has_active_child {
+                return None;
+            }
+            Some(IdleTarget {
+                id: a.id.clone(),
+                label: a.label.clone(),
+                pid,
+                rss_mb: a.rss_mb.unwrap_or(0),
+                idle_ms: now_ms.saturating_sub(a.last_event_ms),
+                is_orphan: a.id.starts_with("ag-orphan:"),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.rss_mb
+            .cmp(&a.rss_mb)
+            .then_with(|| b.idle_ms.cmp(&a.idle_ms))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
 }
 
 pub const PRESET_ORDER: [&str; 6] = ["procedural", "modern", "cozy", "midnight", "retro", "cyberpunk"];
@@ -66,6 +163,16 @@ pub enum Popup {
     Reports { sel: usize, only: Option<AgentId>, inbox: bool },
     /// One hand-off in full (brief + report); Esc goes back to the list.
     ReportView { id: u64, only: Option<AgentId>, inbox: bool },
+    /// Free RAM dialog: multi-select idle/done agents and orphans to stop.
+    FreeRam { sel: usize, targets: Vec<IdleTarget>, checked: Vec<bool> },
+    /// Dispatch a new task or follow-up prompt to a session.
+    Dispatch { field: usize, target_idx: usize, cwd: String, prompt: String, followup: Option<(AgentId, String)> },
+    /// Command palette / quick actions menu.
+    Actions { sel: usize },
+    /// Confirmation before approving all pending permissions.
+    ConfirmApproveAll { items: Vec<(AgentId, String, String)> },
+    /// Confirmation before aborting a `rosso-auto` job.
+    ConfirmAbortAuto { job: String, phase: String },
 }
 
 /// Reports newest first, optionally only those sent or received by `only`.
@@ -122,6 +229,8 @@ pub struct LayoutCache {
     pub font_px: Option<(u16, u16)>,
     /// The sidebar's tab bar (empty when not drawn).
     pub side_tabs: Rect,
+    /// Clickable Free RAM button in the header/sidebar (empty when not drawn).
+    pub free_ram_btn: Rect,
 }
 
 pub fn mix_eq(a: &ThemeMix, b: &ThemeMix) -> bool {
@@ -316,10 +425,26 @@ impl App {
         if !sel_ok {
             self.selected = rows.first().map(|(id, _)| id.clone());
         }
-        if let Popup::Detail(id) | Popup::ConfirmCancel { id, .. } = &self.popup {
-            if !scene.agents.contains_key(id) {
-                self.popup = Popup::None;
+        match &mut self.popup {
+            Popup::Detail(id) | Popup::ConfirmCancel { id, .. } => {
+                if !scene.agents.contains_key(id) {
+                    self.popup = Popup::None;
+                }
             }
+            Popup::FreeRam { sel, targets, checked } => {
+                let mut keep_targets = Vec::with_capacity(targets.len());
+                let mut keep_checked = Vec::with_capacity(targets.len());
+                for (i, t) in targets.drain(..).enumerate() {
+                    if scene.agents.contains_key(&t.id) {
+                        keep_targets.push(t);
+                        keep_checked.push(checked.get(i).copied().unwrap_or(true));
+                    }
+                }
+                *targets = keep_targets;
+                *checked = keep_checked;
+                *sel = (*sel).min(targets.len().saturating_sub(1));
+            }
+            _ => {}
         }
 
         // Activity history + state transitions.
@@ -604,6 +729,119 @@ impl App {
         self.dirty = true;
     }
 
+    fn default_cwd(&self, scene: &Scene) -> String {
+        self.selected_agent(scene)
+            .and_then(|a| a.cwd.as_deref())
+            .filter(|c| !c.is_empty())
+            .or_else(|| scene.agents.values().find_map(|a| a.cwd.as_deref().filter(|c| !c.is_empty())))
+            .map(ToString::to_string)
+            .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| ".".into())
+    }
+
+    fn open_free_ram(&mut self, scene: &Scene, now_ms: u64) {
+        let targets = idle_kill_candidates(scene, now_ms);
+        let checked = vec![true; targets.len()];
+        if targets.is_empty() && scene.router_extra.orphans == 0 {
+            self.popup = Popup::None;
+            self.toast("no idle killable agents", AlertLevel::Info, now_ms);
+        } else {
+            self.popup = Popup::FreeRam { sel: 0, targets, checked };
+        }
+    }
+
+    fn open_followup(&mut self, scene: &Scene, id: &str, now_ms: u64) {
+        let Some(a) = scene.agents.get(id) else {
+            self.toast("agent is no longer in the office", AlertLevel::Info, now_ms);
+            return;
+        };
+        let target = match a.kind {
+            AgentKind::ClaudeSub => a.parent.as_ref().and_then(|p| scene.agents.get(p)).unwrap_or(a),
+            _ => a,
+        };
+        if target.resume_id.as_deref().is_none_or(str::is_empty) {
+            let l = target.label.clone();
+            self.toast(format!("{l}: no session id to reply to"), AlertLevel::Info, now_ms);
+            return;
+        }
+        let cwd = target
+            .cwd
+            .clone()
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| self.default_cwd(scene));
+        self.popup = Popup::Dispatch {
+            field: 2,
+            target_idx: 0,
+            cwd,
+            prompt: String::new(),
+            followup: Some((target.id.clone(), target.label.clone())),
+        };
+    }
+
+    fn open_approve_all(&mut self, scene: &Scene, now_ms: u64) {
+        if !self.permissions_enabled {
+            self.toast(
+                "approve disabled: set permission_timeout_s > 0 and run `office install-hooks`",
+                AlertLevel::Warn,
+                now_ms,
+            );
+            return;
+        }
+        let mut items: Vec<(AgentId, String, String)> = scene
+            .agents
+            .values()
+            .filter_map(|a| a.pending_permission.clone().map(|req| (a.id.clone(), a.label.clone(), req)))
+            .collect();
+        items.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        if items.is_empty() {
+            self.toast("no pending permissions", AlertLevel::Info, now_ms);
+        } else {
+            self.popup = Popup::ConfirmApproveAll { items };
+        }
+    }
+
+    fn reap_orphans_with_toast(&mut self, ctl: &mut dyn Control, now_ms: u64) {
+        match ctl.reap_orphans() {
+            Ok((0, _)) => self.toast("no orphan agy processes", AlertLevel::Info, now_ms),
+            Ok((n, mb)) => self.toast(format!("reaped {n} orphan agy (~{mb} MB)"), AlertLevel::Info, now_ms),
+            Err(e) => self.toast(format!("reap failed: {e}"), AlertLevel::Critical, now_ms),
+        }
+    }
+
+    fn run_action(&mut self, act: &str, scene: &Scene, ctl: &mut dyn Control, now_ms: u64) {
+        match act {
+            "p" => {
+                self.popup = Popup::Dispatch {
+                    field: 2,
+                    target_idx: 0,
+                    cwd: self.default_cwd(scene),
+                    prompt: String::new(),
+                    followup: None,
+                };
+            }
+            "f" => match self.selected_agent(scene).map(|a| a.id.clone()) {
+                Some(id) => self.open_followup(scene, &id, now_ms),
+                None => self.toast("no agent selected", AlertLevel::Info, now_ms),
+            },
+            "K" => self.open_free_ram(scene, now_ms),
+            "R" => self.reap_orphans_with_toast(ctl, now_ms),
+            "A" => self.open_approve_all(scene, now_ms),
+            "i" => {
+                if scene.reports.iter().any(|r| r.to.is_none()) {
+                    self.popup = Popup::Reports { sel: 0, only: None, inbox: true };
+                } else {
+                    self.toast("inbox is empty", AlertLevel::Info, now_ms);
+                }
+            }
+            "o" => self.resume(scene, ctl, now_ms),
+            "B" => match ctl.prune_brain() {
+                Ok(msg) => self.toast(msg, AlertLevel::Info, now_ms),
+                Err(e) => self.toast(format!("prune failed: {e}"), AlertLevel::Critical, now_ms),
+            },
+            _ => {}
+        }
+    }
+
     pub fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -677,7 +915,7 @@ impl App {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.popup = Popup::None;
                         match scene.agents.get(&id) {
-                            Some(a) => match ctl.cancel_agy(a, pid) {
+                            Some(a) => match ctl.kill_agent(a, pid) {
                                 Ok(()) => self.toast(format!("sent SIGTERM to {label} (pid {pid})"), AlertLevel::Info, now_ms),
                                 Err(e) => self.toast(format!("cancel failed: {e}"), AlertLevel::Critical, now_ms),
                             },
@@ -764,7 +1002,7 @@ impl App {
                             None => self.toast(if key.code == KeyCode::Char('n') { "last report" } else { "first report" }, AlertLevel::Info, now_ms),
                         }
                     }
-                    KeyCode::Char('g') | KeyCode::Char('o') | KeyCode::Char('a') | KeyCode::Char('d') => {
+                    KeyCode::Char('g') | KeyCode::Char('o') | KeyCode::Char('a') | KeyCode::Char('d') | KeyCode::Char('f') => {
                         let from = scene.reports.iter().find(|r| r.id == id).map(|r| r.from.clone());
                         match from.filter(|f| scene.agents.contains_key(f)) {
                             None => self.toast("sender is no longer in the office", AlertLevel::Info, now_ms),
@@ -773,6 +1011,11 @@ impl App {
                                     self.selected = Some(f);
                                     self.detail_scroll = 0;
                                     self.popup = Popup::None;
+                                }
+                                KeyCode::Char('f') => {
+                                    self.detail_scroll = 0;
+                                    self.popup = Popup::None;
+                                    self.open_followup(scene, &f, now_ms);
                                 }
                                 code => {
                                     let prev = self.selected.replace(f);
@@ -861,6 +1104,221 @@ impl App {
                 }
                 return Outcome::Continue;
             }
+            Popup::FreeRam { mut sel, targets, mut checked } => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        self.popup = Popup::FreeRam { sel, targets, checked };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !targets.is_empty() {
+                            sel = (sel + 1).min(targets.len() - 1);
+                        }
+                        self.popup = Popup::FreeRam { sel, targets, checked };
+                    }
+                    KeyCode::Char(' ') => {
+                        if sel < checked.len() {
+                            checked[sel] = !checked[sel];
+                        }
+                        self.popup = Popup::FreeRam { sel, targets, checked };
+                    }
+                    KeyCode::Char('a') => {
+                        let all_on = checked.iter().any(|&c| !c);
+                        for c in &mut checked {
+                            *c = all_on;
+                        }
+                        self.popup = Popup::FreeRam { sel, targets, checked };
+                    }
+                    KeyCode::Char('r') => {
+                        self.popup = Popup::None;
+                        self.reap_orphans_with_toast(ctl, now_ms);
+                    }
+                    KeyCode::Enter => {
+                        self.popup = Popup::None;
+                        let mut stopped = 0usize;
+                        let mut freed_mb = 0u32;
+                        let mut any_checked = false;
+                        let mut last_err = None;
+                        for (t, c) in targets.iter().zip(checked.iter()) {
+                            if !*c {
+                                continue;
+                            }
+                            any_checked = true;
+                            if let Some(a) = scene.agents.get(&t.id) {
+                                match ctl.kill_agent(a, t.pid) {
+                                    Ok(()) => {
+                                        stopped += 1;
+                                        freed_mb = freed_mb.saturating_add(t.rss_mb);
+                                    }
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                        }
+                        if !any_checked {
+                            self.toast("none selected", AlertLevel::Info, now_ms);
+                        } else if stopped > 0 {
+                            self.toast(format!("stopped {stopped} idle agents (~{freed_mb} MB)"), AlertLevel::Info, now_ms);
+                        } else if let Some(e) = last_err {
+                            self.toast(format!("stop failed: {e}"), AlertLevel::Critical, now_ms);
+                        } else {
+                            self.toast("none selected", AlertLevel::Info, now_ms);
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('K') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::Dispatch { mut field, mut target_idx, mut cwd, mut prompt, followup } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.popup = Popup::None;
+                    }
+                    KeyCode::Tab => {
+                        field = if followup.is_none() {
+                            (field + 1) % 3
+                        } else if field == 1 {
+                            2
+                        } else {
+                            1
+                        };
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::BackTab => {
+                        field = if followup.is_none() {
+                            (field + 2) % 3
+                        } else if field == 1 {
+                            2
+                        } else {
+                            1
+                        };
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Up => {
+                        field = if followup.is_none() { field.saturating_sub(1) } else { 1 };
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Down => {
+                        field = (field + 1).min(2);
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Left if field == 0 && followup.is_none() => {
+                        let n = DISPATCH_TARGETS.len();
+                        target_idx = (target_idx + n - 1) % n;
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Right if field == 0 && followup.is_none() => {
+                        target_idx = (target_idx + 1) % DISPATCH_TARGETS.len();
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Backspace => {
+                        if field == 1 {
+                            cwd.pop();
+                        } else if field == 2 {
+                            prompt.pop();
+                        }
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                        if field == 1 {
+                            cwd.push(ch);
+                        } else if field == 2 {
+                            prompt.push(ch);
+                        }
+                        self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                    }
+                    KeyCode::Enter => {
+                        if prompt.trim().is_empty() {
+                            self.popup = Popup::Dispatch { field, target_idx, cwd, prompt, followup };
+                            self.toast("enter a prompt first", AlertLevel::Info, now_ms);
+                        } else if let Some((aid, label)) = followup {
+                            self.popup = Popup::None;
+                            match scene.agents.get(&aid) {
+                                Some(a) => match ctl.followup_session(a, &prompt) {
+                                    Ok(msg) => self.toast(msg, AlertLevel::Info, now_ms),
+                                    Err(e) => self.toast(format!("follow-up failed: {e}"), AlertLevel::Critical, now_ms),
+                                },
+                                None => self.toast(format!("{label} already left"), AlertLevel::Info, now_ms),
+                            }
+                        } else {
+                            self.popup = Popup::None;
+                            let target = DISPATCH_TARGETS[target_idx].0;
+                            match ctl.dispatch_task(target, &cwd, &prompt) {
+                                Ok(msg) => self.toast(msg, AlertLevel::Info, now_ms),
+                                Err(e) => self.toast(format!("dispatch failed: {e}"), AlertLevel::Critical, now_ms),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::Actions { mut sel } => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        self.popup = Popup::Actions { sel };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1).min(ACTIONS.len() - 1);
+                        self.popup = Popup::Actions { sel };
+                    }
+                    KeyCode::Enter => {
+                        let act = ACTIONS[sel].0;
+                        self.popup = Popup::None;
+                        self.run_action(act, scene, ctl, now_ms);
+                    }
+                    KeyCode::Char(c @ ('p' | 'f' | 'K' | 'R' | 'A' | 'i' | 'o' | 'B')) => {
+                        self.popup = Popup::None;
+                        let mut buf = [0u8; 4];
+                        self.run_action(c.encode_utf8(&mut buf), scene, ctl, now_ms);
+                    }
+                    KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::ConfirmApproveAll { items } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.popup = Popup::None;
+                        let mut approved = 0usize;
+                        let mut last_err = None;
+                        for (id, _label, req) in items {
+                            if let Some(a) = scene.agents.get(&id) {
+                                match ctl.resolve_permission(a, &req, true) {
+                                    Ok(()) => approved += 1,
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                        }
+                        if approved > 0 {
+                            self.toast(format!("approved {approved} permissions"), AlertLevel::Info, now_ms);
+                        } else if let Some(e) = last_err {
+                            self.toast(format!("approve failed: {e}"), AlertLevel::Critical, now_ms);
+                        } else {
+                            self.toast("no pending permissions", AlertLevel::Info, now_ms);
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::ConfirmAbortAuto { job, .. } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        self.popup = Popup::None;
+                        match ctl.abort_auto(&job) {
+                            Ok(msg) => self.toast(msg, AlertLevel::Info, now_ms),
+                            Err(e) => self.toast(format!("abort failed: {e}"), AlertLevel::Critical, now_ms),
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
         }
 
         if let Some(r) = self.card_report(scene) {
@@ -911,11 +1369,42 @@ impl App {
                     let target = if activity {
                         panels::feed(scene, &self.state_log, panels::FEED_MAX).get(i).and_then(|f| f.report)
                     } else {
-                        panels::jobs(scene).get(i).map(|j| j.last_report)
+                        panels::jobs(scene).get(i).map(|j| j.last_report).filter(|&id| id > 0)
                     };
                     match target {
                         Some(id) => self.open_report(id, None, false),
                         None => self.toast(if n == 0 { "nothing here yet" } else { "no document for this line" }, AlertLevel::Info, now_ms),
+                    }
+                    return Outcome::Continue;
+                }
+                KeyCode::Char('R') if !activity => {
+                    let rows = panels::jobs(scene);
+                    if rows.is_empty() {
+                        self.toast("nothing here yet", AlertLevel::Info, now_ms);
+                    } else {
+                        let i = self.jobs_sel.min(rows.len() - 1);
+                        match &rows[i].auto {
+                            Some(aj) => match ctl.resume_auto(&aj.job) {
+                                Ok(msg) => self.toast(msg, AlertLevel::Info, now_ms),
+                                Err(e) => self.toast(format!("resume failed: {e}"), AlertLevel::Critical, now_ms),
+                            },
+                            None => self.toast("selected job is not a rosso-auto job", AlertLevel::Info, now_ms),
+                        }
+                    }
+                    return Outcome::Continue;
+                }
+                KeyCode::Char('X') if !activity => {
+                    let rows = panels::jobs(scene);
+                    if rows.is_empty() {
+                        self.toast("nothing here yet", AlertLevel::Info, now_ms);
+                    } else {
+                        let i = self.jobs_sel.min(rows.len() - 1);
+                        match &rows[i].auto {
+                            Some(aj) => {
+                                self.popup = Popup::ConfirmAbortAuto { job: aj.job.clone(), phase: aj.phase.clone() };
+                            }
+                            None => self.toast("selected job is not a rosso-auto job", AlertLevel::Info, now_ms),
+                        }
                     }
                     return Outcome::Continue;
                 }
@@ -985,17 +1474,29 @@ impl App {
             }
             KeyCode::Char('a') => self.permission(scene, true, ctl, now_ms),
             KeyCode::Char('d') => self.permission(scene, false, ctl, now_ms),
+            KeyCode::Char('A') => self.open_approve_all(scene, now_ms),
             KeyCode::Char('x') => match self.selected_agent(scene) {
-                Some(a) if a.kind == AgentKind::Agy => match a.pid {
+                Some(a) => match a.pid {
                     Some(pid) => self.popup = Popup::ConfirmCancel { id: a.id.clone(), label: a.label.clone(), pid },
-                    None => self.toast(format!("{} has no router pid yet", a.label), AlertLevel::Info, now_ms),
+                    None => self.toast(format!("{} has no live pid", a.label), AlertLevel::Info, now_ms),
                 },
-                Some(a) => {
-                    let l = a.label.clone();
-                    self.toast(format!("x cancels agy calls only ({l} is not one)"), AlertLevel::Info, now_ms)
-                }
                 None => self.toast("no agent selected", AlertLevel::Info, now_ms),
             },
+            KeyCode::Char('K') => self.open_free_ram(scene, now_ms),
+            KeyCode::Char('p') => {
+                self.popup = Popup::Dispatch {
+                    field: 2,
+                    target_idx: 0,
+                    cwd: self.default_cwd(scene),
+                    prompt: String::new(),
+                    followup: None,
+                };
+            }
+            KeyCode::Char('f') => match self.selected_agent(scene).map(|a| a.id.clone()) {
+                Some(id) => self.open_followup(scene, &id, now_ms),
+                None => self.toast("no agent selected", AlertLevel::Info, now_ms),
+            },
+            KeyCode::Char(' ') => self.popup = Popup::Actions { sel: 0 },
             KeyCode::Char('o') => self.resume(scene, ctl, now_ms),
             KeyCode::Char('?') => {
                 self.detail_scroll = 0;
@@ -1046,23 +1547,17 @@ impl App {
             return;
         };
         // For a subagent, resume its parent session.
-        let target = match a.kind {
-            AgentKind::Claude => Some(a),
-            AgentKind::ClaudeSub => a.parent.as_ref().and_then(|p| scene.agents.get(p)).or(Some(a)),
-            _ => None,
+        let t = match a.kind {
+            AgentKind::Claude | AgentKind::Agy | AgentKind::Other => a,
+            AgentKind::ClaudeSub => a.parent.as_ref().and_then(|p| scene.agents.get(p)).unwrap_or(a),
         };
-        let Some(t) = target else {
-            let l = a.label.clone();
-            self.toast(format!("o resumes Claude sessions only ({l} is not one)"), AlertLevel::Info, now_ms);
-            return;
-        };
-        let Some(rid) = t.resume_id.clone() else {
+        let Some(rid) = t.resume_id.clone().filter(|s| !s.is_empty()) else {
             let l = t.label.clone();
             self.toast(format!("{l}: no session id to resume"), AlertLevel::Info, now_ms);
             return;
         };
         let cwd = t.cwd.clone();
-        match ctl.resume_claude(cwd.as_deref(), &rid) {
+        match ctl.resume_agent(t, cwd.as_deref(), &rid) {
             Ok(cmd) => self.toast(format!("copied: {cmd}"), AlertLevel::Info, now_ms),
             Err(e) => self.toast(format!("resume failed: {e}"), AlertLevel::Critical, now_ms),
         }
@@ -1140,6 +1635,12 @@ impl App {
             };
         }
         let (x, y) = (ev.column, ev.row);
+        let btn = self.layout.free_ram_btn;
+        if btn.width > 0 && x >= btn.x && x < btn.x + btn.width && y >= btn.y && y < btn.y + btn.height {
+            self.open_free_ram(scene, now_ms);
+            self.dirty = true;
+            return true;
+        }
         let tb = self.layout.side_tabs;
         if self.sidebar && tb.width > 0 && x >= tb.x && x < tb.x + tb.width && y >= tb.y && y < tb.y + tb.height {
             if let Some(t) = SideTab::at_offset(x - tb.x) {
@@ -1429,7 +1930,7 @@ mod tests {
         let mut h = Harness::new();
         select(&mut h.app, "cc:dice");
         h.press(key('x'));
-        assert!(h.toast().contains("agy calls only"));
+        assert!(h.toast().contains("no live pid"));
         select(&mut h.app, "agy:4242");
         h.press(key('x'));
         assert!(matches!(&h.app.popup, Popup::ConfirmCancel { pid: 4242, .. }));
@@ -1451,7 +1952,7 @@ mod tests {
         assert!(h.toast().starts_with("copied: "));
         select(&mut h.app, "agy:4242");
         h.press(key('o'));
-        assert!(h.toast().contains("Claude sessions only"));
+        assert!(h.toast().contains("no session id to resume"));
     }
 
     #[test]
@@ -2025,5 +2526,287 @@ mod tests {
         assert_eq!(h.app.side_tab, SideTab::Jobs);
         assert!(h.app.handle_mouse_at(click(80 + 28), &h.scene, &|_, _| None, 100));
         assert_eq!(h.app.side_tab, SideTab::Stats);
+    }
+
+    #[test]
+    fn idle_kill_candidates_filters_and_sorts_by_rss() {
+        let mut s = Scene::default();
+        let mk = |id: &str, kind: AgentKind, state: AgentState, pid: Option<u32>, rss: Option<u32>, parent: Option<&str>| {
+            let mut a = agent(id, kind, parent);
+            a.state = state;
+            a.pid = pid;
+            a.rss_mb = rss;
+            a.last_event_ms = 1_000;
+            a
+        };
+        // Active & NeedsYou excluded.
+        s.agents.insert("active".into(), mk("active", AgentKind::Claude, AgentState::Running, Some(100), Some(900), None));
+        s.agents.insert("needs".into(), mk("needs", AgentKind::Claude, AgentState::NeedsYou, Some(101), Some(800), None));
+        // Parent with an active child excluded.
+        s.agents.insert("parent-busy".into(), mk("parent-busy", AgentKind::Claude, AgentState::Idle, Some(102), Some(700), None));
+        s.agents.insert("child-busy".into(), mk("child-busy", AgentKind::Agy, AgentState::Typing, Some(103), Some(200), Some("parent-busy")));
+        // Parent whose child is Done IS eligible.
+        s.agents.insert("parent-ok".into(), mk("parent-ok", AgentKind::Claude, AgentState::Idle, Some(104), Some(300), None));
+        s.agents.insert("child-done".into(), mk("child-done", AgentKind::Agy, AgentState::Done, Some(105), Some(150), Some("parent-ok")));
+        // Orphan with pid > 1 and Done state included; pid <= 1 / None excluded.
+        s.agents.insert("ag-orphan:200".into(), mk("ag-orphan:200", AgentKind::Other, AgentState::Idle, Some(200), Some(500), None));
+        s.agents.insert("no-pid".into(), mk("no-pid", AgentKind::Claude, AgentState::Idle, None, Some(999), None));
+        s.agents.insert("pid-1".into(), mk("pid-1", AgentKind::Claude, AgentState::Idle, Some(1), Some(999), None));
+
+        let cands = idle_kill_candidates(&s, 10_000);
+        let ids: Vec<&str> = cands.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["ag-orphan:200", "parent-ok", "child-done"]);
+        assert!(cands[0].is_orphan);
+        assert!(!cands[1].is_orphan);
+        assert_eq!(cands[0].rss_mb, 500);
+        assert_eq!(cands[0].idle_ms, 9_000);
+    }
+
+    #[test]
+    fn free_ram_popup_toggles_kills_and_opens_on_button_click() {
+        let mut h = Harness::new();
+        // Empty candidates + 0 orphans -> toast, stays None.
+        h.press(key('K'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert!(h.toast().contains("no idle killable"));
+
+        // Add two idle candidates with PIDs.
+        let mut a1 = agent("cc:idle1", AgentKind::Claude, None);
+        a1.pid = Some(1111);
+        a1.rss_mb = Some(400);
+        a1.state = AgentState::Idle;
+        let mut a2 = agent("ag-orphan:2222", AgentKind::Other, None);
+        a2.pid = Some(2222);
+        a2.rss_mb = Some(250);
+        a2.state = AgentState::Done;
+        h.scene.agents.insert(a1.id.clone(), a1);
+        h.scene.agents.insert(a2.id.clone(), a2);
+
+        h.press(key('K'));
+        assert!(matches!(h.app.popup, Popup::FreeRam { sel: 0, .. }));
+        // Space unchecks first target, Enter kills only second target.
+        h.press(key(' '));
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.killed, vec![2222]);
+        assert!(h.toast().contains("stopped 1 idle agents (~250 MB)"), "{}", h.toast());
+
+        // Clicking free_ram_btn opens FreeRam.
+        h.app.layout.free_ram_btn = Rect::new(50, 0, 12, 1);
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 55, row: 0, modifiers: KeyModifiers::NONE };
+        assert!(h.app.handle_mouse_at(click, &h.scene, &|_, _| None, 5_000));
+        assert!(matches!(h.app.popup, Popup::FreeRam { .. }));
+    }
+
+    #[test]
+    fn dispatch_popup_switches_targets_types_and_submits() {
+        let mut h = Harness::new();
+        select(&mut h.app, "cc:dice");
+        h.press(key('p'));
+        assert!(matches!(
+            &h.app.popup,
+            Popup::Dispatch { field: 2, target_idx: 0, cwd, prompt, followup: None }
+            if cwd == "/tmp/dice" && prompt.is_empty()
+        ));
+        // Empty prompt keeps popup open.
+        h.press(code(KeyCode::Enter));
+        assert!(matches!(h.app.popup, Popup::Dispatch { .. }));
+        assert!(h.toast().contains("enter a prompt"));
+
+        // Type prompt, switch to field 0 (Tab), step target Right, submit.
+        for ch in "fix bug".chars() {
+            h.press(key(ch));
+        }
+        h.press(code(KeyCode::Tab));
+        assert!(matches!(h.app.popup, Popup::Dispatch { field: 0, .. }));
+        h.press(code(KeyCode::Right));
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.dispatched, vec![("agy:architect".into(), "/tmp/dice".into(), "fix bug".into())]);
+    }
+
+    #[test]
+    fn followup_from_main_and_report_view_calls_ctl() {
+        let mut h = Harness::new();
+        select(&mut h.app, "cc:dice");
+        h.press(key('f'));
+        assert!(matches!(
+            &h.app.popup,
+            Popup::Dispatch { field: 2, followup: Some((id, _)), .. } if id == "cc:dice"
+        ));
+        for ch in "continue".chars() {
+            h.press(key(ch));
+        }
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.followups, vec![("cc:dice".into(), "continue".into())]);
+
+        // From ReportView via 'f'.
+        h.scene.reports.push(boss_report(42, "cc:office", "need reply"));
+        h.app.popup = Popup::ReportView { id: 42, only: None, inbox: true };
+        h.press(key('f'));
+        assert!(matches!(
+            &h.app.popup,
+            Popup::Dispatch { field: 2, followup: Some((id, _)), .. } if id == "cc:office"
+        ));
+        for ch in "proceed".chars() {
+            h.press(key(ch));
+        }
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.ctl.followups.last(), Some(&("cc:office".into(), "proceed".into())));
+    }
+
+    #[test]
+    fn approve_all_popup_resolves_all_pending_permissions() {
+        let mut h = Harness::new();
+        h.app.permissions_enabled = true;
+        h.scene.agents.get_mut("cc:dice").unwrap().pending_permission = Some("perm-2".into());
+        h.press(key('A'));
+        assert!(matches!(&h.app.popup, Popup::ConfirmApproveAll { items } if items.len() == 2));
+        h.press(key('y'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.calls.len(), 2);
+        assert!(h.ctl.calls.contains(&"perm perm-1 allow".to_string()));
+        assert!(h.ctl.calls.contains(&"perm perm-2 allow".to_string()));
+        assert_eq!(h.toast(), "approved 2 permissions");
+    }
+
+    #[test]
+    fn actions_palette_runs_reap_and_prune() {
+        let mut h = Harness::new();
+        h.press(key(' '));
+        assert_eq!(h.app.popup, Popup::Actions { sel: 0 });
+        h.press(key('R'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.reaped, 1);
+        assert!(h.toast().contains("reaped 2 orphan agy (~420 MB)"));
+
+        h.press(key(' '));
+        h.press(key('B'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.pruned, 1);
+        assert!(h.toast().contains("pruning"));
+    }
+
+    #[test]
+    fn x_kills_idle_claude_agent_with_pid() {
+        let mut h = Harness::new();
+        let mut c = agent("cc:killme", AgentKind::Claude, None);
+        c.label = "cc·killme".into();
+        c.pid = Some(7777);
+        c.state = AgentState::Idle;
+        h.scene.agents.insert(c.id.clone(), c);
+        select(&mut h.app, "cc:killme");
+        h.press(key('x'));
+        assert!(matches!(&h.app.popup, Popup::ConfirmCancel { id, pid: 7777, .. } if id == "cc:killme"));
+        h.press(key('y'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.killed, vec![7777]);
+        assert!(h.toast().contains("SIGTERM"));
+    }
+
+    #[test]
+    fn o_resumes_ag_agent_with_resume_id() {
+        let mut h = Harness::new();
+        let mut ag = agent("ag:abc123", AgentKind::Other, None);
+        ag.label = "agy-cli".into();
+        ag.cwd = Some("/tmp/repo".into());
+        ag.resume_id = Some("abc123".into());
+        h.scene.agents.insert(ag.id.clone(), ag);
+        select(&mut h.app, "ag:abc123");
+        h.press(key('o'));
+        assert_eq!(h.ctl.calls, vec!["resume /tmp/repo abc123".to_string()]);
+        assert!(h.toast().contains("agy --resume abc123"), "{}", h.toast());
+    }
+
+    #[test]
+    fn dispatch_targets_include_new_roles_and_rosso_auto() {
+        let keys: Vec<&str> = DISPATCH_TARGETS.iter().map(|(k, _)| *k).collect();
+        for expected in ["agy:manager", "agy:git", "rosso-auto:council", "rosso-auto:simple"] {
+            assert!(keys.contains(&expected), "missing {expected} in {keys:?}");
+        }
+    }
+
+    #[test]
+    fn jobs_tab_r_resumes_and_x_aborts_auto_job_with_confirm() {
+        let mut h = Harness::new();
+        // Put one non-auto report job (older) and one auto job (newer).
+        h.scene.reports.push(office_core::Report {
+            id: 1,
+            at_ms: 10,
+            kind: office_core::ReportKind::Report,
+            from: "rosso:A".into(),
+            from_label: "A".into(),
+            to: Some("rosso:B".into()),
+            to_label: "B".into(),
+            title: "Memo: plain".into(),
+            body: "x".into(),
+            brief: String::new(),
+        });
+        h.scene.report_jobs.insert(1, "plain-job".into());
+        h.scene.auto_jobs.push(office_core::AutoJob {
+            job: "auto-job".into(),
+            task: "ship feature".into(),
+            flow: "council".into(),
+            phase: "execute".into(),
+            status: "running".into(),
+            calls_used: 4,
+            max_calls: 12,
+            started_at: 50,
+            ..Default::default()
+        });
+
+        h.press(key('2'));
+        assert_eq!(h.app.side_tab, SideTab::Jobs);
+        assert_eq!(h.app.jobs_sel, 0);
+
+        // Press R on auto-job -> calls resume_auto.
+        h.press(key('R'));
+        assert_eq!(*h.ctl.auto_resumed.lock().unwrap(), vec!["auto-job".to_string()]);
+        assert_eq!(h.toast(), "resumed auto job auto-job");
+
+        // Press X on auto-job -> opens ConfirmAbortAuto, Esc cancels.
+        h.press(key('X'));
+        assert_eq!(
+            h.app.popup,
+            Popup::ConfirmAbortAuto { job: "auto-job".into(), phase: "execute".into() }
+        );
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+        assert!(h.ctl.auto_aborted.lock().unwrap().is_empty());
+
+        // Press X then N cancels too.
+        h.press(key('X'));
+        h.press(key('n'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert!(h.ctl.auto_aborted.lock().unwrap().is_empty());
+
+        // Press X then Y confirms abort.
+        h.press(key('X'));
+        h.press(key('y'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(*h.ctl.auto_aborted.lock().unwrap(), vec!["auto-job".to_string()]);
+        assert_eq!(h.toast(), "abort requested for auto-job");
+
+        // Press X then Enter also confirms abort.
+        h.press(key('X'));
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.ctl.auto_aborted.lock().unwrap().len(), 2);
+
+        // Error surfaces Critical toast.
+        h.ctl.fail = true;
+        h.press(key('R'));
+        assert!(h.toast().starts_with("resume failed: boom"), "{}", h.toast());
+        h.ctl.fail = false;
+
+        // Selecting the non-auto job (index 1): R / X show a friendly toast, no popup.
+        h.press(key('j'));
+        assert_eq!(h.app.jobs_sel, 1);
+        h.press(key('R'));
+        assert!(h.toast().contains("not a rosso-auto job"), "{}", h.toast());
+        h.press(key('X'));
+        assert_eq!(h.app.popup, Popup::None);
+        assert!(h.toast().contains("not a rosso-auto job"), "{}", h.toast());
     }
 }

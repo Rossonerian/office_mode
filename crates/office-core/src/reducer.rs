@@ -19,6 +19,7 @@ const MAX_RETIRED: usize = 512;
 const MAX_QUEUE_TICKETS: usize = 64;
 const MAX_WAVES: usize = 16;
 const MAX_DISPATCH_MODES: usize = 32;
+pub const MAX_AUTO_JOBS: usize = 16;
 
 /// Tool name -> character state (shared by every source).
 pub fn state_for_tool(tool: &str) -> AgentState {
@@ -980,6 +981,22 @@ impl Reducer {
                 }
                 let changed = self.scene.dispatch_modes != m;
                 self.scene.dispatch_modes = m;
+                changed
+            }
+            EventKind::AutoJobs(mut jobs) => {
+                while jobs.len() > MAX_AUTO_JOBS {
+                    if let Some((idx, _)) = jobs
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, j)| (j.status == "running", j.started_at))
+                    {
+                        jobs.remove(idx);
+                    } else {
+                        break;
+                    }
+                }
+                let changed = self.scene.auto_jobs != jobs;
+                self.scene.auto_jobs = jobs;
                 changed
             }
             EventKind::Handoff { from, to, kind, title, body, brief } => {
@@ -2020,5 +2037,77 @@ mod tests {
             .collect();
         assert!(r.apply(ev(20_000, EventKind::DispatchModes(many))));
         assert_eq!(r.scene().dispatch_modes.len(), MAX_DISPATCH_MODES);
+    }
+
+    #[test]
+    fn auto_jobs_bounded_keeping_running_and_newest() {
+        use crate::model::AutoJob;
+
+        let mut r = Reducer::new();
+        let mut jobs = Vec::new();
+        // 20 completed jobs (started_at 1_000..1_019) + 2 older running jobs (started_at 100, 200)
+        for i in 0..20u64 {
+            jobs.push(AutoJob {
+                job: format!("done-{i:02}"),
+                flow: "council".into(),
+                phase: "report".into(),
+                status: "done".into(),
+                started_at: 1_000 + i,
+                ..Default::default()
+            });
+        }
+        jobs.push(AutoJob {
+            job: "run-old-1".into(),
+            flow: "council".into(),
+            phase: "execute".into(),
+            status: "running".into(),
+            started_at: 100,
+            ..Default::default()
+        });
+        jobs.push(AutoJob {
+            job: "run-old-2".into(),
+            flow: "simple".into(),
+            phase: "design".into(),
+            status: "running".into(),
+            started_at: 200,
+            ..Default::default()
+        });
+
+        assert!(r.apply(ev(2_000, EventKind::AutoJobs(jobs))));
+        assert_eq!(r.scene().auto_jobs.len(), MAX_AUTO_JOBS);
+
+        let kept: Vec<&str> = r.scene().auto_jobs.iter().map(|j| j.job.as_str()).collect();
+        // Both running jobs must be kept even though their started_at is oldest
+        assert!(kept.contains(&"run-old-1"));
+        assert!(kept.contains(&"run-old-2"));
+        // Remaining 14 slots keep the newest 14 completed jobs (done-06 .. done-19)
+        for i in 0..6 {
+            assert!(!kept.contains(&format!("done-{i:02}").as_str()), "done-{i:02} should be dropped");
+        }
+        for i in 6..20 {
+            assert!(kept.contains(&format!("done-{i:02}").as_str()), "done-{i:02} should be kept");
+        }
+
+        // Duplicate snapshot is a no-op
+        let current = r.scene().auto_jobs.clone();
+        assert!(!r.apply(ev(2_001, EventKind::AutoJobs(current))));
+
+        // More than MAX_AUTO_JOBS running jobs drops the oldest running jobs
+        let many_running: Vec<AutoJob> = (0..20u64)
+            .map(|i| AutoJob {
+                job: format!("run-{i:02}"),
+                status: "running".into(),
+                started_at: 5_000 + i,
+                ..Default::default()
+            })
+            .collect();
+        assert!(r.apply(ev(3_000, EventKind::AutoJobs(many_running))));
+        assert_eq!(r.scene().auto_jobs.len(), MAX_AUTO_JOBS);
+        for i in 0..4 {
+            assert!(!r.scene().auto_jobs.iter().any(|j| j.job == format!("run-{i:02}")));
+        }
+        for i in 4..20 {
+            assert!(r.scene().auto_jobs.iter().any(|j| j.job == format!("run-{i:02}")));
+        }
     }
 }

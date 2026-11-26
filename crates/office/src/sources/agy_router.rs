@@ -68,7 +68,8 @@ pub fn spawn(cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
             if Path::new(&route).exists() {
                 if let Some(text) = run_dry(&route) {
                     let mut st = parse_dry_run(&text);
-                    st.queued = shared.lock().map(|s| s.queued).unwrap_or(0);
+                    let scan_queued = shared.lock().map(|s| s.queued).unwrap_or(0);
+                    st.queued = st.queued.max(scan_queued);
                     let extra = parse_router_extra(&text);
                     let mut evs = vec![EventKind::Router(st)];
                     if let Ok(mut sh) = shared.lock() {
@@ -147,12 +148,39 @@ fn has_flag(cmd: &str, name: &str) -> bool {
     false
 }
 
-/// Live routers: `bun … agy-route --role <r> …` (not --dry-run), with summed descendant RSS.
-pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
+fn children_map(procs: &[Proc]) -> HashMap<u32, Vec<&Proc>> {
     let mut kids: HashMap<u32, Vec<&Proc>> = HashMap::new();
     for p in procs {
         kids.entry(p.ppid).or_default().push(p);
     }
+    kids
+}
+
+/// Walk descendants of `root`, returning summed descendant `rss_kb` and marking all visited PIDs
+/// (including `root`) in `visited`. Cycle-safe and bounded.
+fn walk_descendants(root: u32, kids: &HashMap<u32, Vec<&Proc>>, visited: &mut HashSet<u32>) -> u64 {
+    let mut kb = 0u64;
+    let mut stack = vec![root];
+    visited.insert(root);
+    let mut guard = 0usize;
+    while let Some(x) = stack.pop() {
+        guard += 1;
+        if guard > 10_000 {
+            break;
+        }
+        for k in kids.get(&x).into_iter().flatten() {
+            if visited.insert(k.pid) {
+                kb = kb.saturating_add(k.rss_kb);
+                stack.push(k.pid);
+            }
+        }
+    }
+    kb
+}
+
+/// Live routers: `bun … agy-route --role <r> …` (not --dry-run), with summed descendant RSS.
+pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
+    let kids = children_map(procs);
     procs
         .iter()
         .filter(|p| {
@@ -164,22 +192,8 @@ pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
                 && !has_flag(&p.cmd, "--status")
         })
         .map(|p| {
-            let mut kb = 0u64;
-            let mut stack = vec![p.pid];
-            let mut visited = HashSet::from([p.pid]);
-            let mut guard = 0;
-            while let Some(x) = stack.pop() {
-                guard += 1;
-                if guard > 10_000 {
-                    break;
-                }
-                for k in kids.get(&x).into_iter().flatten() {
-                    if visited.insert(k.pid) {
-                        kb += k.rss_kb;
-                        stack.push(k.pid);
-                    }
-                }
-            }
+            let mut visited = HashSet::new();
+            let kb = walk_descendants(p.pid, &kids, &mut visited);
             RouterProc {
                 pid: p.pid,
                 role: flag(&p.cmd, "--role").unwrap_or_else(|| "?".into()),
@@ -189,6 +203,31 @@ pub fn find_routers(procs: &[Proc]) -> Vec<RouterProc> {
                 rosso_job: flag(&p.cmd, "--rosso-job"),
                 rosso_as: flag(&p.cmd, "--as"),
             }
+        })
+        .collect()
+}
+
+/// Standalone orphan `agy` CLI processes (`ppid == 1`, not inside any live router tree),
+/// returning `(pid, inclusive_rss_mb)`. Never matches Electron / Antigravity Helper apps.
+pub fn find_orphan_agy(procs: &[Proc], routers: &[RouterProc]) -> Vec<(u32, u32)> {
+    let kids = children_map(procs);
+    let mut router_tree = HashSet::new();
+    for r in routers {
+        if !router_tree.contains(&r.pid) {
+            let _ = walk_descendants(r.pid, &kids, &mut router_tree);
+        }
+    }
+    procs
+        .iter()
+        .filter(|p| {
+            p.ppid == 1
+                && basename(p.cmd.split_whitespace().next().unwrap_or("")) == "agy"
+                && !router_tree.contains(&p.pid)
+        })
+        .map(|p| {
+            let mut visited = HashSet::new();
+            let kb = p.rss_kb.saturating_add(walk_descendants(p.pid, &kids, &mut visited));
+            (p.pid, (kb / 1024) as u32)
         })
         .collect()
 }
@@ -319,16 +358,30 @@ struct LiveRouter {
     queue_key: Option<(u32, bool)>,
 }
 
+fn resolve_model(
+    role: &str,
+    audit_models: &HashMap<String, String>,
+    role_models: &HashMap<String, String>,
+    cfg_models: &BTreeMap<String, String>,
+) -> Option<String> {
+    audit_models
+        .get(role)
+        .or_else(|| role_models.get(role))
+        .or_else(|| cfg_models.get(role))
+        .cloned()
+}
+
 fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir: PathBuf) {
     let mut live: BTreeMap<u32, LiveRouter> = BTreeMap::new();
+    let mut live_orphans: HashSet<u32> = HashSet::new();
     let mut fallback_since: HashMap<u32, u64> = HashMap::new();
     let mut last_tickets: BTreeMap<AgentId, QueueTicket> = BTreeMap::new();
     let mut tick: u64 = 0;
     loop {
-        let idle = live.is_empty() && !has_any_lock(&run_dir);
+        let idle = live.is_empty() && live_orphans.is_empty() && !has_any_lock(&run_dir);
         if !idle || tick % 3 == 0 {
             let out = Command::new("ps").args(["-axo", "pid=,ppid=,rss=,command="]).stderr(Stdio::null()).output();
-            if let Ok(out) = out {
+            if let Some(out) = out.ok().filter(|o| o.status.success()) {
                 let procs = parse_ps(&String::from_utf8_lossy(&out.stdout));
                 let routers = find_routers(&procs);
                 let slots = read_slots(&run_dir);
@@ -371,11 +424,7 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                 for r in &routers {
                     let id = format!("agy:{}", r.pid);
                     let slot = slots.get(&r.pid).copied();
-                    let model = models
-                        .get(&r.role)
-                        .cloned()
-                        .or_else(|| cfg.agy_models.get(&r.role).cloned())
-                        .or_else(|| role_models.get(&r.role).cloned());
+                    let model = resolve_model(&r.role, &models, &role_models, &cfg.agy_models);
                     let running = slot.is_some() || r.rss_mb > 0;
                     let qt = queued_by_pid.get(&r.pid);
                     let queue_key = qt.map(|q| (q.pos, q.repo_busy));
@@ -439,6 +488,39 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
                     live.remove(&pid);
                     evs.push(EventKind::Gone { id: format!("agy:{pid}") });
                 }
+
+                let orphans = find_orphan_agy(&procs, &routers);
+                let mut seen_orphans: HashSet<u32> = HashSet::with_capacity(orphans.len());
+                for (pid, rss_mb) in orphans {
+                    seen_orphans.insert(pid);
+                    let id = format!("ag-orphan:{pid}");
+                    if live_orphans.insert(pid) {
+                        evs.push(EventKind::AgentSeen {
+                            id: id.clone(),
+                            kind: AgentKind::Other,
+                            label: Some("agy·orphan".into()),
+                            parent: None,
+                            cwd: None,
+                            role: None,
+                            model: None,
+                            slot: None,
+                            pid: Some(pid),
+                            resume_id: None,
+                        });
+                        evs.push(EventKind::State {
+                            id: id.clone(),
+                            state: AgentState::Idle,
+                            activity: Some("orphan process (K to free)".into()),
+                        });
+                    }
+                    evs.push(EventKind::Resources { id, rss_mb });
+                }
+                let gone_orphans: Vec<u32> = live_orphans.iter().copied().filter(|p| !seen_orphans.contains(p)).collect();
+                for pid in gone_orphans {
+                    live_orphans.remove(&pid);
+                    evs.push(EventKind::Gone { id: format!("ag-orphan:{pid}") });
+                }
+
                 if queue_tickets != last_tickets {
                     last_tickets = queue_tickets.clone();
                     evs.push(EventKind::QueueTickets(queue_tickets));
@@ -499,7 +581,7 @@ fn first_num<T: std::str::FromStr>(s: &str) -> Option<T> {
     t.parse().ok()
 }
 
-/// Parse CAPACITY/FREE_MB/PER_PROC_MB/PRESSURE/SLOTS/LIMIT/MAX_CONCURRENT from the dry-run block.
+/// Parse CAPACITY/FREE_MB/PER_PROC_MB/PRESSURE/SLOTS/QUEUE/LIMIT/MAX_CONCURRENT from the dry-run block.
 pub fn parse_dry_run(text: &str) -> RouterStatus {
     let mut st = RouterStatus::default();
     for line in text.lines() {
@@ -511,6 +593,7 @@ pub fn parse_dry_run(text: &str) -> RouterStatus {
             "FREE_MB" => st.free_mb = first_num(v),
             "PER_PROC_MB" => st.per_proc_mb = first_num(v),
             "PRESSURE" => st.pressure = first_num(v),
+            "QUEUE" => st.queued = first_num(v).unwrap_or(0),
             "SLOTS" => {
                 // "0/5 slots busy"
                 st.busy_slots = first_num(v).unwrap_or(0);
@@ -679,10 +762,12 @@ pub fn audit_events(v: &Value, agent: Option<String>, now: u64, failure_file: Op
     out
 }
 
-/// A finished agy call's result, handed back to the relay that started it. The full response
-/// text is included when the router saved it (long answers); otherwise the relay's own report
-/// (which quotes the router block verbatim) carries it.
-fn audit_report(v: &Value, from: String) -> EventKind {
+const SEED_MAX_REPORTS: usize = 10;
+const SEED_MAX_AGE: Duration = Duration::from_secs(2 * 3600);
+
+/// A finished agy call's result, handed back to the relay that started it (or the Boss Inbox for
+/// standalone `agy-route` calls). The full response text is included when the router saved it.
+pub fn audit_report(v: &Value, from: String, kind: ReportKind) -> EventKind {
     let g = |k: &str| v.get(k).map(|x| match x {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -707,7 +792,30 @@ fn audit_report(v: &Value, from: String) -> EventKind {
         }
     }
     let title = format!("{} {}{}", g("role"), status, if code.is_empty() { String::new() } else { format!(" {code}") });
-    EventKind::Handoff { from, to: None, kind: ReportKind::Report, title, body, brief: String::new() }
+    EventKind::Handoff { from, to: None, kind, title, body, brief: String::new() }
+}
+
+fn audit_report_for(v: &Value, agent: Option<&str>, role: &str) -> EventKind {
+    let is_rosso = v.get("rossoJob").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    let (from, kind) = match agent {
+        Some(id) => (id.to_string(), ReportKind::Report),
+        None => {
+            let run = v.get("run").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(role);
+            let kind = if is_rosso { ReportKind::Report } else { ReportKind::Result };
+            (format!("agy-audit:{run}"), kind)
+        }
+    };
+    audit_report(v, from, kind)
+}
+
+fn has_fresh_response_file(v: &Value) -> bool {
+    let Some(path) = v.get("fullResponseFile").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age <= SEED_MAX_AGE)
 }
 
 fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
@@ -717,7 +825,7 @@ fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
         if let Ok(mut f) = std::fs::File::open(&log) {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             let start = match offset {
-                // first sight: seed models from the last 64 KB, don't replay old alerts
+                // first sight: seed models + recent response files from the last 64 KB, don't replay old alerts
                 None => len.saturating_sub(64 * 1024),
                 Some(o) if o > len => 0,
                 Some(o) => o,
@@ -730,6 +838,7 @@ fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
                 partial.extend_from_slice(&buf);
                 if let Some(nl) = partial.iter().rposition(|b| *b == b'\n') {
                     let lines: Vec<u8> = partial.drain(..=nl).collect();
+                    let mut seed: std::collections::VecDeque<(Value, Option<String>, String)> = std::collections::VecDeque::new();
                     for l in lines.split(|b| *b == b'\n') {
                         let Ok(v) = serde_json::from_slice::<Value>(l) else { continue };
                         let role = v.get("role").and_then(Value::as_str).unwrap_or("").to_string();
@@ -739,19 +848,29 @@ fn audit_loop(log: PathBuf, tx: Sender<Event>, shared: Arc<Mutex<Shared>>) {
                             if let Some(m) = v.get("model").and_then(Value::as_str) {
                                 s.models.insert(role.clone(), m.to_string());
                             }
-                            agent = s.recent.get(&(role, canon_cwd(&cwd))).cloned();
+                            agent = s.recent.get(&(role.clone(), canon_cwd(&cwd))).cloned();
                         }
                         if replay {
-                            if let Some(from) = agent.clone() {
-                                if tx.send(Event::now(SourceKind::AgyRouter, audit_report(&v, from))).is_err() {
-                                    return;
-                                }
+                            if tx.send(Event::now(SourceKind::AgyRouter, audit_report_for(&v, agent.as_deref(), &role))).is_err() {
+                                return;
                             }
                             let ff = read_failure_file(&v);
                             for k in audit_events(&v, agent, paths::now_ms(), ff.as_ref()) {
                                 if tx.send(Event::now(SourceKind::AgyRouter, k)).is_err() {
                                     return;
                                 }
+                            }
+                        } else if has_fresh_response_file(&v) {
+                            if seed.len() == SEED_MAX_REPORTS {
+                                seed.pop_front();
+                            }
+                            seed.push_back((v, agent, role));
+                        }
+                    }
+                    if !replay {
+                        for (v, agent, role) in seed {
+                            if tx.send(Event::now(SourceKind::AgyRouter, audit_report_for(&v, agent.as_deref(), &role))).is_err() {
+                                return;
                             }
                         }
                     }
@@ -773,7 +892,7 @@ mod tests {
 
     #[test]
     fn parses_dry_run_block() {
-        let t = "STATUS: DRY_RUN\nMAX_CONCURRENT: 5\nSLOTS: 1/5 slots busy\nCAPACITY: 2\nFREE_MB: 1571\nPER_PROC_MB: 300\nPRESSURE: 2 (warn)\nLIMIT: memory pressure warn (level 2) -> capacity 2\nRESPONSE:\nCAPACITY: 99\n";
+        let t = "STATUS: DRY_RUN\nMAX_CONCURRENT: 5\nSLOTS: 1/5 slots busy\nCAPACITY: 2\nFREE_MB: 1571\nPER_PROC_MB: 300\nPRESSURE: 2 (warn)\nQUEUE: 2 waiting\nLIMIT: memory pressure warn (level 2) -> capacity 2\nRESPONSE:\nCAPACITY: 99\n";
         let s = parse_dry_run(t);
         assert_eq!(s.capacity, Some(2));
         assert_eq!(s.max_concurrent, Some(5));
@@ -781,7 +900,29 @@ mod tests {
         assert_eq!(s.free_mb, Some(1571));
         assert_eq!(s.per_proc_mb, Some(300));
         assert_eq!(s.pressure, Some(2));
+        assert_eq!(s.queued, 2);
         assert_eq!(s.limit_text.as_deref(), Some("memory pressure warn (level 2) -> capacity 2"));
+    }
+
+    #[test]
+    fn prefers_live_role_models_over_config_and_strips_timeout() {
+        let extra = parse_router_extra("ROLE_MODELS: architect=gemini-4-neon-high/360s worker=gemini-4-hydrogen-low/540s tester=gemini-4-flash\n");
+        assert_eq!(extra.role_models.get("architect").map(String::as_str), Some("gemini-4-neon-high"));
+        assert_eq!(extra.role_models.get("worker").map(String::as_str), Some("gemini-4-hydrogen-low"));
+        assert_eq!(extra.role_models.get("tester").map(String::as_str), Some("gemini-4-flash"));
+
+        let role_models: HashMap<String, String> = extra.role_models.into_iter().collect();
+        let cfg_models = BTreeMap::from([
+            ("architect".into(), "stale-cfg-arch".into()),
+            ("worker".into(), "stale-cfg-worker".into()),
+            ("manager".into(), "cfg-manager".into()),
+        ]);
+        let audit_models = HashMap::from([("worker".into(), "audit-worker".into())]);
+
+        assert_eq!(resolve_model("worker", &audit_models, &role_models, &cfg_models).as_deref(), Some("audit-worker"));
+        assert_eq!(resolve_model("architect", &audit_models, &role_models, &cfg_models).as_deref(), Some("gemini-4-neon-high"));
+        assert_eq!(resolve_model("manager", &audit_models, &role_models, &cfg_models).as_deref(), Some("cfg-manager"));
+        assert_eq!(resolve_model("unknown", &audit_models, &role_models, &cfg_models), None);
     }
 
     #[test]
@@ -957,5 +1098,59 @@ mod tests {
         assert_eq!(evs.len(), 1);
         // verdict without an attributed agent is dropped
         assert!(audit_events(&ok, None, 5, None).is_empty());
+    }
+
+    #[test]
+    fn finds_orphan_agy_and_ignores_electron_and_router_trees() {
+        let ps = "\
+  100     1  50000 /opt/homebrew/bin/bun /Users/u/.claude/bin/agy-route --role worker --cwd /p/repo --prompt-file /tmp/x
+  101   100 204800 /opt/homebrew/bin/agy -p x --model gemini-4-hydrogen-low
+  102   101  51200 node child
+  200     1 102400 /opt/homebrew/bin/agy -p orphan-task
+  201   200 102400 node orphan-helper
+  300     1 300000 /Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper --type=renderer
+  301     1 200000 /Applications/Antigravity.app/Contents/MacOS/Electron
+  400    50  90000 /opt/homebrew/bin/agy -p non-orphan-parent
+";
+        let procs = parse_ps(ps);
+        let routers = find_routers(&procs);
+        let orphans = find_orphan_agy(&procs, &routers);
+        assert_eq!(orphans, vec![(200, 200)]);
+    }
+
+    #[test]
+    fn standalone_audit_report_routes_to_boss_inbox() {
+        let v: Value = serde_json::from_str(
+            r#"{"run":"r-123","role":"worker","model":"gemini-4-hydrogen-low","status":"OK","durationMs":4000,"queuedMs":12,"responseChars":50}"#,
+        )
+        .unwrap();
+        match audit_report_for(&v, None, "worker") {
+            EventKind::Handoff { from, to, kind, title, body, .. } => {
+                assert_eq!(from, "agy-audit:r-123");
+                assert_eq!(to, None);
+                assert_eq!(kind, ReportKind::Result);
+                assert_eq!(title, "worker OK");
+                assert!(body.contains("STATUS: OK"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let rosso: Value = serde_json::from_str(
+            r#"{"run":"r-456","role":"worker","status":"OK","rossoJob":"demo"}"#,
+        )
+        .unwrap();
+        match audit_report_for(&rosso, None, "worker") {
+            EventKind::Handoff { kind, .. } => assert_eq!(kind, ReportKind::Report),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        match audit_report(&v, "agy:99".into(), ReportKind::Result) {
+            EventKind::Handoff { from, to, kind, .. } => {
+                assert_eq!(from, "agy:99");
+                assert_eq!(to, None);
+                assert_eq!(kind, ReportKind::Result);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

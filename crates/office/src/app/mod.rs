@@ -247,7 +247,9 @@ fn setup_terminal() -> anyhow::Result<(Terminal<CrosstermBackend<Stdout>>, TermG
 // ---------- control backends ----------
 
 /// Real control actions (workstream A's sources::control), panic-guarded.
-struct RealControl;
+struct RealControl {
+    pub agy_route: String,
+}
 
 fn not_ready(e: String) -> anyhow::Error {
     anyhow::anyhow!("control action unavailable ({e})")
@@ -257,11 +259,41 @@ impl Control for RealControl {
     fn cancel_agy(&mut self, _agent: &Agent, pid: u32) -> anyhow::Result<()> {
         guarded(|| sources::control::cancel_agy(pid)).map_err(not_ready)?
     }
+    fn kill_agent(&mut self, _agent: &Agent, pid: u32) -> anyhow::Result<()> {
+        guarded(|| sources::control::kill_agent_pid(pid)).map_err(not_ready)?
+    }
+    fn reap_orphans(&mut self) -> anyhow::Result<(usize, u32)> {
+        guarded(sources::control::reap_orphan_agy).map_err(not_ready)?
+    }
     fn resolve_permission(&mut self, _agent: &Agent, request_id: &str, allow: bool) -> anyhow::Result<()> {
         guarded(|| sources::control::resolve_permission(request_id, allow)).map_err(not_ready)?
     }
     fn resume_claude(&mut self, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
         guarded(|| sources::control::resume_claude(cwd, session_id)).map_err(not_ready)?
+    }
+    fn resume_agent(&mut self, agent: &Agent, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
+        let kind = agent.kind;
+        guarded(|| sources::control::resume_agent(kind, cwd, session_id)).map_err(not_ready)?
+    }
+    fn dispatch_task(&mut self, target: &str, cwd: &str, prompt: &str) -> anyhow::Result<String> {
+        let bin = self.agy_route.clone();
+        guarded(|| sources::control::dispatch_task(target, cwd, prompt, &bin)).map_err(not_ready)?
+    }
+    fn followup_session(&mut self, agent: &Agent, prompt: &str) -> anyhow::Result<String> {
+        let rid = agent.resume_id.as_deref().ok_or_else(|| anyhow::anyhow!("no session id"))?;
+        let kind = agent.kind;
+        let cwd = agent.cwd.as_deref();
+        guarded(|| sources::control::followup_session(kind, cwd, rid, prompt)).map_err(not_ready)?
+    }
+    fn prune_brain(&mut self) -> anyhow::Result<String> {
+        let bin = self.agy_route.clone();
+        guarded(|| sources::control::prune_agy_brain(&bin)).map_err(not_ready)?
+    }
+    fn resume_auto(&self, job: &str) -> Result<String, String> {
+        guarded(|| sources::control::resume_rosso_auto(job)).map_err(|e| format!("control action unavailable ({e})"))?
+    }
+    fn abort_auto(&self, job: &str) -> Result<String, String> {
+        guarded(|| sources::control::abort_rosso_auto(job)).map_err(|e| format!("control action unavailable ({e})"))?
     }
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
@@ -293,6 +325,18 @@ impl Control for DemoControl {
         let _ = self.tx.send(Event::now(SourceKind::Demo, EventKind::Gone { id }));
         Ok(())
     }
+    fn kill_agent(&mut self, agent: &Agent, _pid: u32) -> anyhow::Result<()> {
+        let id = agent.id.clone();
+        let _ = self.tx.send(Event::now(
+            SourceKind::Demo,
+            EventKind::State { id: id.clone(), state: office_core::AgentState::Leaving, activity: Some("stopped by you".into()) },
+        ));
+        let _ = self.tx.send(Event::now(SourceKind::Demo, EventKind::Gone { id }));
+        Ok(())
+    }
+    fn reap_orphans(&mut self) -> anyhow::Result<(usize, u32)> {
+        Ok((0, 0))
+    }
     fn resolve_permission(&mut self, agent: &Agent, request_id: &str, allow: bool) -> anyhow::Result<()> {
         let id = agent.id.clone();
         let _ = self.tx.send(Event::now(SourceKind::Demo, EventKind::PermissionResolved { id: id.clone(), request_id: request_id.into() }));
@@ -309,6 +353,35 @@ impl Control for DemoControl {
             Some(c) => format!("(demo) cd {c} && claude --resume {session_id}"),
             None => format!("(demo) claude --resume {session_id}"),
         })
+    }
+    fn resume_agent(&mut self, agent: &Agent, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
+        let cli = if matches!(agent.kind, office_core::model::AgentKind::Other | office_core::model::AgentKind::Agy) {
+            "agy"
+        } else {
+            "claude"
+        };
+        Ok(match cwd {
+            Some(c) => format!("(demo) cd {c} && {cli} --resume {session_id}"),
+            None => format!("(demo) {cli} --resume {session_id}"),
+        })
+    }
+    fn dispatch_task(&mut self, target: &str, cwd: &str, prompt: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(!prompt.trim().is_empty(), "empty prompt");
+        Ok(format!("(demo) dispatched {target} in {cwd}"))
+    }
+    fn followup_session(&mut self, agent: &Agent, prompt: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(!prompt.trim().is_empty(), "empty prompt");
+        let rid = agent.resume_id.as_deref().unwrap_or("demo");
+        Ok(format!("(demo) sent follow-up to {rid}"))
+    }
+    fn prune_brain(&mut self) -> anyhow::Result<String> {
+        Ok("(demo) pruned 0 brain dirs".into())
+    }
+    fn resume_auto(&self, job: &str) -> Result<String, String> {
+        Ok(format!("(demo) resumed {job}"))
+    }
+    fn abort_auto(&self, job: &str) -> Result<String, String> {
+        Ok(format!("(demo) requested abort for {job}"))
     }
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
@@ -410,7 +483,7 @@ fn event_loop(
             }
             Err(e) => app.toast(format!("sources unavailable: {e}"), AlertLevel::Critical, now()),
         }
-        Box::new(RealControl)
+        Box::new(RealControl { agy_route: cfg.agy_route.clone() })
     };
 
     let view: Option<Box<dyn OfficeView>> = match guarded(|| render::Renderer::new(&cfg)) {
@@ -728,6 +801,13 @@ pub mod testutil {
         pub fail: bool,
         pub clipboard: Vec<String>,
         pub saved: Vec<(String, String)>,
+        pub killed: Vec<u32>,
+        pub dispatched: Vec<(String, String, String)>,
+        pub followups: Vec<(String, String)>,
+        pub reaped: usize,
+        pub pruned: usize,
+        pub auto_resumed: std::sync::Mutex<Vec<String>>,
+        pub auto_aborted: std::sync::Mutex<Vec<String>>,
     }
     impl Control for FakeControl {
         fn cancel_agy(&mut self, _a: &Agent, pid: u32) -> anyhow::Result<()> {
@@ -736,6 +816,21 @@ pub mod testutil {
             }
             self.calls.push(format!("cancel {pid}"));
             Ok(())
+        }
+        fn kill_agent(&mut self, a: &Agent, pid: u32) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.killed.push(pid);
+            self.cancel_agy(a, pid)
+        }
+        fn reap_orphans(&mut self) -> anyhow::Result<(usize, u32)> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.reaped += 1;
+            self.calls.push("reap_orphans".into());
+            Ok((2, 420))
         }
         fn resolve_permission(&mut self, _a: &Agent, req: &str, allow: bool) -> anyhow::Result<()> {
             if self.fail {
@@ -750,6 +845,56 @@ pub mod testutil {
             }
             self.calls.push(format!("resume {} {id}", cwd.unwrap_or("-")));
             Ok(format!("cd {} && claude --resume {id}", cwd.unwrap_or(".")))
+        }
+        fn resume_agent(&mut self, a: &Agent, cwd: Option<&str>, id: &str) -> anyhow::Result<String> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.calls.push(format!("resume {} {id}", cwd.unwrap_or("-")));
+            let cli = if matches!(a.kind, office_core::model::AgentKind::Other | office_core::model::AgentKind::Agy) {
+                "agy"
+            } else {
+                "claude"
+            };
+            Ok(format!("cd {} && {cli} --resume {id}", cwd.unwrap_or(".")))
+        }
+        fn dispatch_task(&mut self, target: &str, cwd: &str, prompt: &str) -> anyhow::Result<String> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.dispatched.push((target.into(), cwd.into(), prompt.into()));
+            self.calls.push(format!("dispatch {target} {cwd} {prompt}"));
+            Ok(format!("dispatched {target} in {cwd}"))
+        }
+        fn followup_session(&mut self, agent: &Agent, prompt: &str) -> anyhow::Result<String> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.followups.push((agent.id.clone(), prompt.into()));
+            self.calls.push(format!("followup {} {prompt}", agent.id));
+            Ok(format!("sent follow-up to {}", agent.label))
+        }
+        fn prune_brain(&mut self) -> anyhow::Result<String> {
+            if self.fail {
+                anyhow::bail!("boom")
+            }
+            self.pruned += 1;
+            self.calls.push("prune_brain".into());
+            Ok("pruning old agy brain dirs…".into())
+        }
+        fn resume_auto(&self, job: &str) -> Result<String, String> {
+            if self.fail {
+                return Err("boom".into());
+            }
+            self.auto_resumed.lock().unwrap().push(job.to_string());
+            Ok(format!("resumed auto job {job}"))
+        }
+        fn abort_auto(&self, job: &str) -> Result<String, String> {
+            if self.fail {
+                return Err("boom".into());
+            }
+            self.auto_aborted.lock().unwrap().push(job.to_string());
+            Ok(format!("abort requested for {job}"))
         }
         fn notify(&mut self, title: &str, body: &str) {
             self.notes.push((title.into(), body.into()));
