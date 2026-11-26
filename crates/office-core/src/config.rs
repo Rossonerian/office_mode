@@ -47,7 +47,7 @@ pub struct Config {
     pub show: ShowConfig,
 }
 
-/// `[show]`: display toggles for the office view (all on by default, `selected_only_labels` off).
+/// `[show]`: display toggles for the office view (all on by default, `selected_only_labels` / `fill_viewport` / `scanlines` off).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShowConfig {
@@ -63,6 +63,10 @@ pub struct ShowConfig {
     pub council_cabin: bool,
     pub ambient: bool,
     pub selected_only_labels: bool,
+    pub lighting: bool,
+    pub fill_viewport: bool,
+    pub scanlines: bool,
+    pub theme_chrome: bool,
 }
 
 impl Default for ShowConfig {
@@ -80,13 +84,17 @@ impl Default for ShowConfig {
             council_cabin: true,
             ambient: true,
             selected_only_labels: false,
+            lighting: true,
+            fill_viewport: false,
+            scanlines: false,
+            theme_chrome: true,
         }
     }
 }
 
 impl ShowConfig {
     /// (config key, menu label) for every toggle, in menu order.
-    pub const ITEMS: [(&'static str, &'static str); 12] = [
+    pub const ITEMS: [(&'static str, &'static str); 16] = [
         ("names", "agent names"),
         ("bubbles", "speech bubbles"),
         ("icons", "status icons"),
@@ -99,6 +107,10 @@ impl ShowConfig {
         ("council_cabin", "council cabin"),
         ("ambient", "ambient (steam, LEDs, kanban, strolls)"),
         ("selected_only_labels", "labels: selected/alert only"),
+        ("lighting", "ambient lighting & glow"),
+        ("fill_viewport", "fill viewport (fit pane)"),
+        ("scanlines", "CRT scanlines"),
+        ("theme_chrome", "theme-matched TUI chrome"),
     ];
 
     pub fn get(&self, i: usize) -> bool {
@@ -114,7 +126,11 @@ impl ShowConfig {
             8 => self.ceo,
             9 => self.council_cabin,
             10 => self.ambient,
-            _ => self.selected_only_labels,
+            11 => self.selected_only_labels,
+            12 => self.lighting,
+            13 => self.fill_viewport,
+            14 => self.scanlines,
+            _ => self.theme_chrome,
         }
     }
 
@@ -131,7 +147,11 @@ impl ShowConfig {
             8 => self.ceo = v,
             9 => self.council_cabin = v,
             10 => self.ambient = v,
-            _ => self.selected_only_labels = v,
+            11 => self.selected_only_labels = v,
+            12 => self.lighting = v,
+            13 => self.fill_viewport = v,
+            14 => self.scanlines = v,
+            _ => self.theme_chrome = v,
         }
     }
 
@@ -140,7 +160,19 @@ impl ShowConfig {
         Self::default()
     }
 
-    /// Hide the overlays (names, bubbles, icons, nameplates, couriers); zones, cat and CEO stay.
+    /// Clean preset: office elements visible, labels only on selected/alerting agents, studio visual prefs kept.
+    pub fn clean_on(&self) -> Self {
+        ShowConfig {
+            selected_only_labels: true,
+            lighting: self.lighting,
+            fill_viewport: self.fill_viewport,
+            scanlines: self.scanlines,
+            theme_chrome: self.theme_chrome,
+            ..Self::default()
+        }
+    }
+
+    /// Hide the overlays (names, bubbles, icons, nameplates, couriers); zones, cat, CEO, and studio visual prefs stay.
     pub fn overlays_off(&self) -> Self {
         ShowConfig { names: false, bubbles: false, icons: false, nameplates: false, couriers: false, ..self.clone() }
     }
@@ -306,13 +338,26 @@ mod tests {
     fn show_section_round_trips_and_defaults() {
         let d: Config = toml::from_str("fps = 5\n").unwrap();
         assert_eq!(d.show, ShowConfig::default());
-        assert!(d.show.names && d.show.council_cabin && !d.show.selected_only_labels);
-        let c: Config = toml::from_str("[show]\nnames = false\nselected_only_labels = true\n").unwrap();
-        assert!(!c.show.names && c.show.bubbles && c.show.selected_only_labels);
+        assert!(
+            d.show.names
+                && d.show.council_cabin
+                && d.show.lighting
+                && d.show.theme_chrome
+                && !d.show.selected_only_labels
+                && !d.show.fill_viewport
+                && !d.show.scanlines
+        );
+        let c: Config = toml::from_str("[show]\nnames = false\nselected_only_labels = true\nfill_viewport = true\nscanlines = true\n").unwrap();
+        assert!(!c.show.names && c.show.bubbles && c.show.selected_only_labels && c.show.fill_viewport && c.show.scanlines && c.show.lighting);
+        let off = c.show.overlays_off();
+        assert!(!off.names && !off.bubbles && off.fill_viewport && off.scanlines && off.lighting && off.theme_chrome);
+        let clean = c.show.clean_on();
+        assert!(clean.names && clean.bubbles && clean.selected_only_labels && clean.fill_viewport && clean.scanlines && clean.lighting && clean.theme_chrome);
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.show, c.show);
         let mut x = ShowConfig::default();
+        assert_eq!(ShowConfig::ITEMS.len(), 16);
         for i in 0..ShowConfig::ITEMS.len() {
             x.set(i, i % 2 == 0);
             assert_eq!(x.get(i), i % 2 == 0);

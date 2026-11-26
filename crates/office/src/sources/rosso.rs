@@ -34,7 +34,7 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
         let mut auto_initial = true;
         loop {
             let mut evs = poll(&dir, &mut tails, initial);
-            if last_trays.map_or(true, |t| t.elapsed() >= TRAY_EVERY) {
+            if last_trays.is_none_or(|t| t.elapsed() >= TRAY_EVERY) {
                 last_trays = Some(std::time::Instant::now());
                 evs.extend(scan_in_trays(&dir).into_iter().map(|(slug, count)| EventKind::InTray { slug, count }));
                 let waves = scan_waves(&dir, paths::now_ms());
@@ -123,7 +123,7 @@ pub fn scan_in_trays(dir: &Path) -> Vec<(String, u32)> {
             let slug = d.file_name().to_string_lossy().into_owned();
             // read_dir follows nothing: symlink entries inside received/ are counted as entries
             let n = std::fs::read_dir(d.path().join("received")).map(|r| r.flatten().count().min(99) as u32).unwrap_or(0);
-            if best.get(&slug).map_or(true, |(t, _)| mtime > *t) {
+            if best.get(&slug).is_none_or(|(t, _)| mtime > *t) {
                 best.insert(slug, (mtime, n));
             }
         }
@@ -191,7 +191,8 @@ pub fn parse_iso_ms(s: &str) -> Option<u64> {
     let tail = &s[19..s.len() - 1];
     let ms: u64 = if tail.is_empty() {
         0
-    } else if let Some(frac) = tail.strip_prefix('.') {
+    } else {
+        let frac = tail.strip_prefix('.')?;
         if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
             return None;
         }
@@ -202,8 +203,6 @@ pub fn parse_iso_ms(s: &str) -> Option<u64> {
             mul /= 10;
         }
         acc
-    } else {
-        return None;
     };
     let days = days_from_civil(year as i64, month, day);
     if days < 0 {

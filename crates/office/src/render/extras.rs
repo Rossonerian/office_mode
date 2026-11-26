@@ -40,7 +40,7 @@ pub fn chip_pulses(v: &str) -> bool {
 
 /// Chip background and text colour for a verdict at time `t`.
 pub fn chip_colors(v: &str, t: u64) -> (Col, Col) {
-    let on = (t / 350) % 2 == 0;
+    let on = (t / 350).is_multiple_of(2);
     match verdict_class(v) {
         0 => (rgb(0x3fae6a), rgb(0x0e2418)),
         2 => (if on { rgb(0xe03c3c) } else { rgb(0x8f2323) }, rgb(0xfff4f4)),
@@ -164,7 +164,7 @@ pub fn draw_guard(img: &mut RgbaImage, th: &Theme, fx: i32, fy: i32, alert: bool
     look.shirt = rgb(0x20262f);
     look.pants = rgb(0x171b22);
     look.glasses = false;
-    let arms = if alert { Arms::Wave((t / 300) % 2 == 0) } else { Arms::Down };
+    let arms = if alert { Arms::Wave((t / 300).is_multiple_of(2)) } else { Arms::Down };
     let pose = Pose { arms, legs: Legs::Stand, ..Default::default() };
     let f = |c: u32| th.fx.apply(rgb(c));
     fill(img, fx - 5, fy - 1, 10, 2, with_alpha(f(0x000000), 60));
@@ -209,7 +209,7 @@ pub fn draw_guard_tag(img: &mut RgbaImage, th: &Theme, rect: [i32; 4]) {
 /// Red bubble with a raised-hand glyph (the "stop" hand).
 pub fn draw_hand_bubble(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, t: u64) {
     let f = |c: u32| th.fx.apply(rgb(c));
-    let on = (t / 300) % 2 == 0;
+    let on = (t / 300).is_multiple_of(2);
     fill(img, x, y, 9, 9, if on { f(0xe03c3c) } else { f(0xb02828) });
     outline(img, x, y, 9, 9, f(0x1b1d22));
     put(img, x + 1, y + 9, f(0x1b1d22));
@@ -252,7 +252,7 @@ pub fn draw_council_steps(img: &mut RgbaImage, th: &Theme, sx: i32, sy: i32, rea
         let x = sx + 28 + i as i32 * 3;
         let c = if reached[i] { STEP_COLORS[i] } else { 0x2c3e57 };
         fill(img, x, sy + 5, 2, 2, f(c));
-        if i == current && (t / 400) % 2 == 0 {
+        if i == current && (t / 400).is_multiple_of(2) {
             fill(img, x, sy + 7, 2, 1, f(0xffffff));
         }
     }
@@ -292,7 +292,7 @@ pub fn draw_queue_chip(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, h: i32, 
 
 fn wave_call_color(c: &office_core::WaveCall, t: u64) -> Col {
     if c.relay {
-        if (t / 350) % 2 == 0 {
+        if (t / 350).is_multiple_of(2) {
             rgb(0x4dd0e1)
         } else {
             rgb(0x2b7a8c)

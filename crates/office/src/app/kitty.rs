@@ -18,7 +18,7 @@ pub fn encode_rgb_zlib(img: &RgbaImage, id: u32, area: Rect, is_tmux: bool, rgb_
 
     rgb_scratch.clear();
     rgb_scratch.reserve((w as usize) * (h as usize) * 3);
-    for px in img.as_raw().chunks_exact(4) {
+    for px in img.as_raw().as_chunks::<4>().0 {
         rgb_scratch.push(px[0]);
         rgb_scratch.push(px[1]);
         rgb_scratch.push(px[2]);

@@ -176,7 +176,7 @@ pub fn draw(img: &mut RgbaImage, ox: i32, oy: i32, l: &Look, p: &Pose) {
             let wx = if alt { 14 } else { 13 };
             rect(img, 12, 9 + b, 1, 2, shirt_d);
             rect(img, wx, 2 + b, 1, 8, shirt_d);
-            rect(img, wx, 0 + b, 1, 2, l.skin);
+            rect(img, wx, b, 1, 2, l.skin);
         }
         Arms::Think => {
             sleeve(img, 3, 11 + b, 5);

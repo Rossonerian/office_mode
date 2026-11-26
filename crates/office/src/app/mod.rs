@@ -965,10 +965,12 @@ mod tests {
         assert_eq!(poll_wait_ms(16, 15), 5);
         assert_eq!(poll_wait_ms(20, 10), 10);
 
-        let mut cfg = Config::default();
-        cfg.fps = 30;
-        cfg.cat.enabled = false;
-        cfg.ceo.enabled = false;
+        let mut cfg = Config {
+            fps: 30,
+            cat: office_core::config::CatConfig { enabled: false, ..Default::default() },
+            ceo: office_core::config::CeoConfig { enabled: false, ..Default::default() },
+            ..Default::default()
+        };
         let mut s = Scene::default();
         assert_eq!(frame_interval_ms(&s, &cfg, 0, false), 1000);
         assert_eq!(frame_interval_ms(&s, &cfg, 0, true), 33);

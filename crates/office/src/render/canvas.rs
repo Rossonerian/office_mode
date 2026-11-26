@@ -132,7 +132,7 @@ pub fn crop(src: &RgbaImage, x: u32, y: u32, w: u32, h: u32) -> RgbaImage {
 
 /// Map every non-transparent pixel through `f`.
 pub fn map_pixels(img: &mut RgbaImage, f: &dyn Fn(Col) -> Col) {
-    for p in img.as_mut().chunks_exact_mut(4) {
+    for p in img.as_mut().as_chunks_mut::<4>().0 {
         if p[3] == 0 {
             continue;
         }
@@ -177,7 +177,7 @@ pub fn scale_into_with_xmap(dst: &mut RgbaImage, src: &RgbaImage, ox: u32, oy: u
             out.copy_from_slice(&sraw[srow..srow + ow as usize * 4]);
         } else {
             let row = &sraw[srow..srow + sw as usize * 4];
-            for (o, &sx) in out.chunks_exact_mut(4).zip(xmap.iter()) {
+            for (o, &sx) in out.as_chunks_mut::<4>().0.iter_mut().zip(xmap.iter()) {
                 o.copy_from_slice(&row[sx..sx + 4]);
             }
         }

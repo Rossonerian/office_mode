@@ -35,11 +35,13 @@ pub struct Extras {
     pub ceo: bool,
     /// Council members get a glass cabin; when false they sit at ordinary desks.
     pub council: bool,
+    /// Expand layout and scale to fill the viewport smoothly (vs integer pixel-perfect steps).
+    pub fill_viewport: bool,
 }
 
 impl Default for Extras {
     fn default() -> Self {
-        Extras { ceo: true, council: true }
+        Extras { ceo: true, council: true, fill_viewport: false }
     }
 }
 
@@ -204,14 +206,12 @@ fn session_of<'a>(scene: &'a Scene, a: &'a Agent) -> Option<&'a AgentId> {
     // Walk up the parent chain to a top-level Claude session.
     let mut cur = a;
     for _ in 0..8 {
-        match &cur.parent {
-            Some(p) => match scene.agents.get(p) {
-                Some(pa) if pa.kind == AgentKind::Claude && pa.parent.is_none() => return Some(&pa.id),
-                Some(pa) => cur = pa,
-                None => return None,
-            },
-            None => return None,
+        let Some(p) = &cur.parent else { return None };
+        let pa = scene.agents.get(p)?;
+        if pa.kind == AgentKind::Claude && pa.parent.is_none() {
+            return Some(&pa.id);
         }
+        cur = pa;
     }
     None
 }
@@ -272,7 +272,7 @@ pub fn best_cols_with(n_pods: usize, px_w: u32, px_h: u32, ex: Extras) -> usize 
         let rows = n.div_ceil(cols);
         let (w, h) = room_size_with(cols, rows, ex);
         let raw_fit = (pw / w as f32).min(ph / h as f32);
-        let int_fit = if raw_fit >= 1.0 { raw_fit.floor() } else { raw_fit };
+        let int_fit = if ex.fill_viewport || raw_fit < 1.0 { raw_fit } else { raw_fit.floor() };
         let fill = (w as f32 * int_fit * h as f32 * int_fit) / (pw * ph);
         if int_fit > best.1 + 1e-4 || ((int_fit - best.1).abs() <= 1e-4 && fill > best.2 + 1e-4) {
             best = (cols, int_fit, fill);
@@ -312,7 +312,15 @@ pub fn build_with(scene: &Scene, px_w: u32, px_h: u32, ex: Extras) -> Layout {
     let rows = pod_plans.len().div_ceil(cols);
     let (base_w, base_h) = room_size_with(cols, rows, ex);
     let fit = (px_w.max(1) as f32 / base_w as f32).min(px_h.max(1) as f32 / base_h as f32);
-    let (w, h) = if fit >= 1.0 {
+    let (w, h) = if ex.fill_viewport {
+        if fit > 0.0 {
+            let tw = ((px_w as f32 / fit).floor() as i32) & !1;
+            let th = ((px_h as f32 / fit).floor() as i32) & !1;
+            (tw.clamp(base_w, base_w + 180), th.clamp(base_h, base_h + 64))
+        } else {
+            (base_w, base_h)
+        }
+    } else if fit >= 1.0 {
         let s = fit.floor();
         let tw = ((px_w as f32 / s).floor() as i32) & !1;
         let th = ((px_h as f32 / s).floor() as i32) & !1;
@@ -711,7 +719,7 @@ mod tests {
                 assert!(l.spots.iter().any(|s| s.kind == SpotKind::Sofa));
             }
         }
-        let off = build_with(&Scene::default(), 640, 360, Extras { ceo: false, council: true });
+        let off = build_with(&Scene::default(), 640, 360, Extras { ceo: false, council: true, ..Default::default() });
         assert!(off.ceo.is_none() && !off.spots.iter().any(|s| s.kind == SpotKind::CeoDesk));
     }
 

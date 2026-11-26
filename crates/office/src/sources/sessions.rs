@@ -160,16 +160,16 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<()> {
                                     return;
                                 }
                                 seen_live.insert(meta.pid, id);
-                            } else if meta.pid == 0 && !meta.entrypoint.is_empty() {
-                                if tx
+                            } else if meta.pid == 0
+                                && !meta.entrypoint.is_empty()
+                                && tx
                                     .send(Event::now(
                                         SourceKind::ClaudeHook,
                                         EventKind::Entrypoint { id, entrypoint: meta.entrypoint },
                                     ))
                                     .is_err()
-                                {
-                                    return;
-                                }
+                            {
+                                return;
                             }
                         }
 

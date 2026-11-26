@@ -698,9 +698,9 @@ mod tests {
         std::thread::spawn(move || serve(listener, tx));
 
         // Warm-up exec: the first launch of a freshly built binary on macOS pays a one-off scan cost.
-        let _ = Command::new(&bin).env("OFFICE_SOCKET", dir.join("none.sock")).stdin(Stdio::null()).output();
+        let _ = Command::new(bin).env("OFFICE_SOCKET", dir.join("none.sock")).stdin(Stdio::null()).output();
 
-        let mut child = Command::new(&bin)
+        let mut child = Command::new(bin)
             .env("OFFICE_SOCKET", &sock)
             .env("OFFICE_SOURCE", "claude")
             .stdin(Stdio::piped())
@@ -734,7 +734,7 @@ mod tests {
     #[test]
     fn office_hook_exits_zero_without_listener() {
         let bin = office_hook_bin();
-        let mut child = Command::new(&bin)
+        let mut child = Command::new(bin)
             .env("OFFICE_SOCKET", "/nonexistent/dir/x.sock")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn office_hook_antigravity_exits_silently() {
         let bin = office_hook_bin();
-        let mut child = Command::new(&bin)
+        let mut child = Command::new(bin)
             .env("OFFICE_SOCKET", "/nonexistent/dir/x.sock")
             .env("OFFICE_SOURCE", "antigravity")
             .args(["--hook-event", "Stop"])

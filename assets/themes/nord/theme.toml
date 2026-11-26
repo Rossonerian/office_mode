@@ -1,0 +1,32 @@
+# nord: calm Arctic Frost studio with cool Polar Night slate & Snow Storm desks.
+[sheets]
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
+[fx]
+glow = "#88c0d0"
+char_tint = "#eceff4"
+
+[colors]
+floor_style = "checker"
+floor_a = "#434c5e"
+floor_b = "#3b4252"
+wall = "#3b4252"
+wall_trim = "#88c0d0"
+sky = "#81a1c1"
+wood = "#8f6b54"
+desk = "#d8dee9"
+metal = "#5e81ac"
+screen_off = "#2e3440"
+screen_on = "#2a4b63"
+chair = "#4c566a"
+fabric = "#88c0d0"
+plant = "#a3be8c"
+pot = "#bf616a"
+rug = "#3b4b5c"
+rug_trim = "#88c0d0"
+backdrop = "#242933"

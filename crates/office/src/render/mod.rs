@@ -281,7 +281,7 @@ impl Renderer {
             h ^= 0xff;
             h = h.wrapping_mul(0x100000001b3);
         };
-        feed_bytes(&[self.ceo_on() as u8, self.show.council_cabin as u8]);
+        feed_bytes(&[self.ceo_on() as u8, self.show.council_cabin as u8, self.show.fill_viewport as u8]);
         for a in scene.agents.values() {
             feed_bytes(a.id.as_bytes());
             feed_bytes(&[a.kind as u8]);
@@ -300,13 +300,28 @@ impl Renderer {
         let lay = match &self.cached_layout {
             Some((k, w, h, cached)) if *k == topo && *w == px_w && *h == px_h => cached.clone(),
             _ => {
-                let built = layout::build_with(scene, px_w, px_h, layout::Extras { ceo: self.ceo_on(), council: self.show.council_cabin });
+                let built = layout::build_with(
+                    scene,
+                    px_w,
+                    px_h,
+                    layout::Extras {
+                        ceo: self.ceo_on(),
+                        council: self.show.council_cabin,
+                        fill_viewport: self.show.fill_viewport,
+                    },
+                );
                 self.cached_layout = Some((topo, px_w, px_h, built.clone()));
                 built
             }
         };
         let night = self.is_night(t_ms);
-        let key = (self.mix_hash() ^ ((self.show.zones as u64) << 40) ^ ((night as u64) << 41), lay.static_hash());
+        let key = (
+            self.mix_hash()
+                ^ ((self.show.zones as u64) << 40)
+                ^ ((night as u64) << 41)
+                ^ ((self.show.lighting as u64) << 42),
+            lay.static_hash(),
+        );
         if key != self.static_key {
             self.static_img = self.draw_static(&lay, night);
             self.static_key = key;
@@ -323,7 +338,7 @@ impl Renderer {
 
         let (lw, lh) = (lay.w as f32, lay.h as f32);
         let fit = (px_w as f32 / lw).min(px_h as f32 / lh);
-        let s = if fit >= 1.0 { fit.floor() } else { fit };
+        let s = if self.show.fill_viewport || fit < 1.0 { fit } else { fit.floor() };
         let (ow, oh) = ((lw * s).floor(), (lh * s).floor());
         let ox = ((px_w as f32 - ow) / 2.0).floor().max(0.0);
         let oy = ((px_h as f32 - oh) / 2.0).floor().max(0.0);
@@ -341,10 +356,13 @@ impl Renderer {
         if self.out_buf.dimensions() != (px_w.max(1), px_h.max(1)) {
             self.out_buf = RgbaImage::new(px_w.max(1), px_h.max(1));
         }
-        for px in self.out_buf.as_mut().chunks_exact_mut(4) {
+        for px in self.out_buf.as_mut().as_chunks_mut::<4>().0 {
             px.copy_from_slice(&bg);
         }
         canvas::scale_into_with_xmap(&mut self.out_buf, &self.frame_buf, ox, oy, s, &mut self.xmap);
+        if self.show.scanlines {
+            apply_scanlines(&mut self.out_buf);
+        }
         self.out_buf.clone()
     }
 
@@ -376,7 +394,7 @@ impl Renderer {
     }
 
     fn is_night(&self, t_ms: u64) -> bool {
-        if self.mix.walls == "midnight" || self.mix.walls == "cyberpunk" {
+        if matches!(self.mix.walls.as_str(), "midnight" | "cyberpunk" | "tokyo-night") {
             return true;
         }
         // Keep test/preview synthetic timestamps deterministic daytime; live epoch timestamps check local hour.
@@ -405,8 +423,8 @@ impl Renderer {
         let walls_t = self.th(Layer::Walls);
         let furn_t = self.th(Layer::Furniture);
         let decor_t = self.th(Layer::Decor);
-        let night_theme = self.mix.walls == "midnight" || self.mix.walls == "cyberpunk";
-        let _ = night;
+        let night_theme = matches!(self.mix.walls.as_str(), "midnight" | "cyberpunk" | "tokyo-night");
+        let is_night = night || night_theme;
 
         // floor
         if let Some(bg) = floor_t.floor_bg {
@@ -414,6 +432,12 @@ impl Renderer {
         }
         let ft = floor_t.sprite("floor").frame(0).clone();
         tile(&mut img, &ft, 0, WALL_H, w, h - WALL_H);
+
+        // architectural floor-edge depth shading when lighting is enabled
+        if self.show.lighting && floor_t.fx.palette.is_empty() {
+            fill(&mut img, 0, WALL_H + 1, w, 2, with_alpha(INK, 26));
+            fill(&mut img, 0, WALL_H + 3, w, 2, with_alpha(INK, 12));
+        }
 
         // back wall
         if let Some(bg) = walls_t.wall_bg {
@@ -438,15 +462,15 @@ impl Renderer {
                 let wy = (WALL_H - 3 - win.h()) / 2;
                 blit(&mut img, win.frame(0), x, wy);
                 if let (Some(view), Some(glass)) = (walls_t.sprite_opt("window_view"), win.screen) {
-                    draw_window_view(&mut img, walls_t, view, [x + glass[0], wy + glass[1], glass[2], glass[3]], night, x);
+                    draw_window_view(&mut img, walls_t, view, [x + glass[0], wy + glass[1], glass[2], glass[3]], is_night, x);
                 }
-                if night_theme && walls_t.fx.palette.is_empty() && win.w() >= 20 {
+                if is_night && walls_t.fx.palette.is_empty() && win.w() >= 20 {
                     put(&mut img, x + 5, wy + 4, with_alpha(PAPER, 190));
                     put(&mut img, x + win.w() - 7, wy + 7, with_alpha(PAPER, 160));
                 }
-                if walls_t.fx.palette.is_empty() {
+                if self.show.lighting && walls_t.fx.palette.is_empty() {
                     // soft diagonal light shaft onto the upper floor strip
-                    let shaft_col = with_alpha(sky, if night_theme { 12 } else { 20 });
+                    let shaft_col = with_alpha(sky, if is_night { 14 } else { 22 });
                     for dy in 1..=16 {
                         fill(&mut img, x + dy / 2, WALL_H + dy, win.w() - 2, 1, shaft_col);
                     }
@@ -812,7 +836,7 @@ impl Renderer {
                 } else {
                     rgb(0x4cc46a)
                 };
-                if scene.router_extra.orphans > 0 && (t / 300) % 2 == 0 {
+                if scene.router_extra.orphans > 0 && (t / 300).is_multiple_of(2) {
                     fill(img, rx + 9, ry + 1, 2, 2, furn_t.fx.apply(rgb(0xff2a2a)));
                 }
                 for bay in 0..4 {
@@ -970,7 +994,7 @@ impl Renderer {
                     let sr = mon.screen.unwrap_or([2, 2, mon.w() - 4, mon.h() - 6]);
                     let scr = [mx + sr[0], my + sr[1], sr[2], sr[3]];
                     screen_fx(img, furn_t, st, scr, t, at_desk.map(|(a, _)| character::hash(&a.id)).unwrap_or(0));
-                    if furn_t.fx.palette.is_empty() {
+                    if self.show.lighting && furn_t.fx.palette.is_empty() {
                         if let Some((gc, rad, k)) = tool_glow_color(st) {
                             let boost = if furn_t.glow.is_some() { 1.35 } else { 1.0 };
                             glow(img, scr, furn_t.fx.apply(gc), rad, (k * boost).min(0.65));
@@ -983,12 +1007,12 @@ impl Renderer {
                 let lx = (ox + 40 - lamp.w() / 2).min(desk_left + desk_w - lamp.w() - 1);
                 let ly = desk_top + 4 - lamp.h();
                 blit(img, lamp.frame(0), lx, ly);
-                if on_state == Some(AgentState::NeedsYou) && (t / 350) % 2 == 0 {
+                if on_state == Some(AgentState::NeedsYou) && (t / 350).is_multiple_of(2) {
                     let c = decor_t.fx.apply(rgb(0xffd23f));
                     glow(img, [lx + lamp.w() / 2 - 2, ly, 4, 3], c, 6, 0.55);
                     fill(img, lx + lamp.w() / 2 - 2, ly + lamp.h() / 3, 4, 2, c);
-                } else if night && on_state.is_some() && decor_t.fx.palette.is_empty() {
-                    glow(img, [lx + lamp.w() / 2 - 1, ly + 1, 3, 3], rgb(0xffc966), 5, 0.16);
+                } else if self.show.lighting && night && on_state.is_some() && decor_t.fx.palette.is_empty() {
+                    glow(img, [lx + lamp.w() / 2 - 1, ly + 1, 3, 3], rgb(0xffc966), 6, 0.20);
                 }
                 if let Some(n) = at_desk.and_then(|(a, _)| scene.in_trays.get(&a.id)).filter(|n| **n > 0) {
                     extras::draw_in_tray(img, furn_t, desk_left + desk_w - 11, desk_top + 3, *n);
@@ -1141,6 +1165,7 @@ impl Renderer {
         walk_along(&lay.walk_route(spot, aisle), arrive + PRESENT_MS, t).map(|p| BossTrip { place: p, at_boss: false, approval: false })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_free_agent(
         &self,
         img: &mut RgbaImage,
@@ -1165,6 +1190,7 @@ impl Renderer {
         hits.push(([fx - 9, fy - 26, 18, 27], a.id.clone()));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_overlays(
         &self,
         img: &mut RgbaImage,
@@ -1374,12 +1400,38 @@ impl Renderer {
                 .find(|r| !placed.iter().any(|p| rects_overlap(*r, *p)))
                 .or_else(|| best_spot(&name_candidates, &placed))
                 .unwrap_or(name_candidates[0]);
-            let focus = is_sel || is_hov || matches!(a.state, AgentState::NeedsYou | AgentState::Error);
+            let fail = scene.failures.get(&a.id).filter(|fi| t.saturating_sub(fi.at_ms) < FAILURE_SHOW_MS && !fi.hint.is_empty());
+            let focus = is_sel || is_hov || fail.is_some() || matches!(a.state, AgentState::NeedsYou | AgentState::Error);
             let show_name = self.show.names && self.label_gate(focus);
             if show_name {
                 placed.push(name_rect);
             }
-            let ny = name_rect[1];
+            let [rx, ry, rw, _] = name_rect;
+            let icon = match a.state {
+                _ if fail.is_some() => Some(AgentState::Error),
+                AgentState::Thinking | AgentState::NeedsYou | AgentState::Error | AgentState::Queued => Some(a.state),
+                AgentState::Done if t.saturating_sub(a.last_event_ms) < DONE_CHEER_MS * 2 => Some(AgentState::Done),
+                _ => None,
+            }
+            .filter(|_| self.show.icons)
+            .map(|k| {
+                let icon_max_x = (bounds[0] + bounds[2] - 9).max(bounds[0]);
+                let icon_max_y = (bounds[1] + bounds[3] - 11).max(bounds[1]);
+                let cands = [
+                    [(cx + 9).clamp(bounds[0], icon_max_x), (head_y - 1).clamp(bounds[1], icon_max_y), 9, 11],
+                    [(rx + rw + 2).clamp(bounds[0], icon_max_x), (ry - 1).clamp(bounds[1], icon_max_y), 9, 11],
+                    [(rx - 11).clamp(bounds[0], icon_max_x), (ry - 1).clamp(bounds[1], icon_max_y), 9, 11],
+                    [(cx - 17).clamp(bounds[0], icon_max_x), (head_y - 1).clamp(bounds[1], icon_max_y), 9, 11],
+                ];
+                let spot = cands
+                    .iter()
+                    .copied()
+                    .find(|r| !placed.iter().any(|p| rects_overlap(*r, *p)))
+                    .or_else(|| best_spot(&cands, &placed))
+                    .unwrap_or(cands[0]);
+                placed.push(spot);
+                (k, spot[0], spot[1])
+            });
 
             let speaking = matches!(
                 a.state,
@@ -1392,19 +1444,26 @@ impl Renderer {
                     | AgentState::Error
                     | AgentState::Queued
             );
-            let fail = scene.failures.get(&a.id).filter(|fi| t.saturating_sub(fi.at_ms) < FAILURE_SHOW_MS && !fi.hint.is_empty());
             let must_show = is_sel || is_hov || fail.is_some() || matches!(a.state, AgentState::NeedsYou | AgentState::Error);
             let mut bubble_op = None;
-            if (speaking && !a.activity.is_empty() || fail.is_some()) && self.show.bubbles && (fail.is_some() || self.label_gate(focus)) {
-                let comp = match fail {
-                    Some(fi) => extras::compact_hint(&fi.hint),
-                    None => compact_activity(&a.activity),
-                };
+            let comp_preview = match fail {
+                Some(fi) => extras::compact_hint(&fi.hint),
+                None => compact_activity(&a.activity),
+            };
+            let suppress_redundant = fail.is_none()
+                && a.state != AgentState::NeedsYou
+                && !(is_sel || is_hov)
+                && is_redundant_bubble(&comp_preview, &name, &a.label, a.role.as_deref(), a.state, queue.is_some() || self.show.icons);
+            if ((speaking && !a.activity.is_empty()) || fail.is_some())
+                && !suppress_redundant
+                && self.show.bubbles
+                && (fail.is_some() || self.label_gate(focus))
+            {
                 let max_b = if is_sel || is_hov || fail.is_some() { 124 } else { CELL_W - 4 };
-                let text = font::truncate_words(&comp, max_b);
+                let text = font::truncate_words(&comp_preview, max_b);
                 let bw = font::text_width(&text) + 4;
                 let bh = font::GLYPH_H + 4;
-                let base_y = (ny - bh - 2).clamp(bounds[1], (bounds[1] + bounds[3] - bh).max(bounds[1]));
+                let base_y = (ry - bh - 2).clamp(bounds[1], (bounds[1] + bounds[3] - bh).max(bounds[1]));
                 let base_x = (cx - bw / 2).clamp(bounds[0], (bounds[0] + bounds[2] - bw).max(bounds[0]));
                 let recent_fail = a.last_tool_ok == Some(false) && t.saturating_sub(a.last_event_ms) < 2_500;
                 let (bfg, bbg) = match a.state {
@@ -1422,7 +1481,7 @@ impl Renderer {
                     let near_council = council_seat.get(&a.id).is_some_and(|c| c.0 >= 2);
                     let max_y = (bounds[1] + bounds[3] - bh).max(bounds[1]);
                     for dy in [0, 1, 2, 3, 4].map(|k| k * (bh + OVERLAY_GAP)) {
-                        let y = if near_council { (ny + nh + OVERLAY_GAP + dy).min(max_y) } else { (base_y - dy).max(bounds[1]) };
+                        let y = if near_council { (ry + nh + OVERLAY_GAP + dy).min(max_y) } else { (base_y - dy).max(bounds[1]) };
                         for dx in [0, -12, 12, -24, 24, -36, 36] {
                             candidates.push([(base_x + dx).clamp(bounds[0], max_x), y, bw, bh]);
                         }
@@ -1441,18 +1500,6 @@ impl Renderer {
                         bubble_op = Some((text, rect, bfg, bbg));
                     }
                 }
-            }
-
-            let icon = match a.state {
-                _ if fail.is_some() => Some(AgentState::Error),
-                AgentState::Thinking | AgentState::NeedsYou | AgentState::Error | AgentState::Queued => Some(a.state),
-                AgentState::Done if t.saturating_sub(a.last_event_ms) < DONE_CHEER_MS * 2 => Some(AgentState::Done),
-                _ => None,
-            }
-            .filter(|_| self.show.icons)
-            .map(|k| (k, cx + 9, head_y - 1));
-            if let Some((_, ix, iy)) = icon {
-                placed.push([ix, iy, 9, 11]);
             }
 
             planned.push(Planned { a, cx, head_y, is_sel, is_hov, show_name, name, name_w, verdict, queue, name_rect, bubble: bubble_op, icon });
@@ -1643,7 +1690,7 @@ fn draw_doc(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, k: DocKind) {
 /// The boss's ballot: approve (green check) or request changes (red cross), blinking in turn.
 fn draw_vote(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, t: u64) {
     let f = |c: u32| th.fx.apply(rgb(c));
-    let on = (t / 450) % 2 == 0;
+    let on = (t / 450).is_multiple_of(2);
     let (ok_bg, no_bg) = if on { (f(0x3fae6a), f(0x5a2a2a)) } else { (f(0x24533a), f(0xd04040)) };
     fill(img, x, y, 9, 9, ok_bg);
     outline(img, x, y, 9, 9, f(0x1b1b22));
@@ -1740,8 +1787,6 @@ fn draw_window_view(img: &mut RgbaImage, th: &Theme, view: &theme::Sprite, glass
         fill(img, gx + gw / 2 - 1, gy, 2, gh, trim);
     }
 }
-
-/// Council cabin geometry (relative to the pod origin).
 
 /// The council cabin: a glass-walled meeting room (aluminium frames, a door gap in the front wall),
 /// light carpet tiles, a wall screen with the agenda, a plant and a "COUNCIL" door sign. The
@@ -2006,11 +2051,13 @@ impl Renderer {
                 let bh = ((sh - 1) * v / n).max(if *v > 0 { 1 } else { 0 });
                 fill(img, sx + 1 + i as i32 * bw, sy + sh - bh, (bw - 1).max(1), bh, ff(rgb(*c)));
             }
-            if (t / 600) % 2 == 0 {
+            if (t / 600).is_multiple_of(2) {
                 put(img, sx + sw - 2, sy + 1, ff(rgb(0xb6ff9e)));
             }
-            if let Some(g) = furn.glow {
-                glow(img, [sx, sy, sw, sh], g, 4, 0.3);
+            if self.show.lighting {
+                if let Some(g) = furn.glow {
+                    glow(img, [sx, sy, sw, sh], g, 4, 0.3);
+                }
             }
         }
         // mug on the desk unless it's in hand
@@ -2073,6 +2120,54 @@ fn draw_confetti(img: &mut RgbaImage, th: &Theme, cx: i32, head_y: i32, t: u64) 
     for (dx, dy, c) in [(-5, -3 - phase, 0xffe14d), (5, -4 - (phase % 3), 0x4cc46a), (0, -6 - (phase % 2), 0x5ea8ff)] {
         put(img, cx + dx, head_y + dy, th.fx.apply(rgb(c)));
     }
+}
+
+pub fn apply_scanlines(img: &mut RgbaImage) {
+    let w = img.width() as usize;
+    let h = img.height() as usize;
+    let buf = img.as_mut();
+    for y in (1..h).step_by(2) {
+        let row = y * w * 4;
+        for px in buf[row..row + w * 4].as_chunks_mut::<4>().0 {
+            px[0] = ((px[0] as u16 * 224) / 255) as u8;
+            px[1] = ((px[1] as u16 * 224) / 255) as u8;
+            px[2] = ((px[2] as u16 * 224) / 255) as u8;
+        }
+    }
+}
+
+fn norm_token(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(['.', '…', ':', '!', '?'])
+        .to_ascii_lowercase()
+}
+
+fn is_redundant_bubble(
+    comp: &str,
+    name: &str,
+    label: &str,
+    role: Option<&str>,
+    state: AgentState,
+    has_queue_chip: bool,
+) -> bool {
+    let c = norm_token(comp);
+    if c.is_empty() {
+        return true;
+    }
+    if state == AgentState::Queued && has_queue_chip && matches!(c.as_str(), "waiting" | "waiting for slot" | "queued") {
+        return true;
+    }
+    let n = norm_token(name);
+    let base_label = norm_token(label.split('·').next().unwrap_or(label));
+    if c == n || (!base_label.is_empty() && c == base_label) {
+        return true;
+    }
+    if let Some(r) = role.map(norm_token).filter(|r| !r.is_empty()) {
+        if c == r || c.starts_with(&format!("{r} ")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Empty pixels required between two overlays (name tags, bubbles, badges).
@@ -2221,7 +2316,7 @@ fn place_with(a: &Agent, lay: &Layout, t: u64, queue_idx: usize, strolls: bool) 
             // Deterministic occasional coffee-bar breakroom stroll after 45s idle, anchored to last_event_ms + 45_000.
             let since = t.saturating_sub(a.last_event_ms) - 45_000;
             let slot = (since / 40_000).wrapping_add(character::hash(&a.id));
-            if slot % 3 == 0 {
+            if slot.is_multiple_of(3) {
                 let phase = since % 40_000;
                 if phase < 12_000 {
                     let leg_t = t - phase;
@@ -2246,37 +2341,37 @@ fn place_with(a: &Agent, lay: &Layout, t: u64, queue_idx: usize, strolls: bool) 
 fn pose_for(a: &Agent, t: u64, at_desk: bool) -> Pose {
     let h = character::hash(&a.id);
     let tt = t + (h % 997);
-    let mut p = Pose { blink: tt % 4000 < 130, bob: if (tt / 700) % 2 == 0 { 0 } else { 1 }, ..Default::default() };
+    let mut p = Pose { blink: tt % 4000 < 130, bob: if (tt / 700).is_multiple_of(2) { 0 } else { 1 }, ..Default::default() };
     match a.state {
         AgentState::Typing => {
-            p.arms = Arms::Type((tt / 140) % 2 == 0);
+            p.arms = Arms::Type((tt / 140).is_multiple_of(2));
             p.bob = 0;
         }
-        AgentState::Running => p.arms = Arms::Type((tt / 450) % 2 == 0),
+        AgentState::Running => p.arms = Arms::Type((tt / 450).is_multiple_of(2)),
         AgentState::Reading => {
             p.arms = Arms::Page;
-            p.head_dx = if (tt / 900) % 2 == 0 { 0 } else { 1 };
+            p.head_dx = if (tt / 900).is_multiple_of(2) { 0 } else { 1 };
         }
         AgentState::Thinking => p.arms = Arms::Think,
         AgentState::Idle => {
-            p.arms = Arms::Sip((tt / 3500) % 4 == 0);
-            if (tt / 3200) % 5 == 0 {
-                p.head_dx = if (tt / 1600) % 2 == 0 { -1 } else { 1 };
+            p.arms = Arms::Sip((tt / 3500).is_multiple_of(4));
+            if (tt / 3200).is_multiple_of(5) {
+                p.head_dx = if (tt / 1600).is_multiple_of(2) { -1 } else { 1 };
             }
         }
         AgentState::Delegating => p.arms = Arms::PointRight,
         AgentState::NeedsYou => {
-            p.arms = Arms::Wave((t / 300) % 2 == 0);
+            p.arms = Arms::Wave((t / 300).is_multiple_of(2));
             p.bob = 0;
         }
         AgentState::Error => {
-            p.arms = Arms::Panic((t / 250) % 2 == 0);
-            p.head_dx = if (t / 250) % 2 == 0 { 0 } else { -1 };
+            p.arms = Arms::Panic((t / 250).is_multiple_of(2));
+            p.head_dx = if (t / 250).is_multiple_of(2) { 0 } else { -1 };
             p.bob = 0;
         }
         AgentState::Done if t.saturating_sub(a.last_event_ms) < DONE_CHEER_MS => {
             p.arms = Arms::Up;
-            p.bob = if (t / 150) % 2 == 0 { 0 } else { -1 };
+            p.bob = if (t / 150).is_multiple_of(2) { 0 } else { -1 };
         }
         _ => {}
     }
@@ -2319,9 +2414,9 @@ fn screen_fx(img: &mut RgbaImage, th: &Theme, st: AgentState, r: [i32; 4], t: u6
             let scroll = (t / 110) as i32;
             for row in 0..h {
                 let k = (row + scroll) as u64;
-                if k % 2 == 0 {
+                if k.is_multiple_of(2) {
                     let len = 2 + hash(seed ^ k) % (w - 2).max(1);
-                    fill(img, x + 1, y + row, len.min(w - 1), 1, f(if k % 6 == 0 { 0xb6ff9e } else { 0x3fdc52 }));
+                    fill(img, x + 1, y + row, len.min(w - 1), 1, f(if k.is_multiple_of(6) { 0xb6ff9e } else { 0x3fdc52 }));
                 }
             }
         }
@@ -2336,12 +2431,12 @@ fn screen_fx(img: &mut RgbaImage, th: &Theme, st: AgentState, r: [i32; 4], t: u6
         }
         AgentState::Thinking => {
             fill(img, x, y, w, h, f(0x24304a));
-            if (t / 400) % 2 == 0 {
+            if (t / 400).is_multiple_of(2) {
                 fill(img, x + 2, y + h - 3, 2, 2, f(0xe0e6f0));
             }
         }
         AgentState::NeedsYou => {
-            fill(img, x, y, w, h, f(if (t / 350) % 2 == 0 { 0x5a4510 } else { 0x2a2410 }));
+            fill(img, x, y, w, h, f(if (t / 350).is_multiple_of(2) { 0x5a4510 } else { 0x2a2410 }));
             fill(img, x + w / 2, y + 1, 1, h - 4, f(0xffd23f));
             put(img, x + w / 2, y + h - 2, f(0xffd23f));
         }
@@ -2362,7 +2457,7 @@ fn screen_fx(img: &mut RgbaImage, th: &Theme, st: AgentState, r: [i32; 4], t: u6
         }
         AgentState::Idle => {
             fill(img, x, y, w, h, f(0x10141c));
-            if (t / 900) % 2 == 0 {
+            if (t / 900).is_multiple_of(2) {
                 put(img, x + w - 2, y + h - 2, f(0x3a4a60));
             }
         }
@@ -2372,11 +2467,24 @@ fn screen_fx(img: &mut RgbaImage, th: &Theme, st: AgentState, r: [i32; 4], t: u6
 
 fn icon_bubble(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, kind: AgentState, t: u64) {
     let f = |c: Col| th.fx.apply(c);
+    let on = (t / 350).is_multiple_of(2);
     let (bg, fg) = match kind {
-        AgentState::NeedsYou => (f(rgb(0xffd23f)), f(INK)),
+        AgentState::NeedsYou => {
+            if on {
+                (f(rgb(0xffd23f)), f(INK))
+            } else {
+                (f(rgb(0xd4961a)), f(PAPER))
+            }
+        }
         AgentState::Error => (f(rgb(0xe03c3c)), f(PAPER)),
         AgentState::Done => (f(rgb(0x4cc46a)), f(PAPER)),
         _ => (f(PAPER), f(INK)),
+    };
+    let fg = if fg == bg {
+        let dark = f(INK);
+        if bg == dark { f(PAPER) } else { dark }
+    } else {
+        fg
     };
     fill(img, x, y, 9, 9, bg);
     outline(img, x, y, 9, 9, f(INK));
@@ -2392,10 +2500,8 @@ fn icon_bubble(img: &mut RgbaImage, th: &Theme, x: i32, y: i32, kind: AgentState
             }
         }
         AgentState::NeedsYou | AgentState::Error => {
-            if kind == AgentState::Error || (t / 350) % 2 == 0 {
-                fill(img, x + 4, y + 2, 1, 3, fg);
-                put(img, x + 4, y + 6, fg);
-            }
+            fill(img, x + 4, y + 2, 1, 3, fg);
+            put(img, x + 4, y + 6, fg);
         }
         AgentState::Queued => {
             // clock
@@ -2426,8 +2532,10 @@ mod tests {
 
     fn renderer(mix: &str) -> Renderer {
         let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes")];
-        let mut cfg = Config::default();
-        cfg.theme = ThemeMix { floor: mix.into(), walls: mix.into(), furniture: mix.into(), decor: mix.into(), characters: mix.into() };
+        let cfg = Config {
+            theme: ThemeMix { floor: mix.into(), walls: mix.into(), furniture: mix.into(), decor: mix.into(), characters: mix.into() },
+            ..Default::default()
+        };
         Renderer::with_dirs(&cfg, dirs)
     }
 
@@ -2458,7 +2566,7 @@ mod tests {
         assert_ne!(nozones.as_raw(), base.as_raw(), "zones off repaints the static layer");
         r.set_show(&ShowConfig { council_cabin: false, ..ShowConfig::default() });
         let _ = r.compose(&s, None, 640, 360, now);
-        let lay = layout::build_with(&s, 640, 360, layout::Extras { ceo: true, council: false });
+        let lay = layout::build_with(&s, 640, 360, layout::Extras { ceo: true, council: false, fill_viewport: false });
         assert!(lay.pods.iter().all(|p| p.kind != layout::PodKind::Council));
         assert_eq!(lay.seats.len(), lay0.seats.len());
         assert_eq!(lay.seats.len(), s.agents.len());
@@ -2466,6 +2574,7 @@ mod tests {
         r.set_show(&ShowConfig {
             names: false, bubbles: false, icons: false, nameplates: false, zones: false, couriers: false,
             boss_visits: false, cat: false, ceo: false, council_cabin: false, ambient: false, selected_only_labels: true,
+            lighting: false, fill_viewport: false, scanlines: false, theme_chrome: false,
         });
         let _ = r.compose(&s, None, 640, 360, now);
         let _ = r.compose(&s, Some(&"cc:office".to_string()), 320, 200, now + 50_000);
@@ -2500,7 +2609,7 @@ mod tests {
     #[test]
     fn every_theme_and_empty_scene() {
         let now = 5_000_000;
-        for t in ["procedural", "modern", "cozy", "midnight", "retro", "cyberpunk", "missing-theme"] {
+        for t in ["procedural", "modern", "cozy", "midnight", "tokyo-night", "nord", "retro", "cyberpunk", "missing-theme"] {
             let mut r = renderer(t);
             let img = r.compose(&demo::demo_scene(now), None, 320, 200, now);
             assert_eq!(img.dimensions(), (320, 200));
@@ -2510,6 +2619,8 @@ mod tests {
         let r = renderer("missing-theme");
         assert!(!r.theme_errors().is_empty());
         assert!(r.themes().contains(&"retro".to_string()));
+        assert!(r.themes().contains(&"tokyo-night".to_string()));
+        assert!(r.themes().contains(&"nord".to_string()));
     }
 
     #[test]
@@ -2823,5 +2934,55 @@ mod tests {
         let base_img = r.compose(&rosso_scene(now), None, 1280, 720, now);
         let done_only_img = r.compose(&with_done_only, None, 1280, 720, now);
         assert_ne!(done_only_img.as_raw(), base_img.as_raw());
+    }
+
+    #[test]
+    fn fill_viewport_lighting_and_scanlines_work() {
+        let now = 5_000_000;
+        let s = demo::demo_scene(now);
+        let mut r = renderer("tokyo-night");
+        assert!(r.theme_errors().is_empty());
+        let def = r.compose(&s, None, 1280, 720, now);
+        let int_scale = r.scale();
+        assert!(int_scale.fract() == 0.0);
+
+        r.set_show(&office_core::config::ShowConfig { fill_viewport: true, ..Default::default() });
+        let fit = r.compose(&s, None, 1280, 720, now);
+        assert!(r.scale() >= int_scale);
+        assert_ne!(fit.as_raw(), def.as_raw());
+
+        r.set_show(&office_core::config::ShowConfig { lighting: false, ..Default::default() });
+        let nolight = r.compose(&s, None, 1280, 720, now);
+        assert_ne!(nolight.as_raw(), def.as_raw());
+
+        r.set_show(&office_core::config::ShowConfig { scanlines: true, ..Default::default() });
+        let scan = r.compose(&s, None, 1280, 720, now);
+        assert_ne!(scan.as_raw(), def.as_raw());
+    }
+
+    #[test]
+    fn redundant_and_queued_bubbles_suppressed_cleanly() {
+        assert!(is_redundant_bubble("council-architect agent-office", "COUNCIL-AR..", "council-architect·neon-xhigh", Some("council-architect"), AgentState::Thinking, false));
+        assert!(is_redundant_bubble("waiting for slot", "TECH", "Technician", Some("worker"), AgentState::Queued, true));
+        assert!(!is_redundant_bubble("waiting for slot", "SUPERVISOR..", "supervisor·neon", Some("supervisor"), AgentState::Queued, false));
+        assert!(!is_redundant_bubble("Bash cargo test", "TESTER", "tester", Some("tester"), AgentState::Running, false));
+    }
+
+    #[test]
+    fn icon_bubble_maintains_contrast_on_two_color_palette() {
+        let retro = renderer("retro");
+        let th = retro.th(Layer::Characters);
+        for (st, t) in [
+            (AgentState::NeedsYou, 0),
+            (AgentState::NeedsYou, 350),
+            (AgentState::Done, 0),
+            (AgentState::Error, 0),
+        ] {
+            let mut img = RgbaImage::new(16, 16);
+            icon_bubble(&mut img, th, 2, 2, st, t);
+            let bg = img.get_pixel(3, 3).0;
+            let has_glyph = (4..9).any(|gx| (4..9).any(|gy| img.get_pixel(gx, gy).0 != bg));
+            assert!(has_glyph, "glyph blended into background for {st:?} at t={t}");
+        }
     }
 }

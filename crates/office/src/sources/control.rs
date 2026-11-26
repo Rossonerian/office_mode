@@ -14,7 +14,7 @@ pub fn cancel_agy(router_pid: u32) -> anyhow::Result<()> {
         if rc != 0 {
             return Err(anyhow::anyhow!("kill -TERM {router_pid} failed: {}", std::io::Error::last_os_error()));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {

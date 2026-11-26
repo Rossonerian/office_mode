@@ -198,6 +198,7 @@ impl Reducer {
     }
 
     /// Record a hand-off. A report fills in the brief and title of the task it answers.
+    #[allow(clippy::too_many_arguments)]
     fn push_report(&mut self, at: u64, kind: ReportKind, from: AgentId, to: Option<AgentId>, title: String, body: String, brief: String) {
         self.push_report_as(at, kind, from, to, title, body, brief, None, false);
     }

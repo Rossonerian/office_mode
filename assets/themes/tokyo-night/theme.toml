@@ -1,0 +1,32 @@
+# tokyo-night: deep indigo-slate dark studio tailored for Ghostty nights.
+[sheets]
+tt = { file = "../../vendor/kenney-tiny-town/tilemap_packed.png", tile = 16 }
+
+[sprites]
+window_view = { sheet = "tt", x = 64, y = 35, w = 16, h = 10 }
+window_view_far = { sheet = "tt", x = 48, y = 72, w = 16, h = 8 }
+window_ground = { sheet = "tt", col = 0, row = 0 }
+
+[fx]
+glow = "#7aa2f7"
+char_tint = "#e0e4f5"
+
+[colors]
+floor_style = "wood"
+floor_a = "#24283b"
+floor_b = "#1a1b26"
+wall = "#1f2335"
+wall_trim = "#414868"
+sky = "#15162b"
+wood = "#4a3b52"
+desk = "#343b58"
+metal = "#565f89"
+screen_off = "#13141f"
+screen_on = "#1f3256"
+chair = "#292e42"
+fabric = "#7aa2f7"
+plant = "#73daca"
+pot = "#9d7cd8"
+rug = "#2d284d"
+rug_trim = "#7aa2f7"
+backdrop = "#16161e"

@@ -157,7 +157,7 @@ impl Tailer {
     pub fn poll(&mut self, now: SystemTime) -> Vec<Event> {
         let mut out = Vec::new();
         let mut found: Vec<(PathBuf, SystemTime)> = Vec::new();
-        let full_scan = self.poll_count % DISCOVER_EVERY_POLLS == 0;
+        let full_scan = self.poll_count.is_multiple_of(DISCOVER_EVERY_POLLS);
         self.poll_count = self.poll_count.wrapping_add(1);
         if full_scan {
             collect(&self.root, 0, &mut found);

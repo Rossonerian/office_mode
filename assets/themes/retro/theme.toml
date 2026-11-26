@@ -1,17 +1,12 @@
-# retro: Kenney "1-Bit Pack" (CC0), remapped to a 2-colour green-on-black handheld palette.
+# retro: classic 2-colour green handheld arcade look over clean studio furniture.
 [sheets]
-ob = { file = "onebit_monochrome.png", tile = 16, spacing = 1 }
+ob = { file = "../../vendor/kenney-1-bit-pack/colored-transparent_packed.png", tile = 16 }
 
 [sprites]
-window = { sheet = "ob", col = 1, row = 10 }
 door = { sheet = "ob", col = 3, row = 9 }
-desk = { sheet = "ob", col = 2, row = 8 }
-monitor_off = { sheet = "ob", col = 0, row = 12, screen = [3, 3, 10, 8] }
-monitor_on = { sheet = "ob", col = 0, row = 12, screen = [3, 3, 10, 8] }
-chair = { sheet = "ob", col = 13, row = 9 }
-sofa = { sheet = "ob", col = 15, row = 9 }
-plant = { sheet = "ob", col = 1, row = 1 }
-whiteboard = { sheet = "ob", col = 15, row = 7 }
+chair = { sheet = "ob", col = 11, row = 9 }
+sofa = { sheet = "ob", tiles = [[14, 9], [15, 9]] }
+cooler = { sheet = "ob", col = 5, row = 6 }
 
 [fx]
 palette = ["#0f380f", "#9bbc0f"]
@@ -22,7 +17,7 @@ wall_bg = "#0f380f"
 backdrop = "#0f380f"
 floor_style = "plain"
 floor_a = "#0f380f"
-floor_b = "#9bbc0f"
+floor_b = "#0f380f"
 wall = "#204020"
 wall_trim = "#9bbc0f"
 rug = "#0f380f"

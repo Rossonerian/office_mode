@@ -1,37 +1,34 @@
-# cyberpunk: Kenney "1-Bit Pack" (CC0) tinted neon magenta/cyan on near-black, with glowing monitors.
+# cyberpunk: clean neon-magenta & cyan architectural studio with glowing monitors.
 [sheets]
 ob = { file = "onebit_monochrome.png", tile = 16, spacing = 1 }
 
 [sprites]
-floor = { sheet = "ob", col = 1, row = 0, tint = "#3a1850" }
-wall = { sheet = "ob", col = 16, row = 0, tint = "#123c52" }
+wall = { sheet = "ob", col = 16, row = 0, tint = "#163b52" }
 window = { sheet = "ob", col = 1, row = 10, tint = "#00e5ff" }
 door = { sheet = "ob", col = 3, row = 9, tint = "#ff2bd6" }
-desk = { sheet = "ob", col = 2, row = 8, tint = "#ff2bd6" }
-monitor_off = { sheet = "ob", col = 0, row = 12, tint = "#3a6a80", screen = [3, 3, 10, 8] }
-monitor_on = { sheet = "ob", col = 0, row = 12, tint = "#00e5ff", screen = [3, 3, 10, 8] }
-chair = { sheet = "ob", col = 13, row = 9, tint = "#b026ff" }
-sofa = { sheet = "ob", col = 15, row = 9, tint = "#ff2bd6" }
-plant = { sheet = "ob", col = 1, row = 1, tint = "#39ff88" }
-whiteboard = { sheet = "ob", col = 15, row = 7, tint = "#00e5ff" }
 
 [fx]
-glow = "#00b8ff"
+glow = "#00c8ff"
 floor_bg = "#0b0614"
-wall_bg = "#130a24"
-char_tint = "#c8d8ff"
+wall_bg = "#130b24"
+char_tint = "#d0e0ff"
 
 [colors]
-wall = "#130a24"
+floor_style = "grid"
+floor_a = "#110a1f"
+floor_b = "#241540"
+wall = "#130b24"
 wall_trim = "#ff2bd6"
-wood = "#231438"
-desk = "#1f1233"
-metal = "#2a2140"
-screen_on = "#003a4a"
+sky = "#003a52"
+wood = "#291844"
+desk = "#201638"
+metal = "#38305a"
+screen_on = "#004a63"
 screen_off = "#0b0614"
+chair = "#341e54"
 fabric = "#ff2bd6"
-pot = "#b026ff"
-plant = "#39ff88"
-backdrop = "#07040d"
-rug = "#1a0d2e"
-rug_trim = "#ff2bd6"
+pot = "#8c30d9"
+plant = "#2ee68a"
+backdrop = "#080510"
+rug = "#1d1036"
+rug_trim = "#00e5ff"

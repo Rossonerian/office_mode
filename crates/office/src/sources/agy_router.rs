@@ -379,7 +379,7 @@ fn scan_loop(cfg: Config, tx: Sender<Event>, shared: Arc<Mutex<Shared>>, run_dir
     let mut tick: u64 = 0;
     loop {
         let idle = live.is_empty() && live_orphans.is_empty() && !has_any_lock(&run_dir);
-        if !idle || tick % 3 == 0 {
+        if !idle || tick.is_multiple_of(3) {
             let out = Command::new("ps").args(["-axo", "pid=,ppid=,rss=,command="]).stderr(Stdio::null()).output();
             if let Some(out) = out.ok().filter(|o| o.status.success()) {
                 let procs = parse_ps(&String::from_utf8_lossy(&out.stdout));

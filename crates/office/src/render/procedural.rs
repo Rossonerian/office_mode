@@ -112,6 +112,13 @@ pub fn floor(c: &Colors) -> RgbaImage {
             put(&mut i, 3, 4, c.floor_b);
             put(&mut i, 11, 12, c.floor_b);
         }
+        "grid" => {
+            fill(&mut i, 0, 0, 16, 16, c.floor_a);
+            fill(&mut i, 0, 15, 16, 1, c.floor_b);
+            fill(&mut i, 15, 0, 1, 16, c.floor_b);
+            put(&mut i, 0, 0, shade(c.floor_b, 1.25));
+            put(&mut i, 7, 7, shade(c.floor_b, 0.85));
+        }
         _ => {
             fill(&mut i, 0, 0, 8, 8, c.floor_a);
             fill(&mut i, 8, 8, 8, 8, c.floor_a);

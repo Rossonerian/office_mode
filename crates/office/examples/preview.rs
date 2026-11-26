@@ -1,7 +1,6 @@
 //! Render the demo scene for every theme to target/preview/<theme>.png and time compose().
 //! Run: cargo run -p office --example preview [-- WIDTH HEIGHT]
 #[path = "../src/render/mod.rs"]
-#[allow(dead_code)]
 mod render;
 
 use office_core::config::{Config, ThemeMix};
@@ -26,6 +25,8 @@ fn main() -> anyhow::Result<()> {
         r.set_mix(&mix);
         let sel = "cc:beta".to_string();
         let img = r.compose(&scene, Some(&sel), w, h, now);
+        let full_logical = r.logical_size();
+        let full_scale = r.scale();
         let p = out.join(format!("{t}.png"));
         img.save(&p)?;
         // timing at 640×360 (static layer cached after the first frame)
@@ -36,7 +37,7 @@ fn main() -> anyhow::Result<()> {
             r.compose(&scene, Some(&sel), 640, 360, now + i * 83);
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-        println!("{t:<11} {} ({}x{} logical {:?}, scale {}) | 640x360: {ms:.2} ms/frame", p.display(), w, h, r.logical_size(), r.scale());
+        println!("{t:<13} {} ({}x{} logical {:?}, scale {:.2}) | 640x360: {ms:.2} ms/frame", p.display(), w, h, full_logical, full_scale);
     }
     // ambient extras: an idle office (CEO leaning back / coffee), the cat hovered (name shown)
     r.set_mix(&ThemeMix::default());
@@ -101,8 +102,44 @@ fn main() -> anyhow::Result<()> {
         let img = r.compose(&s, Some(&sel), w, h, later);
         let p = out.join("busy-vote.png");
         img.save(&p)?;
-        println!("busy-vote   {}", p.display());
+        println!("busy-vote     {}", p.display());
+        // busy-fit: fill_viewport smooth fit on busy scene
+        r.set_show(&office_core::config::ShowConfig { fill_viewport: true, ..Default::default() });
+        let img = r.compose(&s, Some(&sel), w, h, now);
+        let p = out.join("busy-fit.png");
+        img.save(&p)?;
+        println!("busy-fit      {} (logical {:?}, scale {:.2})", p.display(), r.logical_size(), r.scale());
+        r.set_show(&office_core::config::ShowConfig::default());
         r.set_hover(None);
+    }
+    // auto-running: live rosso-auto job with Tokyo Night + fill_viewport
+    {
+        let mut s = render::demo::demo_scene(now);
+        s.auto_jobs.push(office_core::AutoJob {
+            job: "auth-audit".into(),
+            task: "Refactor auth middleware and add integration tests".into(),
+            flow: "council".into(),
+            phase: "execute".into(),
+            status: "running".into(),
+            calls_used: 7,
+            max_calls: 16,
+            started_at: now - 45_000,
+            active_calls: 2,
+            ..Default::default()
+        });
+        r.set_mix(&ThemeMix {
+            floor: "tokyo-night".into(),
+            walls: "tokyo-night".into(),
+            furniture: "tokyo-night".into(),
+            decor: "tokyo-night".into(),
+            characters: "tokyo-night".into(),
+        });
+        r.set_show(&office_core::config::ShowConfig { fill_viewport: true, ..Default::default() });
+        let img = r.compose(&s, Some(&"cc:beta".to_string()), w, h, now);
+        let p = out.join("auto-running.png");
+        img.save(&p)?;
+        println!("auto-running  {}", p.display());
+        r.set_show(&office_core::config::ShowConfig::default());
     }
     // ROSSO extras: guard deny, verdict chips on council seats, a failure, a council round, in-tray badges,
     // FIFO queue chips, active wave strip, and Chief of Staff dispatch route tag

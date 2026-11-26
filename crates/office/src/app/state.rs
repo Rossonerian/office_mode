@@ -132,7 +132,19 @@ pub fn idle_kill_candidates(scene: &Scene, now_ms: u64) -> Vec<IdleTarget> {
     out
 }
 
-pub const PRESET_ORDER: [&str; 6] = ["procedural", "modern", "cozy", "midnight", "retro", "cyberpunk"];
+pub const PRESET_ORDER: [&str; 11] = [
+    "procedural",
+    "modern",
+    "cozy",
+    "midnight",
+    "tokyo-night",
+    "nord",
+    "retro",
+    "retro-1bit",
+    "retro-amber",
+    "retro-gameboy",
+    "cyberpunk",
+];
 pub const LAYERS: [&str; 5] = ["floor", "walls", "furniture", "decor", "characters"];
 pub const NOTIFY_INTERVAL_MS: u64 = 10_000;
 pub const TOAST_MS: u64 = 4_000;
@@ -406,9 +418,9 @@ impl App {
         let mut v: Vec<_> = scene
             .alerts
             .iter()
-            .filter(|a| self.alerts_cleared_at.map_or(true, |c| a.at_ms > c))
+            .filter(|a| self.alerts_cleared_at.is_none_or(|c| a.at_ms > c))
             .collect();
-        v.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        v.sort_by_key(|a| std::cmp::Reverse(a.at_ms));
         v
     }
 
@@ -629,7 +641,7 @@ impl App {
     }
 
     /// Preset names `t` cycles through: the standard order (only themes that exist or are
-    /// configured as presets), then any extra configured presets.
+    /// configured as presets), then any extra configured presets, then any other discovered themes.
     pub fn preset_cycle(&self, themes: &[String]) -> Vec<String> {
         let mut v: Vec<String> = PRESET_ORDER
             .iter()
@@ -639,6 +651,11 @@ impl App {
         for k in self.presets.keys() {
             if !v.contains(k) {
                 v.push(k.clone());
+            }
+        }
+        for t in themes {
+            if !v.contains(t) {
+                v.push(t.clone());
             }
         }
         v
@@ -1052,6 +1069,10 @@ impl App {
                         self.set_show_item(sel, v, view);
                     }
                     KeyCode::Char('a') => self.set_show_all(ShowConfig::all_on(), view),
+                    KeyCode::Char('c') => {
+                        let s = self.show.clean_on();
+                        self.set_show_all(s, view);
+                    }
                     KeyCode::Char('h') => {
                         let s = self.show.overlays_off();
                         self.set_show_all(s, view);
@@ -1124,9 +1145,7 @@ impl App {
                     }
                     KeyCode::Char('a') => {
                         let all_on = checked.iter().any(|&c| !c);
-                        for c in &mut checked {
-                            *c = all_on;
-                        }
+                        checked.fill(all_on);
                         self.popup = Popup::FreeRam { sel, targets, checked };
                     }
                     KeyCode::Char('r') => {
@@ -1439,6 +1458,14 @@ impl App {
             KeyCode::Char('[') => self.cycle_theme(-1, view, now_ms),
             KeyCode::Char('T') => self.popup = Popup::Mixer { layer: 0 },
             KeyCode::Char('v') => self.popup = Popup::View { sel: 0 },
+            KeyCode::Char('z') => {
+                let v = !self.show.fill_viewport;
+                self.show.fill_viewport = v;
+                view.set_show(&self.show);
+                self.dirty = true;
+                self.persist(now_ms);
+                self.toast(if v { "scale: fill viewport" } else { "scale: pixel-exact" }, AlertLevel::Info, now_ms);
+            }
             KeyCode::Char('L') => {
                 let on = !(self.show.names || self.show.bubbles);
                 self.set_show_item(0, on, view);
@@ -2808,5 +2835,44 @@ mod tests {
         h.press(key('X'));
         assert_eq!(h.app.popup, Popup::None);
         assert!(h.toast().contains("not a rosso-auto job"), "{}", h.toast());
+    }
+
+    #[test]
+    fn preset_cycle_discovers_all_builtins_and_custom_themes() {
+        let mut h = Harness::new();
+        h.app.presets.insert("custom-mix".into(), uniform_mix("nord"));
+        let themes = vec![
+            "procedural".into(),
+            "nord".into(),
+            "tokyo-night".into(),
+            "retro-amber".into(),
+            "my-user-theme".into(),
+        ];
+        let cycle = h.app.preset_cycle(&themes);
+        assert_eq!(
+            cycle,
+            vec!["procedural", "tokyo-night", "nord", "retro-amber", "custom-mix", "my-user-theme"]
+        );
+    }
+
+    #[test]
+    fn view_clean_preset_and_z_scale_toggle() {
+        let mut h = Harness::new();
+        assert!(!h.app.show.fill_viewport);
+        h.press(key('z'));
+        assert!(h.app.show.fill_viewport);
+        assert!(h.view.show.fill_viewport);
+        assert!(h.toast().contains("fill viewport"));
+
+        h.press(key('v'));
+        h.press(key('c'));
+        assert!(h.app.show.selected_only_labels);
+        assert!(h.app.show.names && h.app.show.lighting && h.app.show.theme_chrome);
+        assert!(h.app.show.fill_viewport, "clean preset preserves studio visual prefs");
+        h.press(code(KeyCode::Esc));
+
+        h.press(key('z'));
+        assert!(!h.app.show.fill_viewport);
+        assert!(h.toast().contains("pixel-exact"));
     }
 }

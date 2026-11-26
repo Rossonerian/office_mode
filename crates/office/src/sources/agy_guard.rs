@@ -133,7 +133,7 @@ mod tests {
         let l = t.read(&p);
         assert_eq!(l.len(), 1);
         assert!(l[0].contains("new"));
-        write!(f, "ny\"}}\n").unwrap();
+        writeln!(f, "ny\"}}").unwrap();
         assert_eq!(t.read(&p).len(), 1);
         assert!(t.read(&p).is_empty());
         let _ = std::fs::remove_dir_all(&d);

@@ -1,6 +1,7 @@
 //! A synthetic scene for previews/tests: 2 Claude pods + an agy lab, covering every AgentState.
 use office_core::{model::AgentKind, Agent, AgentState, Scene};
 
+#[allow(clippy::too_many_arguments)]
 fn mk(id: &str, kind: AgentKind, label: &str, parent: Option<&str>, cwd: &str, state: AgentState, activity: &str, started: u64, last: u64) -> Agent {
     Agent {
         id: id.into(),

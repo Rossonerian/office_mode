@@ -67,7 +67,7 @@ fn alert_desks(scene: &Scene, lay: &Layout) -> Vec<Spot> {
 /// Waypoint for leg `k` (and whether it is an alert visit).
 fn waypoint(lay: &Layout, alerts: &[Spot], k: u64) -> (Spot, bool) {
     let h = mix(k);
-    if !alerts.is_empty() && h % 3 == 0 {
+    if !alerts.is_empty() && h.is_multiple_of(3) {
         return (alerts[((h >> 8) % alerts.len() as u64) as usize], true);
     }
     let find = |kind: SpotKind| lay.spots.iter().copied().find(|s| s.kind == kind);
@@ -191,8 +191,8 @@ fn leg_state(lay: &Layout, leg: &Leg, t: u64) -> CatState {
     let within = t.saturating_sub(leg.start);
     let walk_ms = leg.walk_ms;
     let dx = to.x - from.x;
-    let tail_up = (t / 450) % 7 == 0 || (alert && (t / 250) % 2 == 0);
-    let default_left = if dx != 0 { dx < 0 } else { mix(k ^ 0x51) % 2 == 0 };
+    let tail_up = (t / 450).is_multiple_of(7) || (alert && (t / 250).is_multiple_of(2));
+    let default_left = if dx != 0 { dx < 0 } else { mix(k ^ 0x51).is_multiple_of(2) };
     if (within as f32) < walk_ms {
         let p = within as f32 / walk_ms;
         let (x, y, _, sx) = pos_on(&leg.route, &from, &to, p);
@@ -205,11 +205,11 @@ fn leg_state(lay: &Layout, leg: &Leg, t: u64) -> CatState {
     let action = if alert {
         Action::Alert
     } else if to.kind == SpotKind::Sofa {
-        if rest < 1_500.0 { Action::Groom((t / 280) % 2 == 0) } else { Action::Sleep }
+        if rest < 1_500.0 { Action::Groom((t / 280).is_multiple_of(2)) } else { Action::Sleep }
     } else {
         match mix(k ^ 0xCA7) % 4 {
             0 => Action::Sleep,
-            1 if rest < 5_000.0 => Action::Groom((t / 280) % 2 == 0),
+            1 if rest < 5_000.0 => Action::Groom((t / 280).is_multiple_of(2)),
             _ => Action::Sit,
         }
     };
@@ -375,7 +375,7 @@ mod tests {
         let scenes = [demo::demo_scene(now), Scene::default()];
         for s in &scenes {
             for (pw, ph, ceo) in [(640, 360, true), (1600, 900, false), (300, 800, true)] {
-                let lay = layout::build_with(s, pw, ph, layout::Extras { ceo, council: true });
+                let lay = layout::build_with(s, pw, ph, layout::Extras { ceo, council: true, ..Default::default() });
                 let mut seen = std::collections::HashSet::new();
                 for i in 0..4_000u64 {
                     let t = now + i * 97;
@@ -419,7 +419,7 @@ mod tests {
         }
         for s in [demo::demo_scene(now), Scene::default(), big] {
             for (pw, ph, ceo) in [(640, 360, true), (1600, 900, false), (300, 800, true), (1920, 400, true)] {
-                let lay = layout::build_with(&s, pw, ph, layout::Extras { ceo, council: true });
+                let lay = layout::build_with(&s, pw, ph, layout::Extras { ceo, council: true, ..Default::default() });
                 out.push((s.clone(), lay));
             }
         }

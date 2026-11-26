@@ -103,7 +103,7 @@ pub fn council_round(scene: &crate::model::Scene) -> Option<CouncilRound> {
     let mut latest: Option<(u64, &str)> = None;
     for r in &scene.reports {
         let (Some(job), Some(ty)) = (scene.report_jobs.get(&r.id), scene.report_types.get(&r.id)) else { continue };
-        if council_step(ty).is_some() && latest.map_or(true, |(id, _)| r.id > id) {
+        if council_step(ty).is_some() && latest.is_none_or(|(id, _)| r.id > id) {
             latest = Some((r.id, job.as_str()));
         }
     }

@@ -62,6 +62,7 @@ pub struct OfficeCtx {
     pending_kitty_bytes: Option<Vec<u8>>,
     last_logical: Vec<u8>,
     last_logical_dims: (u32, u32),
+    last_scanlines: bool,
     last_area: Rect,
     last_px: (u32, u32),
     cached_proto: Option<Protocol>,
@@ -87,6 +88,7 @@ impl OfficeCtx {
             pending_kitty_bytes: None,
             last_logical: Vec::new(),
             last_logical_dims: (0, 0),
+            last_scanlines: false,
             last_area: Rect::default(),
             last_px: (0, 0),
             cached_proto: None,
@@ -139,28 +141,32 @@ impl OfficeCtx {
             let unchanged = self.last_area == cells
                 && self.last_px == (px_w, px_h)
                 && self.last_logical_dims == dims
+                && self.last_scanlines == app.show.scanlines
                 && self.last_logical == *lf.img.as_raw();
-            if unchanged {
-                if (proto_ty == ProtocolType::Kitty && self.active_kitty_id != 0)
-                    || (proto_ty != ProtocolType::Kitty && self.cached_proto.is_some())
-                {
-                    self.error = None;
-                    return;
-                }
+            if unchanged
+                && ((proto_ty == ProtocolType::Kitty && self.active_kitty_id != 0)
+                    || (proto_ty != ProtocolType::Kitty && self.cached_proto.is_some()))
+            {
+                self.error = None;
+                return;
             }
             self.last_area = cells;
             self.last_px = (px_w, px_h);
             self.last_logical_dims = dims;
+            self.last_scanlines = app.show.scanlines;
             self.last_logical.clear();
             self.last_logical.extend_from_slice(lf.img.as_raw());
 
             if self.scaled_scratch.dimensions() != (px_w, px_h) {
                 self.scaled_scratch = image::RgbaImage::new(px_w, px_h);
             }
-            for px in self.scaled_scratch.as_mut().chunks_exact_mut(4) {
+            for px in self.scaled_scratch.as_mut().as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&lf.backdrop);
             }
             render::canvas::scale_into_with_xmap(&mut self.scaled_scratch, lf.img, lf.ox, lf.oy, lf.scale, &mut self.xmap);
+            if app.show.scanlines {
+                render::apply_scanlines(&mut self.scaled_scratch);
+            }
 
             match proto_ty {
                 ProtocolType::Kitty => {
@@ -262,9 +268,9 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
             let text = confirm_cancel_text(scene, id, label, *pid);
             Some(centered(area, text.chars().count() as u16 + 6, 3))
         }
-        Popup::Theme { names, .. } => Some(centered(area, 36, (names.len() as u16 + 4).min(max_h))),
+        Popup::Theme { names, .. } => Some(centered(area, 56, (names.len() as u16 + 4).min(max_h))),
         Popup::Mixer { .. } => Some(centered(area, 50, (LAYERS.len() as u16 + 5).min(max_h))),
-        Popup::View { .. } => Some(centered(area, 66, (office_core::config::ShowConfig::ITEMS.len() as u16 + 8).min(max_h))),
+        Popup::View { .. } => Some(centered(area, 68, (office_core::config::ShowConfig::ITEMS.len() as u16 + 8).min(max_h))),
         Popup::Reports { only, inbox, .. } => {
             let n = crate::app::state::report_list_for(scene, only.as_deref(), *inbox).len() as u16;
             Some(centered(area, 100, (n + 4).clamp(6, max_h)))
@@ -326,12 +332,13 @@ fn draw_card(f: &mut Frame, app: &mut App, scene: &Scene, office: Rect) {
     } else {
         ("report", Color::Yellow)
     };
+    let pal = ui_palette(app);
     let unread = app.unread_count(scene);
     let b = Block::bordered()
         .border_style(Style::new().fg(c))
         .title(format!(" ✉ boss inbox{} ", if unread > 1 { format!(" · {unread} unread") } else { String::new() }))
         .title_bottom(Line::from(" enter read · esc dismiss · i inbox ").right_aligned())
-        .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+        .style(Style::new().bg(pal.popup_bg));
     let inner = b.inner(r);
     let w = inner.width as usize;
     let mut lines = vec![
@@ -347,7 +354,7 @@ fn draw_card(f: &mut Frame, app: &mut App, scene: &Scene, office: Rect) {
         lines.push(Line::from(Span::styled(trunc(&st, w), Style::new().fg(col))));
         room -= 1;
     }
-    for l in reader::summary_of(&parsed.content).lines().map(|l| reader::first_line(l)).filter(|l| !l.is_empty()).take(room) {
+    for l in reader::summary_of(&parsed.content).lines().map(reader::first_line).filter(|l| !l.is_empty()).take(room) {
         lines.push(Line::from(Span::styled(trunc(&l, w), Style::new().fg(Color::Gray))));
     }
     f.render_widget(Clear, r);
@@ -388,6 +395,98 @@ pub fn draw(f: &mut Frame, app: &mut App, scene: &Scene, office: &mut OfficeCtx,
     draw_popup(f, app, scene, office, now_ms);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiPalette {
+    pub border: Color,
+    pub accent: Color,
+    pub badge_fg: Color,
+    pub popup_bg: Color,
+    pub sel_bg: Color,
+}
+
+pub fn ui_palette(app: &App) -> UiPalette {
+    let default = UiPalette {
+        border: Color::DarkGray,
+        accent: Color::Rgb(0xE0, 0x7A, 0x3F),
+        badge_fg: Color::Black,
+        popup_bg: Color::Rgb(0x16, 0x18, 0x20),
+        sel_bg: Color::Rgb(0x2A, 0x30, 0x40),
+    };
+    if !app.show.theme_chrome {
+        return default;
+    }
+    match app.mix.walls.as_str() {
+        "tokyo-night" => UiPalette {
+            border: Color::Rgb(0x41, 0x48, 0x68),
+            accent: Color::Rgb(0x7A, 0xA2, 0xF7),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x16, 0x16, 0x1E),
+            sel_bg: Color::Rgb(0x28, 0x34, 0x57),
+        },
+        "nord" => UiPalette {
+            border: Color::Rgb(0x4C, 0x56, 0x6A),
+            accent: Color::Rgb(0x88, 0xC0, 0xD0),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x24, 0x29, 0x33),
+            sel_bg: Color::Rgb(0x3B, 0x42, 0x52),
+        },
+        "midnight" => UiPalette {
+            border: Color::Rgb(0x3A, 0x44, 0x59),
+            accent: Color::Rgb(0xF5, 0xA6, 0x42),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x11, 0x13, 0x19),
+            sel_bg: Color::Rgb(0x25, 0x29, 0x34),
+        },
+        "cyberpunk" => UiPalette {
+            border: Color::Rgb(0xFF, 0x2B, 0xD6),
+            accent: Color::Rgb(0x00, 0xE5, 0xFF),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x0B, 0x06, 0x14),
+            sel_bg: Color::Rgb(0x24, 0x15, 0x40),
+        },
+        "retro" | "retro-gameboy" => UiPalette {
+            border: Color::Rgb(0x8B, 0xAC, 0x0F),
+            accent: Color::Rgb(0x9B, 0xBC, 0x0F),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x0F, 0x38, 0x0F),
+            sel_bg: Color::Rgb(0x30, 0x62, 0x30),
+        },
+        "retro-1bit" => UiPalette {
+            border: Color::Rgb(0x2F, 0xC2, 0x4A),
+            accent: Color::Rgb(0xB8, 0xFF, 0xC0),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x00, 0x1A, 0x05),
+            sel_bg: Color::Rgb(0x0A, 0x4D, 0x1A),
+        },
+        "retro-amber" => UiPalette {
+            border: Color::Rgb(0xC2, 0x7A, 0x00),
+            accent: Color::Rgb(0xFF, 0xC3, 0x4D),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x14, 0x0A, 0x00),
+            sel_bg: Color::Rgb(0x3A, 0x20, 0x00),
+        },
+        "cozy" => UiPalette {
+            border: Color::Rgb(0x8A, 0x55, 0x30),
+            accent: Color::Rgb(0xE7, 0xB3, 0x6A),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x20, 0x15, 0x0E),
+            sel_bg: Color::Rgb(0x3B, 0x27, 0x19),
+        },
+        "modern" => UiPalette {
+            border: Color::Rgb(0x6B, 0x6F, 0x78),
+            accent: Color::Rgb(0x7F, 0x8F, 0xE6),
+            badge_fg: Color::Black,
+            popup_bg: Color::Rgb(0x18, 0x1B, 0x22),
+            sel_bg: Color::Rgb(0x2A, 0x30, 0x3C),
+        },
+        _ => default,
+    }
+}
+
+fn chrome_block<'a>(title: impl Into<Line<'a>>, pal: UiPalette) -> Block<'a> {
+    Block::bordered().title(title).border_style(Style::new().fg(pal.border))
+}
+
 fn theme_tag(mix: &office_core::config::ThemeMix) -> String {
     if mix.floor == mix.walls && mix.floor == mix.furniture && mix.floor == mix.decor && mix.floor == mix.characters {
         mix.floor.clone()
@@ -400,9 +499,11 @@ fn draw_header(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
     let (c, s, g, o) = kind_counts(scene);
     let total = c + s + g + o;
     let tag = theme_tag(&app.mix);
+    let pal = ui_palette(app);
+    let badge_st = Style::new().bold().fg(pal.badge_fg).bg(pal.accent);
     let mut spans = if area.width >= 105 {
         vec![
-            Span::styled(" ROSSO · agent office ", Style::new().bold().fg(Color::Black).bg(Color::Rgb(0xE0, 0x7A, 0x3F))),
+            Span::styled(" ROSSO · agent office ", badge_st),
             Span::raw(format!(" {total} agents (")),
             Span::styled(format!("claude {c}"), Style::new().fg(kind_color(AgentKind::Claude))),
             Span::raw(" · "),
@@ -414,7 +515,7 @@ fn draw_header(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
         ]
     } else {
         vec![
-            Span::styled(" ROSSO ", Style::new().bold().fg(Color::Black).bg(Color::Rgb(0xE0, 0x7A, 0x3F))),
+            Span::styled(" ROSSO ", badge_st),
             Span::raw(format!(" {total}a (")),
             Span::styled(format!("{c}c"), Style::new().fg(kind_color(AgentKind::Claude))),
             Span::raw("/"),
@@ -512,7 +613,7 @@ fn draw_footer(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
         spans.push(Span::styled("  i inbox", Style::new().fg(Color::Yellow)));
     }
     spans.push(Span::styled("  p task  f reply  K ram  Space menu  ? help", dim));
-    spans.push(Span::styled("  1-4 tabs  Tab jump  t theme  [ ] cycle  T mix  v view  L labels  s side", dim));
+    spans.push(Span::styled("  1-4 tabs  Tab jump  t theme  [ ] cycle  T mix  v view  z fit  L labels  s side", dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -549,36 +650,33 @@ fn draw_office(f: &mut Frame, app: &App, scene: &Scene, office: &mut OfficeCtx, 
         return;
     }
     let was_prepared = std::mem::take(&mut office.prepared);
-    let proto_ty = office.picker.as_ref().map(|p| p.protocol_type());
-    if office.view.is_some() && proto_ty.is_some() {
-        let proto_ty = proto_ty.unwrap();
+    if let (Some(v), Some(picker)) = (office.view.as_mut(), office.picker.as_ref()) {
+        let proto_ty = picker.protocol_type();
         if proto_ty == ProtocolType::Halfblocks {
-            let (fw, fh) = office.picker.as_ref().unwrap().font_size();
+            let (fw, fh) = picker.font_size();
             let (fw, fh) = (fw.max(1) as u32, fh.max(1) as u32);
             let px_w = (area.width as u32 * fw).min(MAX_PX_W);
             let px_h = (area.height as u32 * fh).min(MAX_PX_H);
             let sel = app.selected.clone();
-            if let Some(v) = office.view.as_mut() {
-                v.set_hover(app.hover.clone());
-                if let Some(lf) = v.compose_logical(scene, sel.as_ref(), px_w, px_h, now_ms) {
-                    draw_halfblocks_direct(f.buffer_mut(), area, &lf, fw, fh);
-                    office.last_walking = lf.is_walking;
-                    office.error = None;
-                    return;
-                }
-                // Fallback for FakeView in tests:
-                match guarded(|| v.compose(scene, sel.as_ref(), px_w, px_h, now_ms)) {
-                    Ok(img) => {
-                        let cells = Rect::new(area.x, area.y, (px_w / fw) as u16, (px_h / fh) as u16);
-                        let dynimg = image::DynamicImage::ImageRgba8(img);
-                        if let Ok(proto) = office.picker.as_ref().unwrap().new_protocol(dynimg, cells, Resize::Fit(None)) {
-                            office.error = None;
-                            f.render_widget(Image::new(&proto), area);
-                            return;
-                        }
+            v.set_hover(app.hover.clone());
+            if let Some(lf) = v.compose_logical(scene, sel.as_ref(), px_w, px_h, now_ms) {
+                draw_halfblocks_direct(f.buffer_mut(), area, &lf, fw, fh);
+                office.last_walking = lf.is_walking;
+                office.error = None;
+                return;
+            }
+            // Fallback for FakeView in tests:
+            match guarded(|| v.compose(scene, sel.as_ref(), px_w, px_h, now_ms)) {
+                Ok(img) => {
+                    let cells = Rect::new(area.x, area.y, (px_w / fw) as u16, (px_h / fh) as u16);
+                    let dynimg = image::DynamicImage::ImageRgba8(img);
+                    if let Ok(proto) = picker.new_protocol(dynimg, cells, Resize::Fit(None)) {
+                        office.error = None;
+                        f.render_widget(Image::new(&proto), area);
+                        return;
                     }
-                    Err(e) => office.error = Some(e),
                 }
+                Err(e) => office.error = Some(e),
             }
         } else {
             // Prepare if not yet prepared for this state (e.g. unit tests calling draw directly).
@@ -680,13 +778,14 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms:
 }
 
 fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let pal = ui_palette(app);
     let titles: Vec<Line> = SideTab::ALL.iter().map(|t| Line::from(t.title())).collect();
     let tabs = Tabs::new(titles)
         .select(app.side_tab.index())
         .padding("", "")
         .divider(Span::styled("│", Style::new().fg(Color::DarkGray)))
         .style(Style::new().fg(Color::Gray))
-        .highlight_style(Style::new().fg(Color::Black).bg(Color::Rgb(0xE0, 0x7A, 0x3F)).bold());
+        .highlight_style(Style::new().fg(pal.badge_fg).bg(pal.accent).bold());
     f.render_widget(tabs, area);
 }
 
@@ -728,14 +827,14 @@ fn draw_agents_panel(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, no
         app.layout.free_ram_btn = Rect::default();
         let [agents, router] = Layout::vertical([Constraint::Min(4), Constraint::Length(6)]).areas(area);
         draw_agents(f, app, scene, agents, now_ms);
-        draw_router(f, scene, router);
+        draw_router(f, app, scene, router);
     } else if area.height < 20 {
         app.layout.free_ram_btn = Rect::default();
         let alerts_h = (area.height / 3).clamp(4, 10);
         let [agents, router, alerts] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(6), Constraint::Length(alerts_h)]).areas(area);
         draw_agents(f, app, scene, agents, now_ms);
-        draw_router(f, scene, router);
+        draw_router(f, app, scene, router);
         draw_alerts(f, app, scene, alerts, now_ms);
     } else {
         let alerts_h = (area.height / 3).clamp(4, 10);
@@ -747,7 +846,7 @@ fn draw_agents_panel(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, no
         ])
         .areas(area);
         draw_agents(f, app, scene, agents, now_ms);
-        draw_router(f, scene, router);
+        draw_router(f, app, scene, router);
         draw_free_ram_btn(f, app, scene, ram_btn, now_ms);
         draw_alerts(f, app, scene, alerts, now_ms);
     }
@@ -759,8 +858,9 @@ fn short_chip(v: reader::Verdict) -> Span<'static> {
 }
 
 fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
+    let pal = ui_palette(app);
     let rows = panels::jobs(scene);
-    let block = Block::bordered().title(format!(" Jobs ({}) ", rows.len()));
+    let block = chrome_block(format!(" Jobs ({}) ", rows.len()), pal);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width < 8 {
@@ -942,8 +1042,9 @@ fn draw_jobs(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
 }
 
 fn draw_activity(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u64) {
+    let pal = ui_palette(app);
     let items = panels::feed(scene, &app.state_log, panels::FEED_MAX);
-    let block = Block::bordered().title(format!(" Activity ({}) ", items.len()));
+    let block = chrome_block(format!(" Activity ({}) ", items.len()), pal);
     let inner = block.inner(area);
     if items.is_empty() {
         f.render_widget(
@@ -973,7 +1074,8 @@ fn draw_activity(f: &mut Frame, app: &App, scene: &Scene, area: Rect, now_ms: u6
 }
 
 fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u64) {
-    let block = Block::bordered().title(" Stats ");
+    let pal = ui_palette(app);
+    let block = chrome_block(" Stats ", pal);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width < 10 {
@@ -1120,12 +1222,13 @@ fn draw_agents(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: 
     let offset = if cap > 0 && sel_idx >= cap { sel_idx + 1 - cap } else { 0 };
     let visible: Vec<&(String, usize)> = rows.iter().skip(offset).take(cap).collect();
 
+    let pal = ui_palette(app);
     let title = if cap > 0 && rows.len() > cap && !visible.is_empty() {
         format!(" Agents ({}) [{}-{}] ", rows.len(), offset + 1, offset + visible.len())
     } else {
         format!(" Agents ({}) ", rows.len())
     };
-    let block = Block::bordered().title(title);
+    let block = chrome_block(title, pal);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 2 {
@@ -1350,8 +1453,8 @@ pub fn router_gauge_label(scene: &Scene) -> (String, f64) {
     }
 }
 
-fn draw_router(f: &mut Frame, scene: &Scene, area: Rect) {
-    let block = Block::bordered().title(" Router ");
+fn draw_router(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
+    let block = chrome_block(" Router ", ui_palette(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -1381,7 +1484,7 @@ fn draw_alerts(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: 
     } else {
         format!(" Alerts ({}) ", alerts.len())
     };
-    let block = Block::bordered().title(title);
+    let block = chrome_block(title, ui_palette(app));
     let inner = block.inner(area);
     app.layout.alert_rows = inner;
     app.layout.alert_agent_ids = alerts.iter().take(inner.height as usize).map(|a| a.agent.clone()).collect();
@@ -1431,9 +1534,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Display",
         &[
-            ("v", "view menu: choose what the office shows (names, zones, ...)"),
+            ("v", "view menu: toggles, c clean / a all / h hide"),
+            ("z", "toggle pixel-exact vs fill viewport scaling"),
             ("L", "show / hide name tags and speech bubbles"),
-            ("t / [ ]", "theme picker (live preview) / previous & next theme"),
+            ("t / [ ]", "theme picker (swatches + live preview) / cycle"),
             ("T", "theme mixer: a different theme per layer"),
             ("s", "show / hide the sidebar"),
         ],
@@ -1466,7 +1570,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
 }
 
 /// What each View menu row means (label, one-line explanation), in `ShowConfig::ITEMS` order.
-pub const VIEW_INFO: [(&str, &str); 12] = [
+pub const VIEW_INFO: [(&str, &str); 16] = [
     ("names", "the name tag above each agent"),
     ("bubbles", "what each agent is doing right now (speech bubble)"),
     ("icons", "small !, ?, … and ✓ above heads"),
@@ -1477,8 +1581,12 @@ pub const VIEW_INFO: [(&str, &str); 12] = [
     ("cat", "the office cat wandering the aisles"),
     ("CEO corner", "your corner office (you are the CEO)"),
     ("council cabin", "meeting room for council members"),
-    ("ambient", "coffee steam, server lights, idle walks"),
+    ("ambient", "coffee steam, server lights, kanban, strolls"),
     ("selected only", "show tags and bubbles only for the selected agent and alerts"),
+    ("lighting", "window light shafts, monitor glow halos & depth"),
+    ("fill viewport", "scale office to fill pane instead of integer-only steps"),
+    ("scanlines", "subtle CRT scanline pass over the office output"),
+    ("theme chrome", "match sidebar & popup borders and accents to active theme"),
 ];
 
 pub fn detail_lines(app: &App, a: &Agent, scene: &Scene, now_ms: u64) -> Vec<Line<'static>> {
@@ -1564,22 +1672,50 @@ pub fn detail_lines(app: &App, a: &Agent, scene: &Scene, now_ms: u64) -> Vec<Lin
     v
 }
 
-/// One-line blurb for a built-in theme preset (empty for unknown/user themes).
+/// One-line blurb for a built-in theme preset (generic label for user themes).
 fn theme_desc(name: &str) -> &'static str {
     match name {
         "procedural" => "built-in pixels",
         "modern" => "bright and clean",
         "cozy" => "warm wood",
         "midnight" => "dark blue night",
-        "retro" => "8-bit arcade",
-        "cyberpunk" => "neon city",
-        _ => "",
+        "tokyo-night" => "indigo dark studio",
+        "nord" => "arctic slate frost",
+        "retro" => "8-bit handheld",
+        "retro-1bit" => "green phosphor",
+        "retro-amber" => "amber CRT",
+        "retro-gameboy" => "4-shade pocket",
+        "cyberpunk" => "neon synth grid",
+        "custom mix…" => "",
+        _ => "custom theme",
     }
 }
 
-fn popup_frame(f: &mut Frame, r: Rect, title: String) -> Rect {
+fn theme_swatches(name: &str) -> Option<[Color; 4]> {
+    let s = match name {
+        "procedural" => [Color::Rgb(0x8F, 0xA3, 0xB8), Color::Rgb(0xE8, 0xE2, 0xD6), Color::Rgb(0x3F, 0x8F, 0x8A), Color::Rgb(0x7D, 0x5A, 0x8C)],
+        "modern" => [Color::Rgb(0x5F, 0x66, 0x72), Color::Rgb(0xC8, 0x94, 0x5E), Color::Rgb(0x7F, 0x8F, 0xE6), Color::Rgb(0xC0, 0x60, 0x3A)],
+        "cozy" => [Color::Rgb(0x8A, 0x55, 0x30), Color::Rgb(0xC8, 0x94, 0x5E), Color::Rgb(0xA8, 0x43, 0x2F), Color::Rgb(0xE7, 0xB3, 0x6A)],
+        "midnight" => [Color::Rgb(0x1C, 0x22, 0x30), Color::Rgb(0x4D, 0x37, 0x28), Color::Rgb(0xF5, 0xA6, 0x42), Color::Rgb(0x6B, 0x55, 0x8A)],
+        "tokyo-night" => [Color::Rgb(0x1F, 0x23, 0x35), Color::Rgb(0x34, 0x3B, 0x58), Color::Rgb(0x7A, 0xA2, 0xF7), Color::Rgb(0x73, 0xDA, 0xCA)],
+        "nord" => [Color::Rgb(0x3B, 0x42, 0x52), Color::Rgb(0xD8, 0xDE, 0xE9), Color::Rgb(0x88, 0xC0, 0xD0), Color::Rgb(0xA3, 0xBE, 0x8C)],
+        "retro" => [Color::Rgb(0x0F, 0x38, 0x0F), Color::Rgb(0x20, 0x40, 0x20), Color::Rgb(0x5A, 0x84, 0x18), Color::Rgb(0x9B, 0xBC, 0x0F)],
+        "retro-1bit" => [Color::Rgb(0x00, 0x1A, 0x05), Color::Rgb(0x0A, 0x4D, 0x1A), Color::Rgb(0x2F, 0xC2, 0x4A), Color::Rgb(0xB8, 0xFF, 0xC0)],
+        "retro-amber" => [Color::Rgb(0x14, 0x0A, 0x00), Color::Rgb(0x5C, 0x33, 0x00), Color::Rgb(0xC2, 0x7A, 0x00), Color::Rgb(0xFF, 0xC3, 0x4D)],
+        "retro-gameboy" => [Color::Rgb(0x0F, 0x38, 0x0F), Color::Rgb(0x30, 0x62, 0x30), Color::Rgb(0x8B, 0xAC, 0x0F), Color::Rgb(0x9B, 0xBC, 0x0F)],
+        "cyberpunk" => [Color::Rgb(0x13, 0x0B, 0x24), Color::Rgb(0xFF, 0x2B, 0xD6), Color::Rgb(0x00, 0xE5, 0xFF), Color::Rgb(0x2E, 0xE6, 0x8A)],
+        _ => return None,
+    };
+    Some(s)
+}
+
+fn popup_frame_pal(f: &mut Frame, r: Rect, title: String, pal: UiPalette) -> Rect {
     f.render_widget(Clear, r);
-    let b = Block::bordered().borders(Borders::ALL).title(title).style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+    let b = Block::bordered()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(pal.border))
+        .title(title)
+        .style(Style::new().bg(pal.popup_bg));
     let inner = b.inner(r);
     f.render_widget(b, r);
     inner
@@ -1588,6 +1724,7 @@ fn popup_frame(f: &mut Frame, r: Rect, title: String) -> Rect {
 fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, now_ms: u64) {
     let area = f.area();
     let max_h = area.height.saturating_sub(2).max(5);
+    let pal = ui_palette(app);
     match &app.popup {
         Popup::None => {
             app.layout.popup = Rect::default();
@@ -1598,7 +1735,11 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let r = centered(area, 78, (lines.len() as u16 + 2).min(max_h));
             app.layout.popup = r;
             f.render_widget(Clear, r);
-            let mut b = Block::bordered().borders(Borders::ALL).title(" help ").style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+            let mut b = Block::bordered()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(pal.border))
+                .title(" help ")
+                .style(Style::new().bg(pal.popup_bg));
             if lines.len() + 2 > r.height as usize {
                 b = b.title_bottom(Line::from(" ↑↓ / PgUp PgDn scroll · esc close ").right_aligned());
             }
@@ -1619,8 +1760,9 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             f.render_widget(Clear, r);
             let mut b = Block::bordered()
                 .borders(Borders::ALL)
+                .border_style(Style::new().fg(pal.border))
                 .title(format!(" {} ", a.label))
-                .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+                .style(Style::new().bg(pal.popup_bg));
             if lines.len() + 2 > r.height as usize {
                 b = b.title_bottom(Line::from(" PgUp/PgDn scroll · esc close ").right_aligned());
             }
@@ -1651,7 +1793,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 None => " hand-offs · all ".to_string(),
                 }
             };
-            let inner = popup_frame(f, r, title);
+            let inner = popup_frame_pal(f, r, title, pal);
             let rows = inner.height.saturating_sub(1) as usize;
             let start = sel.saturating_sub(rows.saturating_sub(1));
             let w = inner.width as usize;
@@ -1664,7 +1806,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 let unread = *inbox && app.inbox_seen < rep.id;
                 let mut style = Style::new();
                 if i == *sel {
-                    style = style.bg(Color::Rgb(0x2a, 0x30, 0x40));
+                    style = style.bg(pal.sel_bg);
                 }
                 let route_style = if unread { style.bold() } else { style };
                 lines.push(Line::from(vec![
@@ -1689,9 +1831,10 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let pos = list.iter().position(|x| x.id == *id).map(|i| format!(" {}/{} ", i + 1, list.len())).unwrap_or_default();
             let b = Block::bordered()
                 .borders(Borders::ALL)
+                .border_style(Style::new().fg(pal.border))
                 .title(Line::from(vec![Span::styled(" report", Style::new().bold()), Span::styled(pos, Style::new().fg(Color::Yellow).bold())]))
                 .title_bottom(Line::from(" tab/←→ view · ↑↓ scroll · y copy · w save · n/p next/prev · f reply · g sender · esc back ").right_aligned())
-                .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+                .style(Style::new().bg(pal.popup_bg));
             let inner = b.inner(r);
             f.render_widget(Clear, r);
             f.render_widget(b, r);
@@ -1735,18 +1878,23 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let text = confirm_cancel_text(scene, id, label, *pid);
             let r = centered(area, text.chars().count() as u16 + 6, 3);
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " confirm ".into());
+            let inner = popup_frame_pal(f, r, " confirm ".into(), pal);
             f.render_widget(Paragraph::new(text).style(Style::new().fg(Color::LightRed).bold()), inner);
         }
         Popup::View { sel } => {
             let items = office_core::config::ShowConfig::ITEMS;
-            let r = centered(area, 66, (items.len() as u16 + 8).min(max_h));
+            let r = centered(area, 68, (items.len() as u16 + 8).min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " view: what the office shows ".into());
+            let pal = ui_palette(app);
+            let inner = popup_frame_pal(f, r, " view: what the office shows ".into(), pal);
             let w = inner.width as usize;
+            let cap = inner.height.saturating_sub(5).max(1) as usize;
+            let start = sel.saturating_sub(cap.saturating_sub(1));
             let mut lines: Vec<Line> = VIEW_INFO
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(cap)
                 .map(|(i, (label, _))| {
                     let style = if i == *sel { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
                     let mark = if i == *sel { "▶" } else { " " };
@@ -1756,39 +1904,67 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 .collect();
             lines.push(Line::raw(""));
             let desc = VIEW_INFO.get(*sel).map(|(l, d)| format!("{l} — {d}")).unwrap_or_default();
-            lines.push(Line::from(Span::styled(trunc(&desc, w * 2), Style::new().fg(Color::LightCyan))));
+            lines.push(Line::from(Span::styled(trunc(&desc, w), Style::new().fg(Color::LightCyan))));
             lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled("↑↓ move  space toggle  a all  h hide overlays  esc save", Style::new().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                trunc("↑↓ move  space toggle  a all  c clean  h hide  esc save", w),
+                Style::new().fg(Color::DarkGray),
+            )));
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         Popup::Theme { sel, names, .. } => {
-            let r = centered(area, 36, (names.len() as u16 + 4).min(max_h));
+            let r = centered(area, 56, (names.len() as u16 + 4).min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " theme ".into());
+            let pal = ui_palette(app);
+            let inner = popup_frame_pal(f, r, " theme ".into(), pal);
             let cur = names.iter().position(|n| crate::app::state::mix_eq(&app.preset_mix(n), &app.mix)).unwrap_or(names.len());
             let w = inner.width as usize;
+            let cap = inner.height.saturating_sub(1).max(1) as usize;
+            let start = sel.saturating_sub(cap.saturating_sub(1));
             let mut lines: Vec<Line> = names
                 .iter()
                 .map(String::as_str)
                 .chain(std::iter::once("custom mix…"))
                 .enumerate()
+                .skip(start)
+                .take(cap)
                 .map(|(i, n)| {
                     let style = if i == *sel { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
                     let mark = if i == *sel { "▶" } else { " " };
                     let dot = if i == cur { "●" } else { " " };
                     let d = theme_desc(n);
-                    let text = if d.is_empty() { format!("{mark}{dot}{} {n}", i + 1) } else { format!("{mark}{dot}{} {n:<10} {d}", i + 1) };
-                    Line::from(Span::styled(trunc(&text, w), style))
+                    let num = format!("{:<2}", i + 1);
+                    let body = if d.is_empty() {
+                        format!("{mark}{dot}{} {n}", num.trim_end())
+                    } else {
+                        format!("{mark}{dot}{} {n:<13} {d}", num.trim_end())
+                    };
+                    if let Some(sw) = theme_swatches(n) {
+                        let sw_w = 5;
+                        let trimmed = trunc(&body, w.saturating_sub(sw_w + 1));
+                        let used = trimmed.chars().count();
+                        let pad = w.saturating_sub(used + sw_w).max(1);
+                        let mut spans = vec![
+                            Span::styled(trimmed, style),
+                            Span::raw(" ".repeat(pad)),
+                        ];
+                        for c in sw {
+                            spans.push(Span::styled("█", Style::new().fg(c)));
+                        }
+                        Line::from(spans)
+                    } else {
+                        Line::from(Span::styled(trunc(&body, w), style))
+                    }
                 })
                 .collect();
-            lines.push(Line::from(Span::styled(trunc("↑↓ preview  ⏎ keep  esc undo", w), Style::new().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(trunc("↑↓ preview  1-9 jump  ⏎ keep  esc undo", w), Style::new().fg(Color::DarkGray))));
             f.render_widget(Paragraph::new(lines), inner);
         }
         Popup::Mixer { layer } => {
             let themes = office.view.as_ref().map(|v| v.themes()).unwrap_or_else(|| vec!["procedural".into()]);
             let r = centered(area, 50, (LAYERS.len() as u16 + 5).min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " theme mixer ".into());
+            let inner = popup_frame_pal(f, r, " theme mixer ".into(), pal);
             let mut lines: Vec<Line> = LAYERS
                 .iter()
                 .enumerate()
@@ -1808,7 +1984,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let rows = targets.len().max(1) as u16;
             let r = centered(area, 78, (rows + 7).clamp(8, max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " Free RAM — kill idle agents ".into());
+            let inner = popup_frame_pal(f, r, " Free RAM — kill idle agents ".into(), pal);
             let total_mb: u32 = targets.iter().zip(checked.iter()).filter(|(_, c)| **c).map(|(t, _)| t.rss_mb).sum();
             let checked_n = checked.iter().filter(|&&c| c).count();
             let orphans = scene.router_extra.orphans;
@@ -1882,7 +2058,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 .as_ref()
                 .map(|(_, l)| format!(" Reply to {l} "))
                 .unwrap_or_else(|| " Dispatch Task ".into());
-            let inner = popup_frame(f, r, title);
+            let inner = popup_frame_pal(f, r, title, pal);
             let w = inner.width as usize;
             let [top_a, cwd_a, prompt_a, hint_a] =
                 Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(inner);
@@ -1906,11 +2082,11 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 cwd_a,
             );
 
-            let p_border = if *field == 2 { Color::Yellow } else { Color::DarkGray };
+            let p_border = if *field == 2 { Color::Yellow } else { pal.border };
             let p_block = Block::bordered()
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(p_border))
-                .style(Style::new().bg(Color::Rgb(0x16, 0x18, 0x20)));
+                .style(Style::new().bg(pal.popup_bg));
             let p_cursor = if *field == 2 { "▌" } else { "" };
             let p_st = if *field == 2 { Style::new().fg(Color::Yellow).bold() } else { Style::new().fg(Color::DarkGray) };
             let p_line = Line::from(vec![Span::styled("Prompt:  ", p_st), Span::raw(format!("{prompt}{p_cursor}"))]);
@@ -1926,7 +2102,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let n = super::state::ACTIONS.len() as u16;
             let r = centered(area, 56, (n + 5).min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " Command Center ".into());
+            let inner = popup_frame_pal(f, r, " Command Center ".into(), pal);
             let w = inner.width as usize;
             let mut lines: Vec<Line> = super::state::ACTIONS
                 .iter()
@@ -1934,7 +2110,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 .map(|(i, (key, desc))| {
                     let row_txt = format!("  [{key}]  {desc}");
                     let st = if i == *sel {
-                        Style::new().bg(Color::Rgb(0x2a, 0x30, 0x40)).fg(Color::Yellow).bold()
+                        Style::new().bg(pal.sel_bg).fg(Color::Yellow).bold()
                     } else {
                         Style::new()
                     };
@@ -1952,7 +2128,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let (msg, names, w) = approve_all_text_and_w(items);
             let r = centered(area, w, 5.min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " confirm approve all ".into());
+            let inner = popup_frame_pal(f, r, " confirm approve all ".into(), pal);
             let iw = inner.width as usize;
             let lines = vec![
                 Line::from(Span::styled(trunc(&msg, iw), Style::new().fg(Color::Yellow).bold())),
@@ -1966,7 +2142,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let w = msg.chars().count().max(hint.chars().count()) as u16 + 6;
             let r = centered(area, w, 4.min(max_h));
             app.layout.popup = r;
-            let inner = popup_frame(f, r, " confirm abort auto ".into());
+            let inner = popup_frame_pal(f, r, " confirm abort auto ".into(), pal);
             let iw = inner.width as usize;
             let lines = vec![
                 Line::from(Span::styled(trunc(&msg, iw), Style::new().fg(Color::LightRed).bold())),
@@ -2535,5 +2711,27 @@ mod tests {
         ] {
             assert!(s.contains(needle), "missing {needle:?}:\n{s}");
         }
+    }
+
+    #[test]
+    fn ui_palette_syncs_with_theme_chrome_and_theme_picker_shows_swatches() {
+        let (mut app, scene) = test_app();
+        app.mix = crate::app::state::uniform_mix("tokyo-night");
+        let themed = ui_palette(&app);
+        assert_eq!(themed.accent, Color::Rgb(0x7A, 0xA2, 0xF7));
+        app.show.theme_chrome = false;
+        let neutral = ui_palette(&app);
+        assert_eq!(neutral.accent, Color::Rgb(0xE0, 0x7A, 0x3F));
+
+        let mut office = OfficeCtx::new(None, None);
+        app.popup = Popup::Theme {
+            sel: 1,
+            names: vec!["procedural".into(), "tokyo-night".into(), "nord".into(), "custom-user".into()],
+            orig: crate::app::state::MixSnap(app.mix.clone()),
+        };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("tokyo-night") && s.contains("indigo dark studio") && s.contains("████"), "{s}");
+        assert!(s.contains("nord") && s.contains("arctic slate frost"), "{s}");
+        assert!(s.contains("custom-user") && s.contains("custom theme"), "{s}");
     }
 }
