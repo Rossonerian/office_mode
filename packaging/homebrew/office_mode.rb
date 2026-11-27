@@ -7,24 +7,24 @@ class OfficeMode < Formula
   on_macos do
     on_arm do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "2a8ea57abc1de3074cc2cf17fd6ebab0f23f01bafba3a7961acbac90acfa5251"
+      sha256 "cdacdb885b765492bf62766a23764c540f599b54942032dde7b17f37f04e78e0"
     end
 
     on_intel do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "db3385b7d4f98ce5bce38f29423b541971313e66f4dfd60cfd6ab5193ed5990d"
+      sha256 "86735a4c7419721c9f0c5f52e723e3f9a07e152f191ef40632624f5836399840"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "2b6c57efa53af4596f3d790af8ecde3deed4aaf0a22b2a85b0fe2e3f71e9fbf8"
+      sha256 "7357191868e94736f06eed21c9c1ad4e1e366b486a9ac00d1dfabfbb60702d43"
     end
 
     on_intel do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "ac934afecd242bb25d6d9bd165082d38c81c21484a44e321bf71e57849854866"
+      sha256 "4fe7df436cb211c743771ab29865736d30aaa0c18510f95bdd5c9c011810b7b5"
     end
   end
 
@@ -45,7 +45,7 @@ class OfficeMode < Formula
     EOS
   end
 
-  test do
+  def test do
     assert_match "office #{version}", shell_output("#{bin}/office --version")
     assert_match "office #{version}", shell_output("#{bin}/office_mode --version")
     assert_match version.to_s, shell_output("#{bin}/office-desktop --version") if (bin/"office-desktop").exist?
