@@ -7,24 +7,24 @@ class OfficeMode < Formula
   on_macos do
     on_arm do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "PLACEHOLDER_AARCH64_APPLE_DARWIN"
+      sha256 "4373fcb818e1568ffdc04231bdc53712eabf3be9a8528f1fb98e14f33f8a1fa7"
     end
 
     on_intel do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "PLACEHOLDER_X86_64_APPLE_DARWIN"
+      sha256 "34f20927a030fbf0fbbdb8d5dbc2524eea9833b93a8de8bf855499ccccbd5c07"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "PLACEHOLDER_AARCH64_UNKNOWN_LINUX_GNU"
+      sha256 "2b6c57efa53af4596f3d790af8ecde3deed4aaf0a22b2a85b0fe2e3f71e9fbf8"
     end
 
     on_intel do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "PLACEHOLDER_X86_64_UNKNOWN_LINUX_GNU"
+      sha256 "ac934afecd242bb25d6d9bd165082d38c81c21484a44e321bf71e57849854866"
     end
   end
 

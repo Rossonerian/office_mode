@@ -136,6 +136,7 @@ fn drop_sock_guard() {
 }
 
 /// True when we were started under a real parent and have since been re-parented to launchd/init.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn is_orphaned(start_ppid: i32, cur_ppid: i32) -> bool {
     start_ppid != 1 && cur_ppid == 1
 }
@@ -161,6 +162,7 @@ pub fn watchdog_action(since_trigger: Option<Duration>, orphan: bool) -> Watchdo
 
 /// Independent of the event loop (which can be wedged inside crossterm's read on a hung-up tty):
 /// once quitting starts, force the process out if it hasn't exited shortly after.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn spawn_quit_watchdog(quit_flag: Arc<AtomicBool>, start_ppid: i32) {
     let _ = std::thread::Builder::new().name("quit-watchdog".into()).spawn(move || {
         let mut trigger: Option<std::time::Instant> = None;
@@ -457,6 +459,7 @@ pub fn run(cfg: Config, demo: bool) -> anyhow::Result<()> {
     res
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn event_loop(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     cfg: Config,

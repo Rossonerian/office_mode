@@ -121,14 +121,11 @@ fn ps_comm_cmd(pid: u32) -> Option<(String, String)> {
 }
 
 fn is_refused_pid(pid: u32) -> bool {
-    if pid <= 1 || pid == std::process::id() {
-        return true;
-    }
     #[cfg(unix)]
     if pid == unsafe { libc::getppid() } as u32 {
         return true;
     }
-    false
+    pid <= 1 || pid == std::process::id()
 }
 
 /// Safely terminate an agent process by PID: refuses init/self/parent, verifies process identity,
