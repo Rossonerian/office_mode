@@ -483,8 +483,8 @@ impl Reducer {
         let cwd = a.cwd.clone().or_else(|| a.parent.as_ref().and_then(|p| self.scene.agents.get(p)).and_then(|p| p.cwd.clone()));
         let Some(c) = cwd else { return true };
         let c = self.canon(&c);
-        let within = |x: &str, y: &str| x == y || x.starts_with(&format!("{}/", y.trim_end_matches('/')));
-        within(&c, canon) || within(canon, &c)
+        let (pc, pcanon) = (std::path::Path::new(&c), std::path::Path::new(canon));
+        pc.starts_with(pcanon) || pcanon.starts_with(pc)
     }
 
     /// Redirect events for a folded `ag:<sid>` to its `agy:<pid>`; fold a late-arriving `ag:<sid>`
@@ -1491,8 +1491,9 @@ mod tests {
     fn agy_parent_not_inferred_when_two_sessions_share_cwd() {
         let mut r = Reducer::new();
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let sub_cwd = std::env::temp_dir().join("sub").to_string_lossy().into_owned();
         r.apply(ev(0, seen("cc:p1", Some("p1"), Some(&cwd))));
-        r.apply(ev(1, seen("cc:p2", Some("p2"), Some(&format!("{}/sub", cwd.trim_end_matches('/'))))));
+        r.apply(ev(1, seen("cc:p2", Some("p2"), Some(&sub_cwd))));
         r.apply(ev(30, EventKind::AgentSeen {
             id: "agy:42".into(),
             kind: AgentKind::Agy,
@@ -1645,7 +1646,7 @@ mod tests {
     fn agy_call_nests_under_its_relay_subagent() {
         let mut r = Reducer::new();
         let root = std::env::temp_dir().to_string_lossy().into_owned();
-        let sub_dir = format!("{}/x", root.trim_end_matches('/'));
+        let sub_dir = std::env::temp_dir().join("x").to_string_lossy().into_owned();
         let seen_full = |id: &str, kind: AgentKind, parent: Option<&str>, cwd: Option<&str>, role: Option<&str>| EventKind::AgentSeen {
             id: id.into(),
             kind,
