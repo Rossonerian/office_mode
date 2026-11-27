@@ -7,12 +7,12 @@ class OfficeMode < Formula
   on_macos do
     on_arm do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "18fc3e9330bc704a9c5e29c74022bc796daf2b22a8935d281ebf7aa3bdfb4648"
+      sha256 "2a8ea57abc1de3074cc2cf17fd6ebab0f23f01bafba3a7961acbac90acfa5251"
     end
 
     on_intel do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "16dccb46a68fe62fe6397864f55f6225adb8ee21478cfbfb515555ab0aa2e079"
+      sha256 "db3385b7d4f98ce5bce38f29423b541971313e66f4dfd60cfd6ab5193ed5990d"
     end
   end
 
