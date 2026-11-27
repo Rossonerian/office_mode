@@ -1,20 +1,21 @@
 # office_mode
 
-A pixel-art **native desktop app** (`office-desktop`) and **terminal office** (`office` / `office_mode`) for your AI coding agents (**Claude Code** and **Antigravity**).
+A pixel-art **native desktop app** (`office-desktop`) and **terminal office** (`office` / `office_mode`) for your AI coding agents ([**Claude Code**](https://docs.anthropic.com/en/docs/claude-code) and **Antigravity**).
 
 [![Latest Release](https://img.shields.io/github/v/release/Rossonerian/office_mode?label=release&style=flat-square)](https://github.com/Rossonerian/office_mode/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Rossonerian/office_mode/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/Rossonerian/office_mode/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
-![Platforms: macOS | Linux | Windows](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square)
+[![Platforms: macOS | Linux | Windows](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square)](#install)
 
-[Features](#features) · [How It Works](#how-it-works) · [Install](#install) · [Quickstart](#quickstart) · [Terminal Support](#terminal-support) · [Controls](#controls) · [Configuration](#configuration) · [Uninstall](#uninstall)
+[Features](#features) · [How It Works](#how-it-works) · [Install](#install) · [Quickstart](#quickstart) · [Terminal Support](#terminal-support) · [Controls](#controls) · [Configuration](#configuration) · [Uninstall](#uninstall) · [Documentation](#documentation--development)
 
 Every Claude Code session gets a color-coded desk pod; its subagents and `agy` / `agy-route` calls sit at intern desks. Watch who is typing, reading, running, thinking, or waiting on you, inspect tokens and cost, monitor router RAM, dispatch tasks or read agent reports from the Boss Inbox, approve/deny permissions live, track progress on the office whiteboard, customize themes and your CEO outfit, reap idle/orphan processes, and wander with the office cat.
 
-![The modern theme](docs/screenshots/modern.png)
+![office_mode running the modern theme](docs/screenshots/modern.png)
 
-| cyberpunk | an idle office (the CEO looks out of the window) |
+| Cyberpunk Theme | Idle Office (Ambient View) |
 |---|---|
-| ![cyberpunk](docs/screenshots/cyberpunk.png) | ![ambient](docs/screenshots/ambient-back.png) |
+| ![Cyberpunk theme](docs/screenshots/cyberpunk.png) | ![Idle office with CEO looking out the window](docs/screenshots/ambient-back.png) |
 
 ---
 
