@@ -45,7 +45,7 @@ class OfficeMode < Formula
     EOS
   end
 
-  def test do
+  test do
     assert_match "office #{version}", shell_output("#{bin}/office --version")
     assert_match "office #{version}", shell_output("#{bin}/office_mode --version")
     assert_match version.to_s, shell_output("#{bin}/office-desktop --version") if (bin/"office-desktop").exist?
