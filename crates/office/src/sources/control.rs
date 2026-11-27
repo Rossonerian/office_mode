@@ -1,11 +1,11 @@
 //! Workstream A. Control actions invoked by the TUI (workstream C).
 use office_core::{model::AgentKind, paths};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-/// SIGTERM an agy-route router process (it releases its slot and kills its agy group).
+/// Terminate an agy-route router process (`SIGTERM` on Unix, `taskkill` on Windows).
 pub fn cancel_agy(router_pid: u32) -> anyhow::Result<()> {
     anyhow::ensure!(router_pid > 1, "refusing to signal pid {router_pid}");
     #[cfg(unix)]
@@ -16,12 +16,28 @@ pub fn cancel_agy(router_pid: u32) -> anyhow::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let st = Command::new("taskkill")
+            .args(["/PID", &router_pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        anyhow::ensure!(st.success(), "taskkill /PID {router_pid} failed");
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let st = Command::new("kill").args(["-TERM", &router_pid.to_string()]).stderr(Stdio::null()).status()?;
         anyhow::ensure!(st.success(), "kill -TERM {router_pid} failed");
         Ok(())
     }
+}
+
+fn exe_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
 }
 
 /// True when `comm`/`cmd` identify a killable agent CLI or `agy-route` process (never `office`,
@@ -34,8 +50,8 @@ pub fn is_killable_agent_cmd(comm: &str, cmd: &str) -> bool {
     {
         return false;
     }
-    let comm_base = super::basename(comm.trim());
-    let cmd_base = super::basename(cmd.split_whitespace().next().unwrap_or(""));
+    let comm_base = exe_stem(&super::basename(comm.trim()));
+    let cmd_base = exe_stem(&super::basename(cmd.split_whitespace().next().unwrap_or("")));
     let is_base = |name: &str| comm_base == name || cmd_base == name;
     if is_base("claude") || is_base("agy") {
         return true;
@@ -43,12 +59,15 @@ pub fn is_killable_agent_cmd(comm: &str, cmd: &str) -> bool {
     if is_base("bun") && (cmd.contains("agy-route") || cmd.contains("rosso-auto") || cmd.contains("rosso-run")) {
         return true;
     }
-    if is_base("node") && (cmd.contains("/claude") || cmd.contains("claude-code") || cmd.contains("/agy")) {
+    if is_base("node")
+        && (cmd.contains("/claude") || cmd.contains("\\claude") || cmd.contains("claude-code") || cmd.contains("/agy") || cmd.contains("\\agy"))
+    {
         return true;
     }
     false
 }
 
+#[cfg(unix)]
 fn ps_comm_cmd(pid: u32) -> Option<(String, String)> {
     let pid_s = pid.to_string();
     let comm_out = Command::new("/bin/ps")
@@ -77,6 +96,30 @@ fn ps_comm_cmd(pid: u32) -> Option<(String, String)> {
     Some((comm, cmd))
 }
 
+#[cfg(windows)]
+fn ps_comm_cmd(pid: u32) -> Option<(String, String)> {
+    let filter = format!("PID eq {pid}");
+    let out = Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next()?.trim();
+    if !line.starts_with('"') {
+        return None;
+    }
+    let image = line.split(',').next()?.trim_matches('"').to_string();
+    if image.is_empty() {
+        return None;
+    }
+    Some((image.clone(), image))
+}
+
 fn is_refused_pid(pid: u32) -> bool {
     if pid <= 1 || pid == std::process::id() {
         return true;
@@ -88,9 +131,8 @@ fn is_refused_pid(pid: u32) -> bool {
     false
 }
 
-/// Safely terminate an agent process by PID: refuses init/self/parent, verifies `comm`/`command`
-/// via `/bin/ps`, sends `SIGTERM`, and escalates to `SIGKILL` after 2.5 s only if still alive and
-/// still matching `is_killable_agent_cmd`.
+/// Safely terminate an agent process by PID: refuses init/self/parent, verifies process identity,
+/// sends `SIGTERM` -> `SIGKILL` on Unix or `taskkill /T /F` on Windows.
 pub fn kill_agent_pid(pid: u32) -> anyhow::Result<()> {
     anyhow::ensure!(!is_refused_pid(pid), "refusing to signal pid {pid}");
     let (comm, cmd) = ps_comm_cmd(pid).ok_or_else(|| anyhow::anyhow!("process {pid} not found"))?;
@@ -122,16 +164,22 @@ pub fn kill_agent_pid(pid: u32) -> anyhow::Result<()> {
         });
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let st = Command::new("kill").args(["-TERM", &pid.to_string()]).stderr(Stdio::null()).status()?;
-        anyhow::ensure!(st.success(), "kill -TERM {pid} failed");
+        let st = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        anyhow::ensure!(st.success(), "taskkill /PID {pid} failed");
         Ok(())
     }
 }
 
 /// Find and terminate orphan `agy` CLI processes (`ppid == 1`, outside any live router tree).
 /// Returns `(killed_count, freed_mb)`.
+#[cfg(unix)]
 pub fn reap_orphan_agy() -> anyhow::Result<(usize, u32)> {
     let out = Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,rss=,command="])
@@ -153,15 +201,25 @@ pub fn reap_orphan_agy() -> anyhow::Result<(usize, u32)> {
     Ok((killed, freed_mb))
 }
 
+#[cfg(not(unix))]
+pub fn reap_orphan_agy() -> anyhow::Result<(usize, u32)> {
+    Ok((0, 0))
+}
+
 /// Answer a pending Claude permission request that office-hook --permission is waiting on
 /// (write "allow"/"deny" to <runtime_dir>/decisions/<request_id>).
 pub fn resolve_permission(request_id: &str, allow: bool) -> anyhow::Result<()> {
     let id = paths::sanitize_id(request_id);
     anyhow::ensure!(!id.is_empty(), "empty request id");
     let dir = paths::decisions_dir();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir)?;
     }
     let tmp = dir.join(format!(".{id}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, if allow { "allow" } else { "deny" })?;
@@ -216,15 +274,7 @@ fn spawn_ghostty(inner_cmd: &str) -> anyhow::Result<bool> {
 }
 
 fn launch_resume(cmd: String, strip_anthropic_env: bool) -> anyhow::Result<String> {
-    let clip = cmd.clone();
-    std::thread::spawn(move || {
-        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            if let Some(mut si) = child.stdin.take() {
-                let _ = si.write_all(clip.as_bytes());
-            }
-            let _ = child.wait();
-        }
-    });
+    let _ = crate::app::export::copy_to_clipboard(&cmd);
     let inner = if strip_anthropic_env {
         format!("unset ANTHROPIC_BASE_URL DISABLE_AUTO_COMPACT; {cmd}")
     } else {
@@ -462,20 +512,33 @@ fn reap(mut child: std::process::Child) {
     });
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn as_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], " ")
 }
 
-/// macOS notification via osascript (no-op elsewhere). Must not block (> 200 ms).
+/// Desktop notification (macOS via `osascript`, Linux via `notify-send`). Must not block.
 pub fn notify(title: &str, body: &str) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    let script = format!("display notification \"{}\" with title \"{}\"", as_escape(body), as_escape(title));
-    if let Ok(child) =
-        Command::new("osascript").args(["-e", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    #[cfg(target_os = "macos")]
     {
-        reap(child);
+        let script = format!("display notification \"{}\" with title \"{}\"", as_escape(body), as_escape(title));
+        if let Ok(child) =
+            Command::new("osascript").args(["-e", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        {
+            reap(child);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(child) =
+            Command::new("notify-send").args([title, body]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        {
+            reap(child);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (title, body);
     }
 }
 
@@ -521,21 +584,23 @@ mod tests {
     }
     #[test]
     fn dispatch_and_followup_validate_inputs() {
-        assert!(dispatch_task("agy:worker", "/tmp", "   ", "agy-route").is_err());
-        assert!(dispatch_task("agy:manager", "/tmp", "   ", "agy-route").is_err());
+        let tmp = std::env::temp_dir();
+        let tmp_s = tmp.to_string_lossy();
+        assert!(dispatch_task("agy:worker", &tmp_s, "   ", "agy-route").is_err());
+        assert!(dispatch_task("agy:manager", &tmp_s, "   ", "agy-route").is_err());
         assert!(dispatch_task("agy:git", "/definitely-not-a-real-dir-xyz", "status", "agy-route").is_err());
-        assert!(dispatch_task("rosso-auto:council", "/tmp", "   ", "agy-route").is_err());
+        assert!(dispatch_task("rosso-auto:council", &tmp_s, "   ", "agy-route").is_err());
         assert!(dispatch_task("rosso-auto:simple", "/definitely-not-a-real-dir-xyz", "task", "agy-route").is_err());
-        assert!(dispatch_task("rosso-auto:bogus", "/tmp", "task", "agy-route").is_err());
-        assert!(dispatch_task("unknown", "/tmp", "hello", "agy-route").is_err());
+        assert!(dispatch_task("rosso-auto:bogus", &tmp_s, "task", "agy-route").is_err());
+        assert!(dispatch_task("unknown", &tmp_s, "hello", "agy-route").is_err());
         assert!(dispatch_task("claude", "/definitely-not-a-real-dir-xyz", "hello", "agy-route").is_err());
         assert!(followup_session(AgentKind::Claude, None, "", "hi").is_err());
         assert!(followup_session(AgentKind::Other, None, "sid", "  ").is_err());
 
         // Missing binary fails cleanly after passing target/input validation
-        let missing_err = dispatch_task("agy:manager", "/tmp", "audit", "/nonexistent-agy-route-bin-xyz").unwrap_err();
+        let missing_err = dispatch_task("agy:manager", &tmp_s, "audit", "/nonexistent-agy-route-bin-xyz").unwrap_err();
         assert!(!missing_err.to_string().contains("unknown dispatch target"));
-        let git_err = dispatch_task("agy:git", "/tmp", "diff", "/nonexistent-agy-route-bin-xyz").unwrap_err();
+        let git_err = dispatch_task("agy:git", &tmp_s, "diff", "/nonexistent-agy-route-bin-xyz").unwrap_err();
         assert!(!git_err.to_string().contains("unknown dispatch target"));
     }
     #[test]

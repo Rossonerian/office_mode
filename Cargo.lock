@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "office"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64-simd",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "office-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dirs",
  "libc",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "office-hook"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "office-core",
  "serde_json",

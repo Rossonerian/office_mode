@@ -3,8 +3,11 @@ resolver = "2"
 members = ["crates/office-core", "crates/office-hook", "crates/office"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/Rossonerian/office_mode"
+description = "A pixel-art terminal office for your AI coding agents"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

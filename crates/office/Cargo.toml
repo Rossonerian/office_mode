@@ -2,6 +2,9 @@
 name = "office"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
 
 [[bin]]
 name = "office"
@@ -20,7 +23,7 @@ ratatui-image = { version = "8", default-features = false, features = ["crosster
 image = { version = "0.25", default-features = false, features = ["png"] }
 flate2 = "1"
 base64-simd = "0.8"
-signal-hook = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+signal-hook = "0.3"

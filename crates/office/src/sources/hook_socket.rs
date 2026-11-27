@@ -1,15 +1,24 @@
-//! Unix socket listener for office-hook lines; decodes Claude Code and Antigravity hook payloads into Events.
+//! Hook IPC listener for office-hook lines; decodes Claude Code and Antigravity hook payloads into Events.
 use super::{basename, reports, short};
 use office_core::model::{AgentKind, AgentState, ReportKind};
 use office_core::{config::Config, paths, Event, EventKind, SourceKind};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
+#[cfg(windows)]
+use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+pub type Listener = UnixListener;
+#[cfg(windows)]
+pub type Listener = TcpListener;
 
 /// Per-line cap (office-hook caps stdin at 1 MB; leave room for the envelope).
 const MAX_LINE: u64 = (1 << 20) + 64 * 1024;
@@ -17,7 +26,7 @@ const CONN_WORKERS: usize = 4;
 const CONN_QUEUE: usize = 64;
 const CONN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Removes the unix socket file (and our pid file) when the office exits cleanly.
+/// Removes the socket / IPC file (and our pid file) when the office exits cleanly.
 pub struct SocketGuard(pub PathBuf);
 
 impl Drop for SocketGuard {
@@ -39,10 +48,12 @@ fn read_pid(p: &Path) -> Option<u32> {
     std::fs::read_to_string(p).ok()?.trim().parse().ok()
 }
 
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     pid > 1 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
 }
 
+#[cfg(unix)]
 /// True when `pid` is an `office` TUI process (never office-hook, never anything else).
 fn is_office_process(pid: u32) -> bool {
     std::process::Command::new("/bin/ps")
@@ -53,6 +64,7 @@ fn is_office_process(pid: u32) -> bool {
         .is_some_and(|c| c == "office")
 }
 
+#[cfg(unix)]
 /// Pids of `office` processes holding the socket: from the pid file, else from `lsof`
 /// (older builds wrote no pid file).
 fn socket_holders(sock: &Path) -> Vec<u32> {
@@ -68,6 +80,7 @@ fn socket_holders(sock: &Path) -> Vec<u32> {
     pids.into_iter().filter(|&p| p != me && pid_alive(p) && is_office_process(p)).collect()
 }
 
+#[cfg(unix)]
 /// The newest office wins: ask older office instances holding the socket to quit (SIGTERM,
 /// then SIGKILL after ~1.5 s for orphans that no longer respond). Returns the pids asked.
 fn take_over(sock: &Path) -> Vec<u32> {
@@ -87,6 +100,39 @@ fn take_over(sock: &Path) -> Vec<u32> {
     holders
 }
 
+#[cfg(windows)]
+fn is_office_process_win(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
+        .is_some_and(|s| s.contains("office.exe"))
+}
+
+#[cfg(windows)]
+fn read_loopback_addr(path: &Path) -> Option<SocketAddr> {
+    let addr: SocketAddr = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    addr.ip().is_loopback().then_some(addr)
+}
+
+#[cfg(windows)]
+fn take_over_windows(path: &Path) {
+    let me = std::process::id();
+    let Some(pid) = read_pid(&pid_file(path)) else { return };
+    if pid <= 1 || pid == me || !is_office_process_win(pid) {
+        return;
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline && is_office_process_win(pid) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<SocketGuard> {
     let sock = paths::hook_socket();
     let listener = bind(&sock)?;
@@ -94,8 +140,9 @@ pub fn spawn(_cfg: &Config, tx: Sender<Event>) -> anyhow::Result<SocketGuard> {
     Ok(SocketGuard(sock))
 }
 
+#[cfg(unix)]
 /// Bind the socket: create its dir (0700 when it's our runtime dir), drop a stale socket file.
-pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
+pub fn bind(path: &Path) -> anyhow::Result<Listener> {
     if let Some(dir) = path.parent() {
         if !dir.exists() {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
@@ -122,9 +169,50 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
     Ok(l)
 }
 
-fn handle_conn(stream: UnixStream, tx: &Sender<Event>) -> bool {
+#[cfg(windows)]
+/// Bind a loopback TCP listener and write `127.0.0.1:<port>` to `path`.
+pub fn bind(path: &Path) -> anyhow::Result<Listener> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if let Some(addr) = read_loopback_addr(path) {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok() {
+            take_over_windows(path);
+            std::thread::sleep(Duration::from_millis(100));
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok() {
+                anyhow::bail!("another office is already listening on {} ({addr}) and did not hand over", path.display());
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    let l = TcpListener::bind("127.0.0.1:0")?;
+    let addr = l.local_addr()?;
+    std::fs::write(path, addr.to_string())?;
+    let _ = std::fs::write(pid_file(path), std::process::id().to_string());
+    Ok(l)
+}
+
+trait HookStream: Read + Send + 'static {
+    fn set_timeout(&self, dur: Option<Duration>);
+}
+
+#[cfg(unix)]
+impl HookStream for UnixStream {
+    fn set_timeout(&self, dur: Option<Duration>) {
+        let _ = self.set_read_timeout(dur);
+    }
+}
+
+#[cfg(windows)]
+impl HookStream for TcpStream {
+    fn set_timeout(&self, dur: Option<Duration>) {
+        let _ = self.set_read_timeout(dur);
+    }
+}
+
+fn handle_conn<S: HookStream>(stream: S, tx: &Sender<Event>) -> bool {
     let deadline = Instant::now() + CONN_DEADLINE;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    stream.set_timeout(Some(Duration::from_millis(500)));
     let mut r = BufReader::new(stream.take(MAX_LINE * 4));
     let mut line = String::new();
     loop {
@@ -153,9 +241,9 @@ fn handle_conn(stream: UnixStream, tx: &Sender<Event>) -> bool {
     true
 }
 
-pub fn serve(listener: UnixListener, tx: Sender<Event>) {
-    let (conn_tx, conn_rx) = mpsc::sync_channel::<UnixStream>(CONN_QUEUE);
-    let conn_rx: Arc<Mutex<Receiver<UnixStream>>> = Arc::new(Mutex::new(conn_rx));
+fn spawn_workers<S: HookStream>(tx: Sender<Event>) -> SyncSender<S> {
+    let (conn_tx, conn_rx) = mpsc::sync_channel::<S>(CONN_QUEUE);
+    let conn_rx: Arc<Mutex<Receiver<S>>> = Arc::new(Mutex::new(conn_rx));
     for i in 0..CONN_WORKERS {
         let rx = conn_rx.clone();
         let tx = tx.clone();
@@ -170,6 +258,25 @@ pub fn serve(listener: UnixListener, tx: Sender<Event>) {
             }
         });
     }
+    conn_tx
+}
+
+use std::sync::mpsc::SyncSender;
+
+#[cfg(unix)]
+pub fn serve(listener: Listener, tx: Sender<Event>) {
+    let conn_tx = spawn_workers::<UnixStream>(tx);
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        if conn_tx.try_send(stream).is_err() {
+            // Queue saturated: drop slow extra connection rather than exhausting OS threads.
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn serve(listener: Listener, tx: Sender<Event>) {
+    let conn_tx = spawn_workers::<TcpStream>(tx);
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         if conn_tx.try_send(stream).is_err() {
@@ -714,7 +821,8 @@ mod tests {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         assert!(out.stdout.is_empty() && out.stderr.is_empty(), "office-hook must be silent");
-        assert!(t0.elapsed() < Duration::from_millis(300), "office-hook too slow: {:?}", t0.elapsed());
+        let max_hook_elapsed = if cfg!(windows) { Duration::from_millis(1500) } else { Duration::from_millis(300) };
+        assert!(t0.elapsed() < max_hook_elapsed, "office-hook too slow: {:?}", t0.elapsed());
 
         let mut got = Vec::new();
         while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
@@ -734,8 +842,9 @@ mod tests {
     #[test]
     fn office_hook_exits_zero_without_listener() {
         let bin = office_hook_bin();
+        let missing = std::env::temp_dir().join("nonexistent-office-dir").join("x.sock");
         let mut child = Command::new(bin)
-            .env("OFFICE_SOCKET", "/nonexistent/dir/x.sock")
+            .env("OFFICE_SOCKET", &missing)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -748,8 +857,9 @@ mod tests {
     #[test]
     fn office_hook_antigravity_exits_silently() {
         let bin = office_hook_bin();
+        let missing = std::env::temp_dir().join("nonexistent-office-dir").join("x.sock");
         let mut child = Command::new(bin)
-            .env("OFFICE_SOCKET", "/nonexistent/dir/x.sock")
+            .env("OFFICE_SOCKET", &missing)
             .env("OFFICE_SOURCE", "antigravity")
             .args(["--hook-event", "Stop"])
             .stdin(Stdio::piped())

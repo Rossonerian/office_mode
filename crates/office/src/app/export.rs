@@ -4,10 +4,29 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Copy text with `pbcopy` without blocking the UI: the data is written and the child reaped on a thread.
+/// Copy text to the system clipboard without blocking the UI: the data is written and the child reaped on a thread.
 pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
     let mut child = Command::new("pbcopy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
-    let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("pbcopy has no stdin"))?;
+    #[cfg(target_os = "windows")]
+    let mut child = Command::new("clip").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut child = {
+        let candidates: &[(&str, &[&str])] = &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        let mut spawned = None;
+        for (bin, args) in candidates {
+            if let Ok(c) = Command::new(bin).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                spawned = Some(c);
+                break;
+            }
+        }
+        spawned.ok_or_else(|| anyhow::anyhow!("no clipboard tool found (install wl-copy, xclip, or xsel)"))?
+    };
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("clipboard command has no stdin"))?;
     let data = text.to_string();
     std::thread::spawn(move || {
         let _ = stdin.write_all(data.as_bytes());

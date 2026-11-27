@@ -294,7 +294,10 @@ pub fn parse(name: &str, src: &str, dir: &Path) -> Result<Theme> {
 /// Directories searched for theme packs, in priority order.
 pub fn search_dirs() -> Vec<PathBuf> {
     let mut v = office_core::paths::theme_dirs();
-    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes"));
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes");
+    if !v.contains(&dev) {
+        v.push(dev);
+    }
     v
 }
 

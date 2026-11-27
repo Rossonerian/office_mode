@@ -47,8 +47,8 @@ pub(crate) fn source_alert(tx: &Sender<Event>, source: SourceKind, code: &str, m
 
 /// Last path component (for labels like "cc·DICE").
 pub(crate) fn basename(p: &str) -> String {
-    let t = p.trim_end_matches('/');
-    t.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(t).to_string()
+    let t = p.trim_end_matches(['/', '\\']);
+    t.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(t).to_string()
 }
 
 /// First `n` chars of a single-line version of `s` (adds "…" when cut).

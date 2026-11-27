@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Linux aarch64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --workspace --target "${{ matrix.target }}"
+
+      - name: Package release archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="stage"
+          ARCHIVE="office_mode-${TAG}-${TARGET}.tar.gz"
+          mkdir -p "$STAGE" dist
+          cp "target/${TARGET}/release/office" "$STAGE/"
+          cp "target/${TARGET}/release/office-hook" "$STAGE/"
+          cp -R assets "$STAGE/assets"
+          cp LICENSE README.md "$STAGE/"
+          chmod +x "$STAGE/office" "$STAGE/office-hook"
+          tar -czf "dist/${ARCHIVE}" -C "$STAGE" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          fi
+
+      - name: Package release archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $Tag = "${{ steps.tag.outputs.tag }}"
+          $Target = "${{ matrix.target }}"
+          $Stage = "stage"
+          $Archive = "office_mode-$Tag-$Target.zip"
+          New-Item -ItemType Directory -Path $Stage, "dist" -Force | Out-Null
+          Copy-Item "target\$Target\release\office.exe" "$Stage\"
+          Copy-Item "target\$Target\release\office-hook.exe" "$Stage\"
+          Copy-Item "assets" "$Stage\assets" -Recurse
+          Copy-Item "LICENSE", "README.md" "$Stage\"
+          Compress-Archive -Path "$Stage\*" -DestinationPath "dist\$Archive" -Force
+          $Hash = (Get-FileHash -Path "dist\$Archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$Hash  $Archive" | Out-File -FilePath "dist\$Archive.sha256" -Encoding ascii -NoNewline
+          "`n" | Out-File -FilePath "dist\$Archive.sha256" -Encoding ascii -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build SHA256SUMS.txt
+        run: |
+          cd artifacts
+          cat *.sha256 | LC_ALL=C sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release Notes
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          cat <<'EOF' > release-notes.md
+          # office_mode __TAG__
+
+          Pixel-art terminal office for your AI coding agents (**Claude Code** & **Antigravity**).
+
+          ## Install
+
+          ### macOS / Linux (Homebrew)
+          ```sh
+          brew install Rossonerian/tap/office_mode
+          ```
+
+          ### macOS / Linux (`sudo` system install)
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/Rossonerian/office_mode/main/scripts/install.sh | sudo sh
+          ```
+          (Omit `sudo` to install into `~/.local/bin` instead.)
+
+          ### Windows (PowerShell)
+          ```powershell
+          irm https://raw.githubusercontent.com/Rossonerian/office_mode/main/scripts/install.ps1 | iex
+          ```
+
+          ### Windows (Scoop)
+          ```powershell
+          scoop install https://raw.githubusercontent.com/Rossonerian/office_mode/main/packaging/scoop/office_mode.json
+          ```
+
+          ## Quickstart
+          ```sh
+          office install-hooks
+          office doctor
+          office demo
+          office
+          ```
+
+          ## Checksums
+          All release archives include bundled sprite themes and are verified against `SHA256SUMS.txt`.
+          EOF
+          sed -i "s/__TAG__/${TAG}/g" release-notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --title "office_mode $TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS.txt \
+              --title "office_mode $TAG" \
+              --notes-file release-notes.md
+          fi

@@ -5,21 +5,22 @@ mod render;
 mod sources;
 
 const USAGE: &str = "\
-office: ROSSO's terminal pixel office for your AI coding agents
+office (office_mode): pixel-art terminal office for your AI coding agents
 
 USAGE:
     office                      run the office (live sources)
     office demo                 run with synthetic agents (no hooks needed)
-    office install-hooks [--claude] [--antigravity] [--uninstall]
+    office install-hooks [--claude] [--antigravity] [--permission] [--uninstall]
                                 install (or remove) the office-hook entries
-    office doctor               check hooks, socket, router and config
+    office doctor               check hooks, socket, themes, router and config
     office config               validate config.toml and print the effective settings
     office -h | --help          show this help
     office -V | --version       show the version
 
 KEYS (in the office): q quit · ↑↓/jk select · enter details · a/d approve/deny
-    x cancel agy call · o resume session · t/T themes · s sidebar · n notifications
-    c clear alerts · ? help
+    x cancel agy call · K kill idle · X reap orphans · o resume · p dispatch
+    r/i reports/inbox · t/T themes · v view options · s sidebar · n notifications
+    c clear alerts · L labels · ? help
 
 CONFIG: ~/.config/agent-office/config.toml";
 

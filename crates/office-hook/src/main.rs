@@ -8,6 +8,7 @@
 use office_core::paths;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -35,6 +36,32 @@ fn read_stdin(timeout: Duration) -> Option<Vec<u8>> {
     rx.recv_timeout(timeout).ok()
 }
 
+#[cfg(unix)]
+fn connect_and_write(line: &str, timeout: Duration) -> std::io::Result<()> {
+    let mut s = UnixStream::connect(paths::hook_socket())?;
+    s.set_write_timeout(Some(timeout))?;
+    s.write_all(line.as_bytes())?;
+    s.write_all(b"\n")?;
+    s.flush()
+}
+
+#[cfg(windows)]
+fn connect_and_write(line: &str, timeout: Duration) -> std::io::Result<()> {
+    let raw = std::fs::read_to_string(paths::hook_socket())?;
+    let addr: std::net::SocketAddr = raw
+        .trim()
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hook endpoint"))?;
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "non-loopback endpoint"));
+    }
+    let mut s = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    s.set_write_timeout(Some(timeout))?;
+    s.write_all(line.as_bytes())?;
+    s.write_all(b"\n")?;
+    s.flush()
+}
+
 /// Send one line to the socket with an overall deadline (UnixStream has no connect timeout).
 /// Returns true only if the office received it (i.e. the office is running).
 fn send_line(line: String, timeout: Duration) -> bool {
@@ -43,14 +70,7 @@ fn send_line(line: String, timeout: Duration) -> bool {
     }
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let ok = (|| -> std::io::Result<()> {
-            let mut s = UnixStream::connect(paths::hook_socket())?;
-            s.set_write_timeout(Some(timeout))?;
-            s.write_all(line.as_bytes())?;
-            s.write_all(b"\n")?;
-            s.flush()
-        })()
-        .is_ok();
+        let ok = connect_and_write(&line, timeout).is_ok();
         let _ = tx.send(ok);
     });
     rx.recv_timeout(timeout).unwrap_or(false)
@@ -61,6 +81,7 @@ fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let permission = args.iter().any(|a| a == "--permission");
     let hook_event = args.iter().position(|a| a == "--hook-event").and_then(|i| args.get(i + 1)).cloned();
+    let source_arg = args.iter().position(|a| a == "--source").and_then(|i| args.get(i + 1)).cloned();
 
     let raw = read_stdin(STDIN_TIMEOUT).unwrap_or_default();
     let payload: Value = match serde_json::from_slice(&raw) {
@@ -68,7 +89,10 @@ fn run() {
         Err(_) if raw.is_empty() || raw.len() as u64 >= MAX_STDIN => Value::Null,
         Err(_) => Value::String(String::from_utf8_lossy(&raw).into_owned()),
     };
-    let source = std::env::var("OFFICE_SOURCE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "claude".into());
+    let source = source_arg
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("OFFICE_SOURCE").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "claude".into());
 
     let mut line = json!({ "source": source, "payload": payload, "ts": paths::now_ms() });
     if let Some(e) = &hook_event {

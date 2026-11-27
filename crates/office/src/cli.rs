@@ -41,19 +41,48 @@ pub fn gemini_plugins_dir() -> PathBuf {
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gemini/config/plugins"))
 }
 
-/// office-hook next to the running `office`, then ~/.cargo/bin.
-pub fn find_office_hook() -> Option<PathBuf> {
-    let next = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("office-hook")));
-    let cargo = dirs::home_dir().map(|h| h.join(".cargo/bin/office-hook"));
-    [next, cargo].into_iter().flatten().find(|p| p.is_file())
+/// office-hook binary name for the current platform.
+fn hook_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "office-hook.exe"
+    } else {
+        "office-hook"
+    }
 }
 
+/// office-hook next to the running `office`, then ~/.cargo/bin, then PATH.
+pub fn find_office_hook() -> Option<PathBuf> {
+    let bin = hook_bin_name();
+    let next = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(bin)));
+    let cargo = dirs::home_dir().map(|h| h.join(".cargo").join("bin").join(bin));
+    if let Some(p) = [next, cargo].into_iter().flatten().find(|p| p.is_file()) {
+        return Some(p);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
+}
+
+#[cfg(unix)]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+fn hook_command(source: &str, hook: &Path, extra: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("OFFICE_SOURCE={source} {}{extra}", sh_quote(&hook.to_string_lossy()))
+    }
+    #[cfg(windows)]
+    {
+        format!("\"{}\" --source {source}{extra}", hook.to_string_lossy())
+    }
+}
+
 fn is_ours(cmd: &str) -> bool {
-    cmd.contains(MARKER) && cmd.contains("office-hook")
+    (cmd.contains(MARKER) || cmd.contains("--source ")) && cmd.contains("office-hook")
 }
 
 pub fn install_hooks(claude: bool, antigravity: bool, uninstall: bool) -> anyhow::Result<()> {
@@ -117,12 +146,16 @@ pub fn update_claude_settings(path: &Path, hook: Option<&Path>, permission: bool
 
     strip_ours(hooks);
     if let Some(h) = hook {
-        let base = format!("OFFICE_SOURCE=claude {}", sh_quote(&h.to_string_lossy()));
+        let base = hook_command("claude", h, "");
         for ev in CLAUDE_EVENTS {
             push_group(hooks, ev, hook_entry(base.clone(), 5));
         }
         if permission {
-            push_group(hooks, "PermissionRequest", hook_entry(format!("{base} --permission"), permission_timeout_s + 5));
+            push_group(
+                hooks,
+                "PermissionRequest",
+                hook_entry(hook_command("claude", h, " --permission"), permission_timeout_s + 5),
+            );
         }
     }
     if hooks.is_empty() {
@@ -196,7 +229,7 @@ pub fn write_antigravity_plugin(dir: &Path, hook: &Path) -> anyhow::Result<()> {
     for ev in AG_EVENTS {
         let cmd = json!({
             "type": "command",
-            "command": format!("OFFICE_SOURCE=antigravity {} --hook-event {ev}", sh_quote(&hook.to_string_lossy()))
+            "command": hook_command("antigravity", hook, &format!(" --hook-event {ev}"))
         });
         let v = if ev.ends_with("ToolUse") { json!([{ "matcher": "*", "hooks": [cmd] }]) } else { json!([cmd]) };
         events.insert(ev.to_string(), v);
@@ -208,16 +241,27 @@ pub fn write_antigravity_plugin(dir: &Path, hook: &Path) -> anyhow::Result<()> {
 }
 
 fn write_private(p: &Path, text: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::write(p, text)?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
 fn extract_hook_bin(cmd: &str) -> Option<&str> {
-    let idx = cmd.find("office-hook")?;
-    let rest = &cmd[..idx + "office-hook".len()];
-    let start = rest.rfind(['\'', '"', ' ']).map(|i| i + 1).unwrap_or(0);
+    let needle = if cfg!(windows) && cmd.contains("office-hook.exe") {
+        "office-hook.exe"
+    } else {
+        "office-hook"
+    };
+    let idx = cmd.find(needle)?;
+    let rest = &cmd[..idx + needle.len()];
+    let start = rest
+        .rfind(['\'', '"'])
+        .map(|i| i + 1)
+        .unwrap_or_else(|| rest.rfind(' ').map(|i| i + 1).unwrap_or(0));
     Some(&rest[start..])
 }
 
@@ -260,14 +304,39 @@ pub fn doctor() -> anyhow::Result<()> {
     println!("{}config       {}{}", ok(cf.exists()), cf.display(), if cf.exists() { "" } else { " (defaults)" });
 
     let sock = paths::hook_socket();
-    let state = if std::fs::symlink_metadata(&sock).is_err() {
-        "absent (office not running)"
-    } else if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        "listening"
-    } else {
-        "stale (no listener)"
+    let state = {
+        #[cfg(unix)]
+        {
+            if std::fs::symlink_metadata(&sock).is_err() {
+                "absent (office not running)"
+            } else if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                "listening"
+            } else {
+                "stale (no listener)"
+            }
+        }
+        #[cfg(windows)]
+        {
+            match std::fs::read_to_string(&sock) {
+                Err(_) => "absent (office not running)",
+                Ok(raw) => match raw.trim().parse::<std::net::SocketAddr>() {
+                    Ok(addr)
+                        if addr.ip().is_loopback()
+                            && std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() =>
+                    {
+                        "listening"
+                    }
+                    _ => "stale (no listener)",
+                },
+            }
+        }
     };
     println!("{}socket       {} [{state}]", ok(state == "listening"), sock.display());
+
+    let tdirs = crate::render::theme::search_dirs();
+    let themes = crate::render::theme::list(&tdirs);
+    let bundled = themes.len().saturating_sub(1);
+    println!("{}themes       {bundled} packs ({})", ok(bundled > 0), themes.join(", "));
 
     match find_office_hook() {
         Some(h) => println!("ok office-hook  {}", h.display()),
@@ -412,7 +481,7 @@ mod tests {
         assert_eq!(count_ours(&v).0, CLAUDE_EVENTS.len());
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "pixtuoid-hook Stop");
-        assert_eq!(v["hooks"]["PreToolUse"][1]["hooks"][0]["command"], "OFFICE_SOURCE=claude '/opt/x/office-hook'");
+        assert_eq!(v["hooks"]["PreToolUse"][1]["hooks"][0]["command"], hook_command("claude", hook, ""));
         assert!(v["hooks"].get("PermissionRequest").is_none());
         // idempotent
         assert!(!update_claude_settings(&p, Some(hook), false, 0).unwrap());
@@ -431,21 +500,22 @@ mod tests {
     #[test]
     fn antigravity_plugin_shape() {
         let d = tmpdir("ag");
-        write_antigravity_plugin(&d.join(AG_PLUGIN), Path::new("/x/office-hook")).unwrap();
+        let hook = Path::new("/x/office-hook");
+        write_antigravity_plugin(&d.join(AG_PLUGIN), hook).unwrap();
         let h: Value = serde_json::from_str(&std::fs::read_to_string(d.join(AG_PLUGIN).join("hooks.json")).unwrap()).unwrap();
         let events = h[AG_PLUGIN].as_object().unwrap();
         assert_eq!(events.len(), AG_EVENTS.len());
         for ev in ["SessionStart", "PreInvocation", "PostInvocation", "Stop"] {
             assert_eq!(
                 h[AG_PLUGIN][ev][0]["command"],
-                format!("OFFICE_SOURCE=antigravity '/x/office-hook' --hook-event {ev}")
+                hook_command("antigravity", hook, &format!(" --hook-event {ev}"))
             );
         }
         for ev in ["PreToolUse", "PostToolUse"] {
             assert_eq!(h[AG_PLUGIN][ev][0]["matcher"], "*");
             assert_eq!(
                 h[AG_PLUGIN][ev][0]["hooks"][0]["command"],
-                format!("OFFICE_SOURCE=antigravity '/x/office-hook' --hook-event {ev}")
+                hook_command("antigravity", hook, &format!(" --hook-event {ev}"))
             );
         }
         let p: Value = serde_json::from_str(&std::fs::read_to_string(d.join(AG_PLUGIN).join("plugin.json")).unwrap()).unwrap();
