@@ -601,7 +601,15 @@ mod tests {
         let mut t = Tails::default();
         assert!(poll(&d, &mut t, true).is_empty());
         let mut f = std::fs::OpenOptions::new().append(true).open(&lb).unwrap();
-        writeln!(f, "{{\"from\":\"Test Inspector\",\"to\":[\"Chief of Staff\"],\"type\":\"Inspection Report\",\"verdict\":\"PASS\",\"subject\":\"S\",\"doc\":\"{}\"}}", doc.display()).unwrap();
+        let entry = serde_json::json!({
+            "from": "Test Inspector",
+            "to": ["Chief of Staff"],
+            "type": "Inspection Report",
+            "verdict": "PASS",
+            "subject": "S",
+            "doc": doc.to_string_lossy(),
+        });
+        writeln!(f, "{entry}").unwrap();
         write!(f, "{{\"from\":\"partial").unwrap();
         let mut mr = std::fs::File::create(job.join("mailroom.jsonl")).unwrap();
         writeln!(mr, "{{\"event\":\"escalation\",\"ref\":\"R-1\",\"from\":\"Security Seat\",\"to\":[\"CEO\"]}}").unwrap();

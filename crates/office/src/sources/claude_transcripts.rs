@@ -633,7 +633,10 @@ mod tests {
         // Sub finishes with trailing usage in the same poll: Usage MUST precede Gone.
         let mut sf = std::fs::OpenOptions::new().append(true).open(&sub).unwrap();
         sf.write_all(line("sm2", "claude-haiku-5", 25, 0, 0, 0).as_bytes()).unwrap();
-        std::fs::write(&meta, r#"{"agentType":"Explore","finished":true}"#).unwrap();
+        let mut mf_meta = std::fs::File::create(&meta).unwrap();
+        mf_meta.write_all(br#"{"agentType":"Explore","finished":true}"#).unwrap();
+        let _ = mf_meta.set_modified(t0 + Duration::from_secs(2));
+        drop(mf_meta);
         let evs = t.poll(t0 + Duration::from_secs(2));
         let u_pos = evs.iter().position(|e| matches!(&e.kind, EventKind::Usage { id, tokens_in: 75, .. } if id == "cc-sub:s1/xy")).unwrap();
         let g_pos = evs.iter().position(|e| matches!(&e.kind, EventKind::Gone { id } if id == "cc-sub:s1/xy")).unwrap();
