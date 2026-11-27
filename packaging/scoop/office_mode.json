@@ -1,11 +1,11 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Pixel-art terminal office for your AI coding agents",
   "homepage": "https://github.com/Rossonerian/office_mode",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/Rossonerian/office_mode/releases/download/v1.1.0/office_mode-v1.1.0-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/Rossonerian/office_mode/releases/download/v1.2.0/office_mode-v1.2.0-x86_64-pc-windows-msvc.zip",
       "hash": "PLACEHOLDER_X86_64_PC_WINDOWS_MSVC"
     }
   },

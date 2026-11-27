@@ -1,18 +1,18 @@
 class OfficeMode < Formula
   desc "Pixel-art terminal office for your AI coding agents"
   homepage "https://github.com/Rossonerian/office_mode"
-  version "1.1.0"
+  version "1.2.0"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "4373fcb818e1568ffdc04231bdc53712eabf3be9a8528f1fb98e14f33f8a1fa7"
+      sha256 "18fc3e9330bc704a9c5e29c74022bc796daf2b22a8935d281ebf7aa3bdfb4648"
     end
 
     on_intel do
       url "https://github.com/Rossonerian/office_mode/releases/download/v#{version}/office_mode-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "34f20927a030fbf0fbbdb8d5dbc2524eea9833b93a8de8bf855499ccccbd5c07"
+      sha256 "16dccb46a68fe62fe6397864f55f6225adb8ee21478cfbfb515555ab0aa2e079"
     end
   end
 
