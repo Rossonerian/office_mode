@@ -46,6 +46,12 @@ pub trait OfficeView: ThemeHost {
     fn hit_test(&self, x: u32, y: u32) -> Option<AgentId>;
     /// What the mouse is over (the renderer shows the cat's name on hover).
     fn set_hover(&mut self, _id: Option<AgentId>) {}
+    /// Push updated whiteboard checklist tasks to the renderer.
+    fn set_whiteboard(&mut self, _wb: &office_core::whiteboard::Whiteboard) {}
+    /// Theme / outfit load errors recorded by the renderer.
+    fn theme_errors(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// render::Renderer behind panic guards, so an unfinished renderer degrades to text mode.
@@ -64,6 +70,15 @@ impl ThemeHost for RendererView {
     }
     fn set_show(&mut self, show: &office_core::config::ShowConfig) {
         let _ = guarded(|| self.0.set_show(show));
+    }
+    fn set_ceo(&mut self, cfg: &office_core::config::CeoConfig) {
+        let _ = guarded(|| self.0.set_ceo(cfg));
+    }
+    fn reload_themes(&mut self) {
+        let _ = guarded(|| self.0.reload_themes());
+    }
+    fn outfits(&self) -> Vec<String> {
+        guarded(office_core::assets::list_outfits).unwrap_or_default()
     }
 }
 
@@ -87,6 +102,12 @@ impl OfficeView for RendererView {
     fn set_hover(&mut self, id: Option<AgentId>) {
         self.0.set_hover(id);
     }
+    fn set_whiteboard(&mut self, wb: &office_core::whiteboard::Whiteboard) {
+        let _ = guarded(|| self.0.set_whiteboard(wb));
+    }
+    fn theme_errors(&self) -> &[String] {
+        self.0.theme_errors()
+    }
 }
 
 struct NullTheme;
@@ -95,6 +116,11 @@ impl ThemeHost for NullTheme {
         vec!["procedural".into()]
     }
     fn set_mix(&mut self, _mix: &ThemeMix) {}
+    fn set_ceo(&mut self, _cfg: &office_core::config::CeoConfig) {}
+    fn reload_themes(&mut self) {}
+    fn outfits(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // ---------- panic safety ----------
@@ -251,6 +277,7 @@ fn setup_terminal() -> anyhow::Result<(Terminal<CrosstermBackend<Stdout>>, TermG
 /// Real control actions (workstream A's sources::control), panic-guarded.
 struct RealControl {
     pub agy_route: String,
+    pub player: chime::SystemPlayer,
 }
 
 fn not_ready(e: String) -> anyhow::Error {
@@ -300,9 +327,9 @@ impl Control for RealControl {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
     }
-    fn play_sound(&mut self, chime: chime::Chime) {
-        use chime::SoundPlayer;
-        let _ = guarded(|| chime::AfPlayer.play(chime));
+    fn play_sound(&mut self, chime: chime::Chime) -> Result<(), String> {
+        guarded(|| self.player.play_checked(chime))
+            .map_err(|e| format!("sound playback panicked ({e})"))?
     }
     fn copy_text(&mut self, text: &str) -> anyhow::Result<()> {
         guarded(|| export::copy_to_clipboard(text)).map_err(not_ready)?
@@ -315,6 +342,7 @@ impl Control for RealControl {
 /// Demo control: never touches real processes; answers with synthetic events.
 pub struct DemoControl {
     pub tx: Sender<Event>,
+    pub player: chime::SystemPlayer,
 }
 
 impl Control for DemoControl {
@@ -388,9 +416,9 @@ impl Control for DemoControl {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = guarded(|| sources::control::notify(title, body));
     }
-    fn play_sound(&mut self, chime: chime::Chime) {
-        use chime::SoundPlayer;
-        let _ = guarded(|| chime::AfPlayer.play(chime));
+    fn play_sound(&mut self, chime: chime::Chime) -> Result<(), String> {
+        guarded(|| self.player.play_checked(chime))
+            .map_err(|e| format!("sound playback panicked ({e})"))?
     }
     fn copy_text(&mut self, text: &str) -> anyhow::Result<()> {
         guarded(|| export::copy_to_clipboard(text)).map_err(not_ready)?
@@ -470,11 +498,17 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     let now = office_core::paths::now_ms;
     let mut app = App::new(&cfg, demo);
+    let wb_path = office_core::paths::whiteboard_file();
+    let (wb, wb_warn) = office_core::whiteboard::Whiteboard::load_from(&wb_path);
+    if let Some(warn) = wb_warn {
+        app.toast(format!("whiteboard: {warn}"), AlertLevel::Warn, now());
+    }
+    app.set_whiteboard_store(wb, wb_path);
     let (tx, rx) = mpsc::channel::<Event>();
 
     let mut ctl: Box<dyn Control> = if demo {
         demo::spawn(tx.clone());
-        Box::new(DemoControl { tx: tx.clone() })
+        Box::new(DemoControl { tx: tx.clone(), player: chime::SystemPlayer::new(cfg.sounds.clone()) })
     } else {
         let c2 = cfg.clone();
         let t2 = tx.clone();
@@ -486,7 +520,10 @@ fn event_loop(
             }
             Err(e) => app.toast(format!("sources unavailable: {e}"), AlertLevel::Critical, now()),
         }
-        Box::new(RealControl { agy_route: cfg.agy_route.clone() })
+        Box::new(RealControl {
+            agy_route: cfg.agy_route.clone(),
+            player: chime::SystemPlayer::new(cfg.sounds.clone()),
+        })
     };
 
     let view: Option<Box<dyn OfficeView>> = match guarded(|| render::Renderer::new(&cfg)) {
@@ -494,6 +531,18 @@ fn event_loop(
             let mut v = RendererView(r);
             v.set_mix(&cfg.theme);
             v.set_show(&cfg.show);
+            v.set_whiteboard(&app.whiteboard);
+            let mut errs: Vec<String> = v.theme_errors().to_vec();
+            errs.sort();
+            errs.dedup();
+            if !errs.is_empty() {
+                let msg = if errs.len() == 1 {
+                    format!("theme warning: {}", errs[0])
+                } else {
+                    format!("{} theme warnings: {}", errs.len(), errs[0])
+                };
+                app.toast(msg, AlertLevel::Warn, now());
+            }
             Some(Box::new(v))
         }
         Err(e) => {
@@ -501,6 +550,7 @@ fn event_loop(
             None
         }
     };
+    let _ = app.take_whiteboard_dirty();
     let mut office = ui::OfficeCtx::new(view, Some(picker));
     if office.view.is_none() {
         office.error = Some("renderer unavailable".into());
@@ -549,7 +599,14 @@ fn event_loop(
         }
         if scene_changed {
             app.observe(reducer.scene(), t, ctl.as_mut());
+            let _ = app.sync_whiteboard(reducer.scene());
             scene_changed = false;
+        }
+        if app.take_whiteboard_dirty() {
+            if let Some(v) = office.view.as_deref_mut() {
+                v.set_whiteboard(&app.whiteboard);
+            }
+            app.dirty = true;
         }
         // 3. Draw with Ghostty synchronized output (DEC 2026) and zero-redundant Kitty uploads.
         let since = t.saturating_sub(last_draw);
@@ -766,13 +823,28 @@ pub mod testutil {
 
     pub struct FakeView {
         pub themes: Vec<String>,
+        pub outfits: Vec<String>,
         pub mix: ThemeMix,
         pub show: office_core::config::ShowConfig,
+        pub ceo: office_core::config::CeoConfig,
+        pub whiteboard: office_core::whiteboard::Whiteboard,
+        pub reloaded: usize,
+        pub theme_errors: Vec<String>,
         pub composed: Arc<Mutex<Vec<(u32, u32)>>>,
     }
     impl FakeView {
         pub fn new(themes: &[&str]) -> Self {
-            FakeView { themes: themes.iter().map(|s| s.to_string()).collect(), mix: ThemeMix::default(), show: Default::default(), composed: Default::default() }
+            FakeView {
+                themes: themes.iter().map(|s| s.to_string()).collect(),
+                outfits: Vec::new(),
+                mix: ThemeMix::default(),
+                show: Default::default(),
+                ceo: Default::default(),
+                whiteboard: Default::default(),
+                reloaded: 0,
+                theme_errors: Vec::new(),
+                composed: Default::default(),
+            }
         }
     }
     impl ThemeHost for FakeView {
@@ -785,6 +857,15 @@ pub mod testutil {
         fn set_show(&mut self, show: &office_core::config::ShowConfig) {
             self.show = show.clone();
         }
+        fn set_ceo(&mut self, cfg: &office_core::config::CeoConfig) {
+            self.ceo = cfg.clone();
+        }
+        fn reload_themes(&mut self) {
+            self.reloaded += 1;
+        }
+        fn outfits(&self) -> Vec<String> {
+            self.outfits.clone()
+        }
     }
     impl OfficeView for FakeView {
         fn compose(&mut self, _s: &Scene, _sel: Option<&AgentId>, w: u32, h: u32, _t: u64) -> image::RgbaImage {
@@ -794,6 +875,12 @@ pub mod testutil {
         fn hit_test(&self, _x: u32, _y: u32) -> Option<AgentId> {
             None
         }
+        fn set_whiteboard(&mut self, wb: &office_core::whiteboard::Whiteboard) {
+            self.whiteboard = wb.clone();
+        }
+        fn theme_errors(&self) -> &[String] {
+            &self.theme_errors
+        }
     }
 
     #[derive(Default)]
@@ -801,6 +888,7 @@ pub mod testutil {
         pub calls: Vec<String>,
         pub notes: Vec<(String, String)>,
         pub sounds: Vec<chime::Chime>,
+        pub sound_err: Option<String>,
         pub fail: bool,
         pub clipboard: Vec<String>,
         pub saved: Vec<(String, String)>,
@@ -902,8 +990,13 @@ pub mod testutil {
         fn notify(&mut self, title: &str, body: &str) {
             self.notes.push((title.into(), body.into()));
         }
-        fn play_sound(&mut self, chime: chime::Chime) {
+        fn play_sound(&mut self, chime: chime::Chime) -> Result<(), String> {
             self.sounds.push(chime);
+            if let Some(err) = &self.sound_err {
+                Err(err.clone())
+            } else {
+                Ok(())
+            }
         }
         fn copy_text(&mut self, text: &str) -> anyhow::Result<()> {
             if self.fail {
@@ -954,7 +1047,7 @@ mod tests {
     #[test]
     fn demo_control_emits_events_not_signals() {
         let (tx, rx) = mpsc::channel();
-        let mut c = DemoControl { tx };
+        let mut c = DemoControl { tx, player: chime::SystemPlayer::default() };
         let a = testutil::demo_scene().agents["agy:4242"].clone();
         c.cancel_agy(&a, 4242).unwrap();
         let evs: Vec<Event> = rx.try_iter().collect();

@@ -54,14 +54,14 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-/// True when `pid` is an `office` TUI process (never office-hook, never anything else).
+/// True when `pid` is an `office` or `office-desktop` process (never office-hook, never anything else).
 fn is_office_process(pid: u32) -> bool {
     std::process::Command::new("/bin/ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next().unwrap_or("").to_string())
-        .is_some_and(|c| c == "office")
+        .is_some_and(|c| c == "office" || c == "office-desktop")
 }
 
 #[cfg(unix)]
@@ -100,6 +100,17 @@ fn take_over(sock: &Path) -> Vec<u32> {
     holders
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_office_tasklist_csv(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let Some(col0) = line.split(',').next() else {
+            return false;
+        };
+        let exe = col0.trim().trim_matches('"').to_ascii_lowercase();
+        exe == "office.exe" || exe == "office-desktop.exe"
+    })
+}
+
 #[cfg(windows)]
 fn is_office_process_win(pid: u32) -> bool {
     let filter = format!("PID eq {pid}");
@@ -107,8 +118,7 @@ fn is_office_process_win(pid: u32) -> bool {
         .args(["/FI", &filter, "/FO", "CSV", "/NH"])
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
-        .is_some_and(|s| s.contains("office.exe"))
+        .is_some_and(|o| o.status.success() && is_office_tasklist_csv(&String::from_utf8_lossy(&o.stdout)))
 }
 
 #[cfg(windows)]
@@ -893,5 +903,16 @@ mod tests {
             "cargo test"
         );
         assert_eq!(tool_summary("mcp__github__list_issues", &serde_json::json!({})), "github:list_issues");
+    }
+
+    #[test]
+    fn parse_tasklist_csv_col0() {
+        assert!(is_office_tasklist_csv("\"office.exe\",\"1234\",\"Console\",\"1\",\"12,000 K\"\r\n"));
+        assert!(is_office_tasklist_csv("\"office-desktop.exe\",\"5678\",\"Console\",\"1\",\"24,000 K\"\r\n"));
+        assert!(is_office_tasklist_csv("\"OFFICE.EXE\",\"999\",\"Console\",\"1\",\"10,000 K\""));
+        assert!(!is_office_tasklist_csv("\"backoffice.exe\",\"1234\",\"Console\",\"1\",\"12,000 K\"\r\n"));
+        assert!(!is_office_tasklist_csv("\"office-hook.exe\",\"1234\",\"Console\",\"1\",\"12,000 K\"\r\n"));
+        assert!(!is_office_tasklist_csv("INFO: No tasks are running which match the specified criteria.\r\n"));
+        assert!(!is_office_tasklist_csv(""));
     }
 }

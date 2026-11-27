@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+[lib]
+name = "office"
+path = "src/lib.rs"
+
 [[bin]]
 name = "office"
 path = "src/main.rs"
@@ -27,3 +31,6 @@ base64-simd = "0.8"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Media_Audio", "Win32_System_SystemInformation"] }

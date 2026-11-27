@@ -1,8 +1,9 @@
-//! Workstream A. `office install-hooks [--claude] [--antigravity] [--uninstall] [--permission]`, `office doctor`.
+//! Workstream A. `office install-hooks [--claude] [--antigravity] [--uninstall] [--permission]`,
+//! `office import ...`, `office desktop [--demo]`, `office doctor`.
 //!
 //! Paths are overridable for testing: `OFFICE_CLAUDE_SETTINGS` (default ~/.claude/settings.json) and
 //! `OFFICE_GEMINI_PLUGINS` (default ~/.gemini/config/plugins).
-use office_core::{config::Config, paths};
+use office_core::{assets, config::Config, paths, whiteboard};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -63,6 +64,161 @@ pub fn find_office_hook() -> Option<PathBuf> {
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .map(|d| d.join(bin))
         .find(|p| p.is_file())
+}
+
+/// office-desktop binary name for the current platform.
+fn desktop_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "office-desktop.exe"
+    } else {
+        "office-desktop"
+    }
+}
+
+/// SEC-7: resolve `office-desktop` exclusively from the canonical parent directory of `exe`.
+/// Never falls back to `PATH` or CWD, and refuses symlinks / non-regular files.
+fn find_office_desktop_next_to(exe: &Path) -> Option<PathBuf> {
+    let cand = std::fs::canonicalize(exe).ok()?.parent()?.join(desktop_bin_name());
+    let meta = std::fs::symlink_metadata(&cand).ok()?;
+    if !meta.file_type().is_symlink() && meta.file_type().is_file() {
+        Some(cand)
+    } else {
+        None
+    }
+}
+
+/// Resolve `office-desktop` strictly beside the canonical running `office` executable (SEC-7).
+pub fn find_office_desktop() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    find_office_desktop_next_to(&exe)
+}
+
+pub fn launch_desktop(demo: bool) -> anyhow::Result<()> {
+    let bin = find_office_desktop().ok_or_else(|| {
+        anyhow::anyhow!(
+            "office-desktop not installed next to office (install `office-desktop` alongside `office`)"
+        )
+    })?;
+    let mut cmd = std::process::Command::new(&bin);
+    if demo {
+        cmd.arg("--demo");
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to launch {}: {e}", bin.display()))?;
+    if !status.success() {
+        match status.code() {
+            Some(code) => anyhow::bail!("office-desktop exited with status {code}"),
+            None => anyhow::bail!("office-desktop terminated by signal"),
+        }
+    }
+    Ok(())
+}
+
+const IMPORT_USAGE: &str = "\
+usage:
+  office import theme <dir> <name>
+  office import sprite <theme> <sprite> <png>
+  office import ceo-outfit <png-or-dir> <name> [--mode torso|full]
+  office import sound <test|needs-you|inbox|error> <wav>";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ImportCmd<'a> {
+    Theme { dir: &'a str, name: &'a str },
+    Sprite { theme: &'a str, sprite: &'a str, png: &'a str },
+    CeoOutfit { src: &'a str, name: &'a str, mode: Option<&'a str> },
+    Sound { slot: &'a str, wav: &'a str },
+}
+
+fn parse_import_args(args: &[String]) -> anyhow::Result<ImportCmd<'_>> {
+    let Some((sub, rest)) = args.split_first() else {
+        anyhow::bail!("missing import subcommand\n{IMPORT_USAGE}");
+    };
+    match sub.as_str() {
+        "theme" => {
+            if rest.len() != 2 {
+                anyhow::bail!("usage: office import theme <dir> <name>");
+            }
+            Ok(ImportCmd::Theme { dir: &rest[0], name: &rest[1] })
+        }
+        "sprite" => {
+            if rest.len() != 3 {
+                anyhow::bail!("usage: office import sprite <theme> <sprite> <png>");
+            }
+            Ok(ImportCmd::Sprite { theme: &rest[0], sprite: &rest[1], png: &rest[2] })
+        }
+        "ceo-outfit" => {
+            let mut positional: Vec<&str> = Vec::new();
+            let mut mode: Option<&str> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                let arg = rest[i].as_str();
+                if arg == "--mode" {
+                    let Some(val) = rest.get(i + 1) else {
+                        anyhow::bail!(
+                            "--mode requires a value (torso or full)\nusage: office import ceo-outfit <png-or-dir> <name> [--mode torso|full]"
+                        );
+                    };
+                    if mode.is_some() {
+                        anyhow::bail!("--mode specified more than once");
+                    }
+                    mode = Some(val.as_str());
+                    i += 2;
+                } else if let Some(val) = arg.strip_prefix("--mode=") {
+                    if mode.is_some() {
+                        anyhow::bail!("--mode specified more than once");
+                    }
+                    mode = Some(val);
+                    i += 1;
+                } else if arg.starts_with('-') {
+                    anyhow::bail!(
+                        "unknown option {arg:?}\nusage: office import ceo-outfit <png-or-dir> <name> [--mode torso|full]"
+                    );
+                } else {
+                    positional.push(arg);
+                    i += 1;
+                }
+            }
+            if positional.len() != 2 {
+                anyhow::bail!("usage: office import ceo-outfit <png-or-dir> <name> [--mode torso|full]");
+            }
+            if let Some(m) = mode {
+                if m != "torso" && m != "full" {
+                    anyhow::bail!("invalid outfit mode {m:?}: expected \"torso\" or \"full\"");
+                }
+            }
+            Ok(ImportCmd::CeoOutfit { src: positional[0], name: positional[1], mode })
+        }
+        "sound" => {
+            if rest.len() != 2 {
+                anyhow::bail!("usage: office import sound <test|needs-you|inbox|error> <wav>");
+            }
+            Ok(ImportCmd::Sound { slot: &rest[0], wav: &rest[1] })
+        }
+        other => anyhow::bail!("unknown import subcommand {other:?}\n{IMPORT_USAGE}"),
+    }
+}
+
+pub fn import_asset(args: &[String]) -> anyhow::Result<()> {
+    match parse_import_args(args)? {
+        ImportCmd::Theme { dir, name } => {
+            let dest = assets::import_theme_pack(Path::new(dir), name).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("imported theme {name} -> {}", dest.display());
+        }
+        ImportCmd::Sprite { theme, sprite, png } => {
+            let dest = assets::import_sprite_override(theme, sprite, Path::new(png)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("imported sprite {theme}/{sprite} -> {}", dest.display());
+        }
+        ImportCmd::CeoOutfit { src, name, mode } => {
+            let dest = assets::import_ceo_outfit(Path::new(src), name, mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("imported ceo-outfit {name} -> {}", dest.display());
+        }
+        ImportCmd::Sound { slot, wav } => {
+            let dest = assets::import_sound(slot, Path::new(wav)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("imported sound {slot} -> {}", dest.display());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -343,6 +499,72 @@ pub fn doctor() -> anyhow::Result<()> {
         None => println!("-- office-hook  not found (cargo install --path crates/office-hook)"),
     }
 
+    match find_office_desktop() {
+        Some(p) => println!("ok office-desktop {}", p.display()),
+        None => println!("-- office-desktop not installed next to office"),
+    }
+
+    let (audio_ok, audio_backend) = detect_audio_backend();
+    let custom_wavs = count_custom_wavs(&paths::sounds_dir());
+    println!(
+        "{}audio        {audio_backend} [mode {}, {custom_wavs} custom WAV(s), sound {}]",
+        ok(audio_ok),
+        cfg.sounds.mode,
+        if cfg.sound { "on" } else { "off" }
+    );
+
+    let outfits = assets::list_outfits();
+    let active_outfit = cfg.ceo.outfit.as_deref().unwrap_or("none");
+    let outfit_ok = match cfg.ceo.outfit.as_deref() {
+        Some(name) => outfits.iter().any(|o| o == name),
+        None => true,
+    };
+    let outfit_list = if outfits.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", outfits.join(", "))
+    };
+    println!(
+        "{}outfits      {} installed{outfit_list} [active: {active_outfit}, mode: {}]",
+        ok(outfit_ok),
+        outfits.len(),
+        cfg.ceo.outfit_mode
+    );
+
+    let wb_path = paths::whiteboard_file();
+    match std::fs::symlink_metadata(&wb_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("-- whiteboard   {} [empty/absent]", wb_path.display());
+        }
+        Err(e) => {
+            println!("-- whiteboard   {} [unreadable: {e}]", wb_path.display());
+        }
+        Ok(meta) if meta.file_type().is_symlink() => {
+            println!("-- whiteboard   {} [refusing symlink]", wb_path.display());
+        }
+        Ok(meta) if meta.len() > whiteboard::MAX_WHITEBOARD_BYTES as u64 => {
+            println!("-- whiteboard   {} [exceeds size limit]", wb_path.display());
+        }
+        Ok(_) => match std::fs::read(&wb_path) {
+            Err(e) => println!("-- whiteboard   {} [unreadable: {e}]", wb_path.display()),
+            Ok(bytes) => match serde_json::from_slice::<whiteboard::Whiteboard>(&bytes) {
+                Err(e) => println!("-- whiteboard   {} [invalid JSON: {e}]", wb_path.display()),
+                Ok(wb) => {
+                    let (done, total) = wb.counts();
+                    if total == 0 {
+                        println!("ok whiteboard   {} [empty/absent]", wb_path.display());
+                    } else {
+                        println!(
+                            "ok whiteboard   {} [{done}/{total} items, {}%]",
+                            wb_path.display(),
+                            wb.completion_pct()
+                        );
+                    }
+                }
+            },
+        },
+    }
+
     let sp = claude_settings_path();
     match std::fs::read_to_string(&sp) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("-- claude hooks {} missing", sp.display()),
@@ -427,6 +649,66 @@ pub fn doctor() -> anyhow::Result<()> {
     println!("{}transcripts  {} [{recent} modified in the last 2h]", ok(tdir.exists()), tdir.display());
     println!("   permission   timeout {} s ({})", cfg.permission_timeout_s, if cfg.permission_timeout_s > 0 { "approve/deny on" } else { "off" });
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let cand = dir.join(bin);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn detect_audio_backend() -> (bool, String) {
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new("/usr/bin/afplay").is_file() || find_in_path("afplay").is_some() {
+            (true, "afplay".into())
+        } else {
+            (false, "afplay not found".into())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const PLAYERS: [&str; 4] = ["paplay", "pw-play", "aplay", "canberra-gtk-play"];
+        if let Some(found) = PLAYERS.iter().copied().find(|p| find_in_path(p).is_some()) {
+            (true, found.into())
+        } else {
+            (false, format!("none (tried {})", PLAYERS.join(", ")))
+        }
+    }
+    #[cfg(windows)]
+    {
+        (true, "Win32 PlaySoundW".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        (false, "unsupported platform".into())
+    }
+}
+
+fn count_custom_wavs(dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            continue;
+        }
+        let is_wav = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+        if is_wav {
+            n += 1;
+        }
+    }
+    n
 }
 
 fn count_recent_jsonl(dir: &Path, depth: u32) -> usize {
@@ -520,6 +802,198 @@ mod tests {
         }
         let p: Value = serde_json::from_str(&std::fs::read_to_string(d.join(AG_PLUGIN).join("plugin.json")).unwrap()).unwrap();
         assert_eq!(p["name"], AG_PLUGIN);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    fn minimal_png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(b"IHDR");
+        out.extend_from_slice(&w.to_be_bytes());
+        out.extend_from_slice(&h.to_be_bytes());
+        out.extend_from_slice(&[8, 6, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out
+    }
+
+    fn minimal_wav() -> Vec<u8> {
+        let mut out = Vec::with_capacity(44);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&36u32.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&[0u8; 32]);
+        out
+    }
+
+    fn import_asset_in(
+        args: &[String],
+        themes_root: &Path,
+        outfits_root: &Path,
+        sounds_root: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        match parse_import_args(args)? {
+            ImportCmd::Theme { dir, name } => {
+                assets::import_theme_pack_to(Path::new(dir), name, themes_root).map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            ImportCmd::Sprite { theme, sprite, png } => {
+                assets::import_sprite_override_to(theme, sprite, Path::new(png), themes_root).map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            ImportCmd::CeoOutfit { src, name, mode } => {
+                assets::import_ceo_outfit_to(Path::new(src), name, mode, outfits_root).map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            ImportCmd::Sound { slot, wav } => {
+                assets::import_sound_to(slot, Path::new(wav), sounds_root).map_err(|e| anyhow::anyhow!("{e}"))
+            }
+        }
+    }
+
+    #[test]
+    fn import_asset_rejects_bad_arguments_and_unknown_subcommands() {
+        assert!(import_asset(&[]).is_err());
+        assert!(import_asset(&s(&["bogus"])).is_err());
+        assert!(import_asset(&s(&["theme"])).is_err());
+        assert!(import_asset(&s(&["theme", "/only-one"])).is_err());
+        assert!(import_asset(&s(&["theme", "a", "b", "extra"])).is_err());
+        assert!(import_asset(&s(&["sprite", "cozy", "desk"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "shirt.png"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "shirt.png", "suit", "--mode"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "shirt.png", "suit", "--mode", "cape"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "shirt.png", "suit", "--mode=cape"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "shirt.png", "suit", "--mode", "torso", "--mode", "full"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "shirt.png", "suit", "--unknown"])).is_err());
+        assert!(import_asset(&s(&["sound", "test"])).is_err());
+        assert!(import_asset(&s(&["sound", "bad-slot", "/nonexistent.wav"])).is_err());
+        // Pack name traversal fails validation before touching user config.
+        assert!(import_asset(&s(&["theme", "/nonexistent", "../evil"])).is_err());
+        assert!(import_asset(&s(&["sprite", "../evil", "desk", "/nonexistent.png"])).is_err());
+        assert!(import_asset(&s(&["ceo-outfit", "/nonexistent.png", "../evil"])).is_err());
+    }
+
+    #[test]
+    fn import_asset_parses_and_imports_all_four_targets_end_to_end() {
+        let d = tmpdir("import-e2e");
+        let themes_root = d.join("themes");
+        let outfits_root = d.join("outfits");
+        let sounds_root = d.join("sounds");
+
+        // 1. theme
+        let src_theme = d.join("src_theme");
+        std::fs::create_dir_all(&src_theme).unwrap();
+        std::fs::write(src_theme.join("sheet.png"), minimal_png(32, 32)).unwrap();
+        std::fs::write(
+            src_theme.join("theme.toml"),
+            "[sheets]\ns = { file = \"sheet.png\", tile = 16 }\n[sprites]\nfloor = { sheet = \"s\", col = 0, row = 0 }\n",
+        )
+        .unwrap();
+        let theme_dest = import_asset_in(
+            &s(&["theme", src_theme.to_str().unwrap(), "my-theme"]),
+            &themes_root,
+            &outfits_root,
+            &sounds_root,
+        )
+        .unwrap();
+        assert_eq!(theme_dest, themes_root.join("my-theme"));
+        assert!(theme_dest.join("theme.toml").is_file());
+
+        // 2. sprite
+        let src_sprite = d.join("desk.png");
+        std::fs::write(&src_sprite, minimal_png(16, 16)).unwrap();
+        let sprite_dest = import_asset_in(
+            &s(&["sprite", "my-theme", "desk", src_sprite.to_str().unwrap()]),
+            &themes_root,
+            &outfits_root,
+            &sounds_root,
+        )
+        .unwrap();
+        assert_eq!(sprite_dest, themes_root.join("my-theme/sprites/desk.png"));
+        assert!(sprite_dest.is_file());
+
+        // 3. ceo-outfit (with --mode full and --mode=torso)
+        let src_outfit = d.join("tux.png");
+        std::fs::write(&src_outfit, minimal_png(16, 24)).unwrap();
+        let outfit_dest = import_asset_in(
+            &s(&["ceo-outfit", src_outfit.to_str().unwrap(), "tuxedo", "--mode", "full"]),
+            &themes_root,
+            &outfits_root,
+            &sounds_root,
+        )
+        .unwrap();
+        assert_eq!(outfit_dest, outfits_root.join("tuxedo"));
+        let manifest = std::fs::read_to_string(outfit_dest.join("outfit.toml")).unwrap();
+        assert!(manifest.contains("mode = \"full\""));
+
+        let outfit_dest2 = import_asset_in(
+            &s(&["ceo-outfit", "--mode=torso", src_outfit.to_str().unwrap(), "jersey"]),
+            &themes_root,
+            &outfits_root,
+            &sounds_root,
+        )
+        .unwrap();
+        assert_eq!(outfit_dest2, outfits_root.join("jersey"));
+        let manifest2 = std::fs::read_to_string(outfit_dest2.join("outfit.toml")).unwrap();
+        assert!(manifest2.contains("mode = \"torso\""));
+
+        // 4. sound
+        let src_wav = d.join("ping.wav");
+        std::fs::write(&src_wav, minimal_wav()).unwrap();
+        let sound_dest = import_asset_in(
+            &s(&["sound", "needs-you", src_wav.to_str().unwrap()]),
+            &themes_root,
+            &outfits_root,
+            &sounds_root,
+        )
+        .unwrap();
+        assert_eq!(sound_dest, sounds_root.join("needs-you.wav"));
+        assert!(sound_dest.is_file());
+        assert_eq!(count_custom_wavs(&sounds_root), 1);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_office_desktop_enforces_sec7_sibling_and_rejects_symlinks_and_dirs() {
+        let d = tmpdir("desktop-sec7");
+        let exe = d.join("office");
+        std::fs::write(&exe, b"fake-office").unwrap();
+
+        // Absent -> None
+        assert_eq!(find_office_desktop_next_to(&exe), None);
+
+        // Directory with binary name -> rejected
+        let cand = d.join(desktop_bin_name());
+        std::fs::create_dir(&cand).unwrap();
+        assert_eq!(find_office_desktop_next_to(&exe), None);
+        std::fs::remove_dir(&cand).unwrap();
+
+        // Regular file next to exe -> accepted (canonical path)
+        std::fs::write(&cand, b"fake-desktop").unwrap();
+        let expected = std::fs::canonicalize(&exe).unwrap().parent().unwrap().join(desktop_bin_name());
+        assert_eq!(find_office_desktop_next_to(&exe), Some(expected.clone()));
+
+        // Unix symlink checks:
+        // 1. Symlinked office binary resolves to real parent dir (finds real sibling)
+        // 2. Symlinked office-desktop candidate is rejected
+        #[cfg(unix)]
+        {
+            let link_dir = tmpdir("desktop-sec7-link");
+            let exe_link = link_dir.join("office");
+            std::os::unix::fs::symlink(&exe, &exe_link).unwrap();
+            assert_eq!(find_office_desktop_next_to(&exe_link), Some(expected));
+
+            let real_target = link_dir.join("real-desktop");
+            std::fs::write(&real_target, b"real").unwrap();
+            std::fs::remove_file(&cand).unwrap();
+            std::os::unix::fs::symlink(&real_target, &cand).unwrap();
+            assert_eq!(find_office_desktop_next_to(&exe), None);
+
+            let _ = std::fs::remove_dir_all(&link_dir);
+        }
+
         let _ = std::fs::remove_dir_all(&d);
     }
 }

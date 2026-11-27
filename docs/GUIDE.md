@@ -95,6 +95,35 @@ The header also shows a compact strip on the right when the window is wide enoug
 `● 3 active · ✉ 2 · $4.12 · router 2/5` (agents working, unread inbox items, total cost, busy and
 total router slots).
 
+## Native Desktop App (`office desktop` / `office-desktop`)
+
+In addition to the terminal TUI (`office` / `office_mode`), `office_mode` ships a standalone native desktop GUI application (`office-desktop`, built with `eframe`/`egui`) for macOS, Linux, and Windows:
+
+```sh
+office desktop          # launch live native desktop office
+office desktop --demo   # preview with synthetic agents
+```
+
+You can also run `office-desktop` directly. For `office desktop` to launch it safely, `office-desktop` must be installed in the same directory as `office` (Homebrew, Scoop, and the install scripts do this automatically).
+
+- **Shared live state:** Both the desktop app and the terminal TUI read the same `~/.config/agent-office/config.toml`, themes, CEO outfits, whiteboard checklist, and live hook socket.
+- **Direct interaction:** Click agents, sidebar tabs, and the wall whiteboard directly in a crisp pixel-art window without needing Kitty Graphics or Sixel terminal support.
+- **Drag-and-drop asset import:** Drag a theme folder, `.png` sprite or CEO outfit, or `.wav` chime directly onto the desktop window to validate and import it into `~/.config/agent-office/`.
+
+## Office Whiteboard Checklist & Progress Tracker
+
+The office wall includes an interactive **Whiteboard** that tracks your checklist and displays a live completion progress bar both on the pixel-art wall and inside the popup.
+
+- **Open it:** Press `b`, click the wall whiteboard directly, or pick `b` from the Command Center palette (`Space`).
+- **Manage tasks:**
+  - `a` — add a new manual task (`Enter` saves, `Esc` cancels)
+  - `Space` or `Enter` — toggle the selected task done / not done
+  - `d` / `Delete` / `Backspace` — remove the selected task
+  - `C` — clear all completed manual tasks
+  - `w` — toggle automatic **ROSSO wave sync** (`sync_waves`), which mirrors active pipeline wave items onto the board alongside your manual tasks
+  - `Esc` / `b` / `q` — close the whiteboard
+- **Persistence:** Saved atomically to `~/.config/agent-office/whiteboard.json` and checked by `office doctor`.
+
 ## Keys
 
 | Key | What it does |
@@ -105,22 +134,29 @@ total router slots).
 | `1` `2` `3` `4` | sidebar tabs: Agents, Jobs, Activity, Stats |
 | `r` / `i` | reports / inbox |
 | `Tab` `←` `→`, `y`, `w` | inside a report: change view, copy the view, save as Markdown |
-| `a` / `d` | approve / deny a permission the agent is asking for |
-| `x` | cancel the selected agy call (asks `y`/`n`) |
-| `o` | resume the selected Claude session in a terminal |
-| `v` | View menu: choose what the office shows |
+| `b` | open the Whiteboard checklist (or click the wall whiteboard) |
+| `Space` | Command Center quick-actions palette (`p`, `f`, `K`, `R`, `A`, `i`, `o`, `B`, `b`, `O`) |
+| `p` / `f` | dispatch a new task (`agy` / `claude` / `rosso-auto`) / follow-up reply to selected agent |
+| `a` / `d` / `A` | approve / deny pending permission, or `A` to approve all pending |
+| `x` | stop / cancel the selected agent or router call (asks `y`/`n`) |
+| `K` | Free RAM dialog: stop idle agents or orphan `agy` processes |
+| `R` / `X` *(Jobs tab)* | resume / abort the selected `rosso-auto` job |
+| `o` | resume the selected session in a terminal |
+| `v` | View menu: choose what the office shows (`c` clean, `a` all, `h` hide) |
+| `z` | toggle fill-viewport vs pixel-exact scaling |
 | `L` | show / hide name tags and speech bubbles |
 | `t`, `[` `]`, `T` | theme picker, previous / next theme, theme mixer |
-| `s` | show / hide the sidebar |
+| `Space` → `O` | CEO Outfit picker (`(procedural)` or imported outfits) |
+| `s` | show / hide the sidebar (persisted) |
 | `n` | desktop notifications on / off |
-| `m` | sound chimes on / off |
+| `m` | cross-platform sound chimes on / off |
 | `c` / `C` | clear alerts / bring them back |
 | `?` | help |
 | `q` / `ctrl-c` | quit (agents keep working) |
 
 ## The View menu (`v`)
 
-Move with `↑` `↓`, toggle with `space`, `a` shows everything, `h` hides the overlays, `esc` saves.
+Move with `↑` `↓`, toggle with `space`, `c` applies the clean preset (labels on selected/alerting agents only), `a` shows everything, `h` hides the overlays, `esc` saves.
 The highlighted row is explained at the bottom.
 
 | Option | What it is |
@@ -135,38 +171,88 @@ The highlighted row is explained at the bottom.
 | cat | the office cat |
 | CEO corner | your corner office |
 | council cabin | meeting room for council members |
-| ambient | coffee steam, server lights, idle walks |
+| ambient | coffee steam, server lights, kanban, idle walks |
 | selected only | show tags and bubbles only for the selected agent and for alerts |
+| ambient lighting & glow | monitor glow and subtle room lighting |
+| fill viewport | scale the office to fill the pane (`z` shortcut) |
+| CRT scanlines | optional subtle retro scanline overlay |
+| theme-matched TUI chrome | tint borders and accents to match the active theme |
 
 `L` is a shortcut for names + bubbles together ("name tags + bubbles").
 
-## Themes
+## Themes, Sprites & CEO Outfit Import
 
 `t` opens the picker (arrow keys preview live, `enter` keeps, `esc` undoes). `[` and `]` step
 through presets. `T` lets you pick a different theme for the floor, walls, furniture, decor and
 characters. Your choice is saved.
 
+### Importing custom themes, sprites, and CEO outfits
+
+Use `office import` (or drag and drop files onto the `office-desktop` window) to install custom
+validated assets into `~/.config/agent-office/`:
+
+```sh
+office import theme <dir> <name>                                # -> ~/.config/agent-office/themes/<name>/
+office import sprite <theme> <sprite> <png>                     # override one sprite in a theme
+office import ceo-outfit <png-or-dir> <name> [--mode torso|full] # -> ~/.config/agent-office/outfits/<name>/
+```
+
+- Supported sprite names for `office import sprite`: `floor`, `wall`, `window`, `door`, `desk`,
+  `monitor_off`, `monitor_on`, `chair`, `plant`, `sofa`, `cooler`, `whiteboard`, `lamp`, `rug`.
+- Pack names must match `^[a-z0-9][a-z0-9_-]{0,47}$`; PNGs are validated before copying.
+
+### Switching your CEO Outfit (`Space` → `O`)
+
+Open the Command Center palette with `Space` and press `O` to open the **CEO Outfit** picker:
+
+- Pick `(procedural)` or any installed outfit pack from `~/.config/agent-office/outfits/`.
+- Press `Tab` (or `t`) to switch between **`torso`** mode (overlay on the CEO's jersey/shirt) and **`full`** mode (full character outfit sprite).
+- Press `r` to reload themes and newly imported outfits from disk without restarting.
+- Press `Enter` to apply and persist `outfit` / `outfit_mode` to `[ceo]` in `~/.config/agent-office/config.toml` (where you can also set `primary_color` and `secondary_color` hex overrides).
+
 ## Sound and notifications
 
-- `n` toggles **macOS notifications** (agent needs you, critical alerts, new inbox items).
-- `m` toggles **sound chimes**. Turning it on plays a short test chime so you know it works.
-  Different sounds mean different things: Glass = an agent needs you, Ping = something arrived
-  in your inbox, Basso = an error or escalation. At most one chime every 3 seconds.
-- Both settings are saved in `~/.config/agent-office/config.toml` (`notifications`, `sound`).
-  Sound works without notifications and the other way round. Chimes need macOS (`afplay`).
+- `n` toggles **desktop notifications** (agent needs you, critical alerts, new inbox items).
+- `m` toggles **cross-platform sound chimes**. Turning it on plays a short test chime so you know
+  it works (or shows a warning toast if no playback backend is available). At most one chime plays
+  every 3 seconds.
+- **Platforms & backends:**
+  - **macOS:** `afplay` — uses system `.aiff` chimes (`Pop` = test, `Glass` = agent needs you, `Ping` = inbox item, `Basso` = error/escalation) when `mode = "system"`, or synthesized WAVs when `mode = "synth"`.
+  - **Linux:** auto-detects `paplay`, `pw-play`, `aplay`, or `canberra-gtk-play` and plays built-in pure-Rust synthesized WAV chimes.
+  - **Windows:** plays synthesized or custom WAV chimes directly in memory via Win32 `PlaySoundW`.
+- **Custom WAV slots:** Import your own `.wav` files (up to 4 MiB, validated RIFF/WAVE) with:
+
+  ```sh
+  office import sound <test|needs-you|inbox|error> <wav>
+  ```
+
+  Files are stored under `~/.config/agent-office/sounds/` and configured under `[sounds]` in `~/.config/agent-office/config.toml`:
+
+  ```toml
+  sound = true
+
+  [sounds]
+  mode = "system"          # "system" | "synth"
+  # test = "test.wav"
+  # needs_you = "needs-you.wav"
+  # inbox = "inbox.wav"
+  # error = "error.wav"
+  ```
+
+- Both `notifications` and `sound` are saved in `~/.config/agent-office/config.toml` and work independently of each other.
 
 ## Troubleshooting
 
-Run `office doctor`. It checks the hooks, the socket, the agy router and the config, and tells
-you what to fix. Common cases:
+Run `office doctor`. It checks the config, hooks, socket, themes, `office-desktop`, audio backend,
+custom WAVs, CEO outfits, whiteboard JSON, `agy-route` router, and transcripts, and tells you what
+to fix. Common cases:
 
 - **Nothing appears**: run `office install-hooks`, then restart the Claude session.
-- **No sound**: press `m` and listen for the test chime; check the Mac's volume and that the
-  status bar shows `sound`. If the test chime is silent, `afplay /System/Library/Sounds/Glass.aiff`
-  in a terminal should play.
+- **`office desktop` says `office-desktop not installed next to office`**: ensure `office-desktop` is installed in the same bin directory as `office` (re-run the installer, `brew upgrade office_mode`, or `cargo install --path crates/office-desktop`).
+- **No sound**: press `m` and listen for the test chime, then run `office doctor` to inspect the detected audio backend. On macOS, check `afplay /System/Library/Sounds/Glass.aiff`; on Linux, ensure one of `paplay`, `pw-play`, `aplay`, or `canberra-gtk-play` is in `PATH`.
 - **Approve / deny does nothing**: set `permission_timeout_s` above 0 in the config and run
   `office install-hooks --permission`.
-- **Blocky picture**: your terminal has no image support, so the office is drawn in half-blocks.
-  Ghostty, kitty and WezTerm give the sharpest picture.
-- `office config` prints the settings that are actually in effect; `office demo` runs with fake
+- **Blocky picture in the terminal**: your terminal has no image support, so the office is drawn in half-blocks.
+  Use Ghostty, kitty, or WezTerm — or launch the native desktop app with `office desktop`.
+- `office config` prints the settings that are actually in effect; `office demo` (or `office desktop --demo`) runs with fake
   agents so you can try every key safely.

@@ -421,15 +421,28 @@ pub fn alert_counts(scene: &Scene) -> (usize, usize, usize) {
     (c(AlertLevel::Info), c(AlertLevel::Warn), c(AlertLevel::Critical))
 }
 
+/// RAM headroom gauge data `(label, ratio)` when router reports `free_mb` and `per_proc_mb`.
+/// Ratio represents available capacity headroom relative to `max_concurrent` (or 4 slots fallback).
+pub fn ram_headroom_ratio(scene: &Scene) -> Option<(String, f64)> {
+    let free = scene.router.free_mb?;
+    let per = scene.router.per_proc_mb.filter(|&p| p > 0)?;
+    let slots = scene.router.max_concurrent.or(scene.router.capacity).unwrap_or(4).max(1);
+    let target_mb = (per as f64) * (slots as f64);
+    let ratio = (free as f64 / target_mb).clamp(0.0, 1.0);
+    let label = format!("RAM free {free} MB ({:.0}%)", ratio * 100.0);
+    Some((label, ratio))
+}
+
 /// Sample spacing and history length: one point per 10 s, 30 minutes.
 pub const SAMPLE_EVERY_MS: u64 = 10_000;
 pub const SAMPLE_CAP: usize = 180;
 
-/// Bounded history of total cost and active-agent count.
+/// Bounded history of total cost, active-agent count, and total tokens.
 #[derive(Debug, Clone, Default)]
 pub struct Samples {
     pub cost: VecDeque<f64>,
     pub active: VecDeque<u64>,
+    pub tokens: VecDeque<u64>,
     last_ms: Option<u64>,
 }
 
@@ -442,11 +455,15 @@ impl Samples {
         self.last_ms = Some(now_ms);
         self.cost.push_back(scene.total_cost_usd);
         self.active.push_back(active_count(scene) as u64);
+        self.tokens.push_back(scene.total_tokens);
         while self.cost.len() > SAMPLE_CAP {
             self.cost.pop_front();
         }
         while self.active.len() > SAMPLE_CAP {
             self.active.pop_front();
+        }
+        while self.tokens.len() > SAMPLE_CAP {
+            self.tokens.pop_front();
         }
         true
     }
@@ -462,6 +479,14 @@ impl Samples {
     pub fn active_series(&self, width: usize) -> Vec<u64> {
         let skip = self.active.len().saturating_sub(width);
         self.active.iter().skip(skip).copied().collect()
+    }
+
+    /// The last `width` token points, rebased to the window minimum so growth is visible.
+    pub fn token_series(&self, width: usize) -> Vec<u64> {
+        let skip = self.tokens.len().saturating_sub(width);
+        let tail: Vec<u64> = self.tokens.iter().skip(skip).copied().collect();
+        let min = tail.iter().copied().min().unwrap_or(0);
+        tail.iter().map(|v| v.saturating_sub(min)).collect()
     }
 }
 
@@ -719,10 +744,32 @@ mod tests {
         }
         assert_eq!(sm.cost.len(), SAMPLE_CAP);
         assert_eq!(sm.active.len(), SAMPLE_CAP);
+        assert_eq!(sm.tokens.len(), SAMPLE_CAP);
         assert_eq!(sm.cost_series(10).len(), 10);
         assert_eq!(sm.cost_series(10)[0], 0, "rebased to the window minimum");
         assert!(sm.cost_series(10)[9] > 0);
         assert_eq!(sm.active_series(500).len(), SAMPLE_CAP);
+        assert_eq!(sm.token_series(10).len(), 10);
+    }
+
+    #[test]
+    fn token_series_and_ram_headroom() {
+        let mut s = demo_scene();
+        let (lbl, ratio) = ram_headroom_ratio(&s).unwrap();
+        assert!(lbl.contains("RAM free 1800 MB"), "{lbl}");
+        assert!((ratio - 1.0).abs() < 1e-9, "{ratio}");
+
+        s.router.free_mb = Some(700);
+        let (lbl2, ratio2) = ram_headroom_ratio(&s).unwrap();
+        assert!(lbl2.contains("700 MB") && lbl2.contains("50%"), "{lbl2}");
+        assert!((ratio2 - 0.5).abs() < 1e-9, "{ratio2}");
+
+        let mut sm = Samples::default();
+        s.total_tokens = 1_000;
+        sm.sample(&s, 1_000);
+        s.total_tokens = 2_500;
+        sm.sample(&s, 11_000);
+        assert_eq!(sm.token_series(5), vec![0, 1_500]);
     }
 
     #[test]

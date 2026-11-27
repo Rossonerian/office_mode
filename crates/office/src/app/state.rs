@@ -5,7 +5,12 @@ use super::fmt;
 use super::panels::{self, SideTab, StateNote};
 use super::reader::{self, ReaderTab};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use office_core::{config::{ShowConfig, ThemeMix}, model::AgentKind, Agent, AgentId, AgentState, AlertLevel, Scene};
+use office_core::{
+    config::{CeoConfig, ShowConfig, ThemeMix},
+    model::AgentKind,
+    whiteboard::Whiteboard,
+    Agent, AgentId, AgentState, AlertLevel, Scene,
+};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -16,6 +21,12 @@ pub trait ThemeHost {
     fn set_mix(&mut self, mix: &ThemeMix);
     /// Apply the display toggles (names, bubbles, zones, ...).
     fn set_show(&mut self, _show: &ShowConfig) {}
+    /// Update CEO appearance/outfit configuration.
+    fn set_ceo(&mut self, cfg: &CeoConfig);
+    /// Reload theme packs and sprites from disk.
+    fn reload_themes(&mut self);
+    /// List available external CEO outfit packs.
+    fn outfits(&self) -> Vec<String>;
 }
 
 /// Side-effecting control actions (real: sources::control; demo: synthetic events; tests: fakes).
@@ -24,7 +35,9 @@ pub trait Control {
     fn resolve_permission(&mut self, agent: &Agent, request_id: &str, allow: bool) -> anyhow::Result<()>;
     fn resume_claude(&mut self, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String>;
     fn notify(&mut self, title: &str, body: &str);
-    fn play_sound(&mut self, _chime: Chime) {}
+    fn play_sound(&mut self, _chime: Chime) -> Result<(), String> {
+        Ok(())
+    }
     /// Put text on the system clipboard (non-blocking).
     fn copy_text(&mut self, _text: &str) -> anyhow::Result<()> {
         anyhow::bail!("clipboard not available")
@@ -79,7 +92,7 @@ pub const DISPATCH_TARGETS: &[(&str, &str)] = &[
     ("agy:git", "agy git (branch/commit)"),
     ("agy-cli", "agy CLI (standalone)"),
     ("claude", "claude (background -p)"),
-    ("claude-win", "claude (Ghostty window)"),
+    ("claude-win", "Claude (terminal)"),
     ("rosso-auto:council", "rosso-auto council (full pipeline)"),
     ("rosso-auto:simple", "rosso-auto simple (fast pipeline)"),
 ];
@@ -91,8 +104,10 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("R", "Reap orphan agy processes"),
     ("A", "Approve all pending permissions"),
     ("i", "Open Boss Inbox"),
-    ("o", "Open selected session in Ghostty"),
+    ("o", "Open terminal for selected session"),
     ("B", "Prune old agy brain directories"),
+    ("b", "Whiteboard checklist"),
+    ("O", "CEO Outfit"),
 ];
 
 /// Candidates for the Free RAM dialog: idle/done agents with live PIDs and no active children,
@@ -185,6 +200,10 @@ pub enum Popup {
     ConfirmApproveAll { items: Vec<(AgentId, String, String)> },
     /// Confirmation before aborting a `rosso-auto` job.
     ConfirmAbortAuto { job: String, phase: String },
+    /// CEO outfit picker: `outfits` starts with `"(procedural)"` followed by discovered outfit packs.
+    CeoOutfit { sel: usize, outfits: Vec<String>, mode_full: bool },
+    /// Interactive whiteboard task checklist.
+    Whiteboard { sel: usize, input: String, adding: bool },
 }
 
 /// Reports newest first, optionally only those sent or received by `only`.
@@ -274,9 +293,17 @@ pub fn layer_set(m: &mut ThemeMix, layer: usize, v: String) {
     }
 }
 
-/// Write `theme = {..}` into the TOML config atomically, keeping every other key and failing safely
-/// if an existing config file cannot be read or parsed.
-pub fn persist_config(path: &std::path::Path, mix: &ThemeMix, show: &ShowConfig, notifications: bool, sound: bool) -> anyhow::Result<()> {
+/// Write persisted settings into the TOML config atomically via `office_core::paths::atomic_write`,
+/// keeping every other key and failing safely if an existing config file cannot be read or parsed.
+pub fn persist_config(
+    path: &std::path::Path,
+    mix: &ThemeMix,
+    show: &ShowConfig,
+    sidebar: bool,
+    notifications: bool,
+    sound: bool,
+    ceo: &CeoConfig,
+) -> anyhow::Result<()> {
     let mut table: toml::Table = match std::fs::read_to_string(path) {
         Ok(s) => s.parse::<toml::Table>()?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
@@ -284,14 +311,12 @@ pub fn persist_config(path: &std::path::Path, mix: &ThemeMix, show: &ShowConfig,
     };
     table.insert("theme".into(), toml::Value::try_from(mix)?);
     table.insert("show".into(), toml::Value::try_from(show)?);
+    table.insert("sidebar".into(), toml::Value::Boolean(sidebar));
     table.insert("notifications".into(), toml::Value::Boolean(notifications));
     table.insert("sound".into(), toml::Value::Boolean(sound));
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("toml.office-tmp");
-    std::fs::write(&tmp, toml::to_string_pretty(&table)?)?;
-    std::fs::rename(&tmp, path)?;
+    table.insert("ceo".into(), toml::Value::try_from(ceo)?);
+    let serialized = toml::to_string_pretty(&table)?;
+    office_core::paths::atomic_write(path, serialized.as_bytes())?;
     Ok(())
 }
 
@@ -319,6 +344,10 @@ pub struct App {
     pub config_path: Option<PathBuf>,
     pub mix: ThemeMix,
     pub show: ShowConfig,
+    pub ceo: CeoConfig,
+    pub whiteboard: Whiteboard,
+    whiteboard_path: Option<PathBuf>,
+    whiteboard_dirty: bool,
     pub presets: BTreeMap<String, ThemeMix>,
     /// Recent activity per agent (time, text), newest last.
     pub history: HashMap<AgentId, VecDeque<(u64, String)>>,
@@ -367,6 +396,10 @@ impl App {
             config_path: Some(office_core::paths::config_file()),
             mix: cfg.theme.clone(),
             show: cfg.show.clone(),
+            ceo: cfg.ceo.clone(),
+            whiteboard: Whiteboard::default(),
+            whiteboard_path: None,
+            whiteboard_dirty: false,
             presets: cfg.presets.clone(),
             history: HashMap::new(),
             prev_states: HashMap::new(),
@@ -385,6 +418,39 @@ impl App {
             state_log: VecDeque::new(),
             samples: panels::Samples::default(),
             reader_tab: ReaderTab::Summary,
+        }
+    }
+
+    /// Configure the persistent whiteboard store (called by the event loop; tests keep `None`).
+    pub fn set_whiteboard_store(&mut self, wb: Whiteboard, path: PathBuf) {
+        self.whiteboard = wb;
+        self.whiteboard_path = Some(path);
+        self.whiteboard_dirty = true;
+        self.dirty = true;
+    }
+
+    /// Returns `true` if the whiteboard changed since the last renderer sync, clearing the flag.
+    pub fn take_whiteboard_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.whiteboard_dirty)
+    }
+
+    /// Sync ROSSO wave steps from `scene` into the whiteboard when `sync_waves` is enabled.
+    pub fn sync_whiteboard(&mut self, scene: &Scene) -> bool {
+        let changed = self.whiteboard.sync_from_scene(scene);
+        if changed {
+            self.whiteboard_dirty = true;
+            self.dirty = true;
+        }
+        changed
+    }
+
+    fn save_whiteboard(&mut self, now_ms: u64) {
+        self.whiteboard_dirty = true;
+        self.dirty = true;
+        if let Some(path) = self.whiteboard_path.clone() {
+            if let Err(e) = self.whiteboard.save_to(&path) {
+                self.toast(format!("could not save whiteboard: {e}"), AlertLevel::Warn, now_ms);
+            }
         }
     }
 
@@ -570,7 +636,7 @@ impl App {
     /// Play a chime if sound is on and the 3 s rate limit allows (independent of the `n` toggle).
     fn chime(&mut self, chime: Chime, now_ms: u64, ctl: &mut dyn Control) {
         if self.chimer.allow(self.sound, chime, now_ms) {
-            ctl.play_sound(chime);
+            let _ = ctl.play_sound(chime);
         }
     }
 
@@ -676,10 +742,27 @@ impl App {
 
     fn persist(&mut self, now_ms: u64) {
         if let Some(p) = self.config_path.clone() {
-            if let Err(e) = persist_config(&p, &self.mix, &self.show, self.notifications, self.sound) {
+            if let Err(e) = persist_config(&p, &self.mix, &self.show, self.sidebar, self.notifications, self.sound, &self.ceo) {
                 self.toast(format!("could not save settings: {e}"), AlertLevel::Warn, now_ms);
             }
         }
+    }
+
+    fn open_ceo_outfit(&mut self, view: &dyn ThemeHost) {
+        let mut outfits = vec!["(procedural)".to_string()];
+        outfits.extend(view.outfits());
+        let sel = self
+            .ceo
+            .outfit
+            .as_deref()
+            .and_then(|cur| outfits.iter().position(|o| o == cur))
+            .unwrap_or(0);
+        let mode_full = self.ceo.outfit_mode == "full";
+        self.popup = Popup::CeoOutfit { sel, outfits, mode_full };
+    }
+
+    fn open_whiteboard(&mut self) {
+        self.popup = Popup::Whiteboard { sel: 0, input: String::new(), adding: false };
     }
 
     fn open_theme_picker(&mut self, view: &mut dyn ThemeHost) {
@@ -825,7 +908,7 @@ impl App {
         }
     }
 
-    fn run_action(&mut self, act: &str, scene: &Scene, ctl: &mut dyn Control, now_ms: u64) {
+    fn run_action(&mut self, act: &str, scene: &Scene, view: &mut dyn ThemeHost, ctl: &mut dyn Control, now_ms: u64) {
         match act {
             "p" => {
                 self.popup = Popup::Dispatch {
@@ -855,6 +938,8 @@ impl App {
                 Ok(msg) => self.toast(msg, AlertLevel::Info, now_ms),
                 Err(e) => self.toast(format!("prune failed: {e}"), AlertLevel::Critical, now_ms),
             },
+            "b" => self.open_whiteboard(),
+            "O" => self.open_ceo_outfit(view),
             _ => {}
         }
     }
@@ -1285,12 +1370,12 @@ impl App {
                     KeyCode::Enter => {
                         let act = ACTIONS[sel].0;
                         self.popup = Popup::None;
-                        self.run_action(act, scene, ctl, now_ms);
+                        self.run_action(act, scene, view, ctl, now_ms);
                     }
-                    KeyCode::Char(c @ ('p' | 'f' | 'K' | 'R' | 'A' | 'i' | 'o' | 'B')) => {
+                    KeyCode::Char(c @ ('p' | 'f' | 'K' | 'R' | 'A' | 'i' | 'o' | 'B' | 'b' | 'O')) => {
                         self.popup = Popup::None;
                         let mut buf = [0u8; 4];
-                        self.run_action(c.encode_utf8(&mut buf), scene, ctl, now_ms);
+                        self.run_action(c.encode_utf8(&mut buf), scene, view, ctl, now_ms);
                     }
                     KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q') => self.popup = Popup::None,
                     _ => {}
@@ -1335,6 +1420,142 @@ impl App {
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => self.popup = Popup::None,
                     _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::CeoOutfit { mut sel, mut outfits, mut mode_full } => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        self.popup = Popup::CeoOutfit { sel, outfits, mode_full };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !outfits.is_empty() {
+                            sel = (sel + 1).min(outfits.len() - 1);
+                        }
+                        self.popup = Popup::CeoOutfit { sel, outfits, mode_full };
+                    }
+                    KeyCode::Tab | KeyCode::Char('t') => {
+                        mode_full = !mode_full;
+                        self.popup = Popup::CeoOutfit { sel, outfits, mode_full };
+                    }
+                    KeyCode::Char('r') => {
+                        view.reload_themes();
+                        let prev = outfits.get(sel).cloned();
+                        outfits = vec!["(procedural)".to_string()];
+                        outfits.extend(view.outfits());
+                        sel = prev
+                            .as_deref()
+                            .and_then(|name| outfits.iter().position(|o| o == name))
+                            .unwrap_or(0)
+                            .min(outfits.len().saturating_sub(1));
+                        self.popup = Popup::CeoOutfit { sel, outfits, mode_full };
+                        self.toast("reloaded themes & outfits", AlertLevel::Info, now_ms);
+                    }
+                    KeyCode::Enter => {
+                        self.ceo.outfit = if sel == 0 { None } else { outfits.get(sel).cloned() };
+                        self.ceo.outfit_mode = if mode_full { "full".into() } else { "torso".into() };
+                        view.set_ceo(&self.ceo);
+                        self.persist(now_ms);
+                        self.popup = Popup::None;
+                        let name = self.ceo.outfit.as_deref().unwrap_or("procedural");
+                        let mode = self.ceo.outfit_mode.clone();
+                        self.toast(format!("CEO outfit: {name} ({mode})"), AlertLevel::Info, now_ms);
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.popup = Popup::None;
+                    }
+                    _ => {}
+                }
+                return Outcome::Continue;
+            }
+            Popup::Whiteboard { mut sel, mut input, mut adding } => {
+                if adding {
+                    match key.code {
+                        KeyCode::Esc => {
+                            adding = false;
+                            input.clear();
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Backspace => {
+                            input.pop();
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Enter => {
+                            let added = self.whiteboard.add(&input);
+                            adding = false;
+                            input.clear();
+                            if added {
+                                sel = self.whiteboard.items.len().saturating_sub(1);
+                                self.save_whiteboard(now_ms);
+                            }
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Char(c)
+                            if !c.is_control()
+                                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            if input.chars().count() < office_core::whiteboard::MAX_TITLE_CHARS {
+                                input.push(c);
+                            }
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        _ => {}
+                    }
+                } else {
+                    sel = sel.min(self.whiteboard.items.len().saturating_sub(1));
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            sel = sel.saturating_sub(1);
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !self.whiteboard.items.is_empty() {
+                                sel = (sel + 1).min(self.whiteboard.items.len() - 1);
+                            }
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => {
+                            if self.whiteboard.toggle(sel) {
+                                self.save_whiteboard(now_ms);
+                            }
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Char('a') => {
+                            adding = true;
+                            input.clear();
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                            if self.whiteboard.remove(sel) {
+                                sel = sel.min(self.whiteboard.items.len().saturating_sub(1));
+                                self.save_whiteboard(now_ms);
+                            }
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Char('C') => {
+                            let removed = self.whiteboard.clear_done();
+                            if removed > 0 {
+                                sel = sel.min(self.whiteboard.items.len().saturating_sub(1));
+                                self.save_whiteboard(now_ms);
+                                self.toast(format!("cleared {removed} completed tasks"), AlertLevel::Info, now_ms);
+                            }
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Char('w') => {
+                            self.whiteboard.sync_waves = !self.whiteboard.sync_waves;
+                            if self.whiteboard.sync_waves {
+                                self.whiteboard.sync_from_scene(scene);
+                            }
+                            sel = sel.min(self.whiteboard.items.len().saturating_sub(1));
+                            self.save_whiteboard(now_ms);
+                            self.popup = Popup::Whiteboard { sel, input, adding };
+                        }
+                        KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => {
+                            self.popup = Popup::None;
+                        }
+                        _ => {}
+                    }
                 }
                 return Outcome::Continue;
             }
@@ -1473,7 +1694,10 @@ impl App {
                 self.persist(now_ms);
                 self.toast(if on { "name tags + bubbles on" } else { "name tags + bubbles off" }, AlertLevel::Info, now_ms);
             }
-            KeyCode::Char('s') => self.sidebar = !self.sidebar,
+            KeyCode::Char('s') => {
+                self.sidebar = !self.sidebar;
+                self.persist(now_ms);
+            }
             KeyCode::Char('n') => {
                 self.notifications = !self.notifications;
                 self.persist(now_ms);
@@ -1484,12 +1708,16 @@ impl App {
                 self.sound = !self.sound;
                 self.persist(now_ms);
                 if self.sound {
-                    self.chime(Chime::Test, now_ms, ctl);
-                    self.toast("sound on (test chime played; chimes: needs you, inbox, errors)", AlertLevel::Info, now_ms);
+                    self.chimer.allow(true, Chime::Test, now_ms);
+                    match ctl.play_sound(Chime::Test) {
+                        Ok(()) => self.toast("sound on", AlertLevel::Info, now_ms),
+                        Err(e) => self.toast(format!("sound on (playback unavailable: {e})"), AlertLevel::Warn, now_ms),
+                    }
                 } else {
                     self.toast("sound off", AlertLevel::Info, now_ms);
                 }
             }
+            KeyCode::Char('b') => self.open_whiteboard(),
             KeyCode::Char('c') => {
                 let latest = scene.alerts.iter().map(|a| a.at_ms).max().unwrap_or(0);
                 self.alerts_cleared_at = Some(latest.max(self.alerts_cleared_at.unwrap_or(0)));
@@ -1707,6 +1935,11 @@ impl App {
             return false;
         }
         if let Some(id) = self.office_hit(x, y, hit) {
+            if id == crate::render::WHITEBOARD_ID {
+                self.open_whiteboard();
+                self.dirty = true;
+                return true;
+            }
             if scene.agents.contains_key(&id) || is_ambient(&id) {
                 let dbl = !is_ambient(&id)
                     && self
@@ -2874,5 +3107,192 @@ mod tests {
         h.press(key('z'));
         assert!(!h.app.show.fill_viewport);
         assert!(h.toast().contains("pixel-exact"));
+    }
+
+    #[test]
+    fn sidebar_toggle_persists_to_config() {
+        let dir = std::env::temp_dir().join(format!("office-sidebar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let mut h = Harness::new();
+        h.app.config_path = Some(path.clone());
+        assert!(h.app.sidebar);
+        h.press(key('s'));
+        assert!(!h.app.sidebar);
+        let cfg: office_core::config::Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!cfg.sidebar);
+
+        h.press(key('s'));
+        assert!(h.app.sidebar);
+        let cfg2: office_core::config::Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cfg2.sidebar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sound_toggle_shows_warn_toast_on_playback_error() {
+        let mut h = Harness::new();
+        h.ctl.sound_err = Some("afplay not found".into());
+        h.press(key('m'));
+        assert!(h.app.sound);
+        assert_eq!(h.ctl.sounds, vec![Chime::Test]);
+        let toast = h.app.current_toast().unwrap();
+        assert_eq!(toast.level, AlertLevel::Warn);
+        assert_eq!(toast.text, "sound on (playback unavailable: afplay not found)");
+
+        // Turning off and back on with working playback gives Info "sound on".
+        h.press(key('m'));
+        assert!(!h.app.sound);
+        h.ctl.sound_err = None;
+        h.press(key('m'));
+        assert!(h.app.sound);
+        let ok_toast = h.app.current_toast().unwrap();
+        assert_eq!(ok_toast.level, AlertLevel::Info);
+        assert_eq!(ok_toast.text, "sound on");
+    }
+
+    #[test]
+    fn ceo_outfit_popup_picks_toggles_mode_reloads_and_persists() {
+        let dir = std::env::temp_dir().join(format!("office-ceo-outfit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let mut h = Harness::new();
+        h.app.config_path = Some(path.clone());
+        h.view.outfits = vec!["tuxedo".into(), "hoodie".into()];
+
+        // Open via Command Center palette (' ' -> 'O').
+        h.press(key(' '));
+        h.press(key('O'));
+        assert_eq!(
+            h.app.popup,
+            Popup::CeoOutfit {
+                sel: 0,
+                outfits: vec!["(procedural)".into(), "tuxedo".into(), "hoodie".into()],
+                mode_full: false,
+            }
+        );
+
+        // Move down to "tuxedo", toggle mode to full, reload themes/outfits.
+        h.press(key('j'));
+        h.press(code(KeyCode::Tab));
+        assert!(matches!(h.app.popup, Popup::CeoOutfit { sel: 1, mode_full: true, .. }));
+        h.view.outfits.push("suit".into());
+        h.press(key('r'));
+        assert_eq!(h.view.reloaded, 1);
+        assert!(matches!(
+            &h.app.popup,
+            Popup::CeoOutfit { sel: 1, outfits, mode_full: true } if outfits.contains(&"suit".to_string())
+        ));
+
+        // Apply selection with Enter -> updates app.ceo, calls host.set_ceo, persists.
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.popup, Popup::None);
+        assert_eq!(h.app.ceo.outfit.as_deref(), Some("tuxedo"));
+        assert_eq!(h.app.ceo.outfit_mode, "full");
+        assert_eq!(h.view.ceo.outfit.as_deref(), Some("tuxedo"));
+        assert_eq!(h.view.ceo.outfit_mode, "full");
+        assert!(h.toast().contains("tuxedo") && h.toast().contains("full"), "{}", h.toast());
+
+        let cfg: office_core::config::Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.ceo.outfit.as_deref(), Some("tuxedo"));
+        assert_eq!(cfg.ceo.outfit_mode, "full");
+
+        // Re-open pre-selects "tuxedo" & mode_full=true; picking index 0 reverts to procedural (None).
+        h.press(key(' '));
+        h.press(key('O'));
+        assert!(matches!(h.app.popup, Popup::CeoOutfit { sel: 1, mode_full: true, .. }));
+        h.press(key('k'));
+        h.press(key('t'));
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.ceo.outfit, None);
+        assert_eq!(h.app.ceo.outfit_mode, "torso");
+        assert_eq!(h.view.ceo.outfit, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whiteboard_popup_opens_via_key_and_click_and_mutates() {
+        let dir = std::env::temp_dir().join(format!("office-wb-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let wb_path = dir.join("whiteboard.json");
+        let mut h = Harness::new();
+        h.app.set_whiteboard_store(Whiteboard::default(), wb_path.clone());
+        assert!(h.app.take_whiteboard_dirty());
+        assert!(!h.app.take_whiteboard_dirty());
+
+        // Clicking WHITEBOARD_ID in the office viewport opens Popup::Whiteboard (before is_ambient).
+        h.app.layout.office = Rect::new(0, 1, 58, 20);
+        h.app.layout.font_px = Some((10, 20));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let hit_wb = |_: u32, _: u32| Some(crate::render::WHITEBOARD_ID.to_string());
+        assert!(h.app.handle_mouse_at(click, &h.scene, &hit_wb, 5_000));
+        assert_eq!(h.app.popup, Popup::Whiteboard { sel: 0, input: String::new(), adding: false });
+        // Esc closes whiteboard.
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.popup, Popup::None);
+
+        // 'b' opens whiteboard.
+        h.press(key('b'));
+        assert_eq!(h.app.popup, Popup::Whiteboard { sel: 0, input: String::new(), adding: false });
+
+        // 'a' enters adding mode; control chars are stripped; Enter adds and persists.
+        h.press(key('a'));
+        for ch in "Ship\x07 v2".chars() {
+            h.press(key(ch));
+        }
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.whiteboard.items.len(), 1);
+        assert_eq!(h.app.whiteboard.items[0].title, "Ship v2");
+        assert!(!h.app.whiteboard.items[0].done);
+        assert!(h.app.take_whiteboard_dirty());
+        assert!(wb_path.is_file());
+
+        // Add second item, then cancel a third with Esc.
+        h.press(key('a'));
+        for ch in "Cleanup".chars() {
+            h.press(key(ch));
+        }
+        h.press(code(KeyCode::Enter));
+        assert_eq!(h.app.whiteboard.items.len(), 2);
+        h.press(key('a'));
+        h.press(key('x'));
+        h.press(code(KeyCode::Esc));
+        assert_eq!(h.app.whiteboard.items.len(), 2);
+        assert!(matches!(h.app.popup, Popup::Whiteboard { adding: false, .. }));
+
+        // Space toggles done on selected item (index 1: "Cleanup").
+        h.press(key(' '));
+        assert!(h.app.whiteboard.items[1].done);
+        assert!(h.app.take_whiteboard_dirty());
+
+        // 'C' clears completed manual items (removes "Cleanup").
+        h.press(key('C'));
+        assert_eq!(h.app.whiteboard.items.len(), 1);
+        assert_eq!(h.app.whiteboard.items[0].title, "Ship v2");
+        assert!(h.app.take_whiteboard_dirty());
+
+        // 'w' toggles sync_waves off and back on.
+        assert!(h.app.whiteboard.sync_waves);
+        h.press(key('w'));
+        assert!(!h.app.whiteboard.sync_waves);
+        h.press(key('w'));
+        assert!(h.app.whiteboard.sync_waves);
+
+        // 'd' deletes selected item.
+        h.press(key('d'));
+        assert!(h.app.whiteboard.items.is_empty());
+        assert!(h.app.take_whiteboard_dirty());
+
+        // 'b' closes whiteboard popup.
+        h.press(key('b'));
+        assert_eq!(h.app.popup, Popup::None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

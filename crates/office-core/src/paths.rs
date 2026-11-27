@@ -1,4 +1,7 @@
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_ms() -> u64 {
@@ -66,6 +69,133 @@ pub fn sanitize_id(id: &str) -> String {
 /// Config file: ~/.config/agent-office/config.toml
 pub fn config_file() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".config/agent-office/config.toml")
+}
+
+/// User theme packs dir: ~/.config/agent-office/themes
+pub fn user_themes_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".config/agent-office/themes")
+}
+
+/// User CEO outfit packs dir: ~/.config/agent-office/outfits
+pub fn outfits_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".config/agent-office/outfits")
+}
+
+/// User custom sound slots dir: ~/.config/agent-office/sounds
+pub fn sounds_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".config/agent-office/sounds")
+}
+
+/// Persistent whiteboard file: ~/.config/agent-office/whiteboard.json
+pub fn whiteboard_file() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".config/agent-office/whiteboard.json")
+}
+
+/// Ensure `runtime_dir()` exists with 0700 permissions on Unix, returning its path.
+pub fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
+    let dir = runtime_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir)?;
+    }
+    Ok(dir)
+}
+
+/// Atomically write `bytes` to `path` via a unique same-directory temp file (`create_new(true)`).
+/// Refuses to write if `path` already exists as a symlink.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to write through symlink: {}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = parent.join(format!("{fname}.{}.{seq}.tmp", std::process::id()));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = replace_file(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, dst)
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src_w: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    for attempt in 0..4 {
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        }
+        return Err(err);
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, dst)
 }
 
 fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
@@ -152,5 +282,55 @@ mod tests {
         // Deduplicated
         let unique: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
         assert_eq!(unique.len(), dirs.len());
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "office-paths-test-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn atomic_write_creates_and_overwrites_cleanly() {
+        let dir = test_dir("atomic");
+        let target = dir.join("nested/state.json");
+
+        atomic_write(&target, b"first payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first payload");
+
+        atomic_write(&target, b"second payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second payload");
+
+        // Ensure no leftover .tmp files in parent dir.
+        let leftover: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover tmp files: {leftover:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_symlink_destination() {
+        let dir = test_dir("symlink");
+        let real = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        std::fs::write(&real, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = atomic_write(&link, b"evil").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&real).unwrap(), b"untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

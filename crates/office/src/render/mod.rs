@@ -32,9 +32,10 @@ pub const KIND_OTHER: Col = rgb(0x9aa0a6);
 const SELECT: Col = rgb(0xffe14d);
 const INK: Col = rgb(0x1b1d22);
 const PAPER: Col = rgb(0xfbfaf5);
-/// Pseudo agent ids that `hit_test` returns for the ambient characters.
+/// Pseudo agent ids that `hit_test` returns for the ambient characters and interactive fixtures.
 pub const CAT_ID: &str = "office:cat";
 pub const CEO_ID: &str = "office:ceo";
+pub const WHITEBOARD_ID: &str = "office:whiteboard";
 
 pub fn kind_color(k: AgentKind) -> Col {
     match k {
@@ -96,6 +97,8 @@ pub struct Renderer {
     ceo: CeoConfig,
     show: ShowConfig,
     ceo_look: ceo::CeoLook,
+    ceo_outfit: Option<ceo::CeoOutfit>,
+    whiteboard: office_core::whiteboard::Whiteboard,
     hover: Option<AgentId>,
     /// Interior mutability: the cat continues its walk across frames while themes are borrowed.
     cat_mem: std::cell::RefCell<cat::Memory>,
@@ -143,11 +146,19 @@ impl Renderer {
 
     /// Like `new`, with an explicit theme search path.
     pub fn with_dirs(cfg: &Config, dirs: Vec<PathBuf>) -> Self {
+        let mut errors = Vec::new();
+        let ceo_outfit = match ceo::load_outfit(&cfg.ceo, &office_core::paths::outfits_dir()) {
+            Ok(o) => o,
+            Err(e) => {
+                errors.push(format!("ceo outfit: {e}"));
+                None
+            }
+        };
         let mut r = Renderer {
             mix: cfg.theme.clone(),
             dirs,
             themes: HashMap::new(),
-            errors: Vec::new(),
+            errors,
             static_key: (0, 0),
             static_img: RgbaImage::new(1, 1),
             cached_layout: None,
@@ -161,6 +172,8 @@ impl Renderer {
             ceo: cfg.ceo.clone(),
             show: cfg.show.clone(),
             ceo_look: ceo::look(&cfg.ceo),
+            ceo_outfit,
+            whiteboard: office_core::whiteboard::Whiteboard::default(),
             hover: None,
             cat_mem: Default::default(),
             visit_mem: Default::default(),
@@ -178,6 +191,38 @@ impl Renderer {
         self.mix = mix.clone();
         self.static_key = (0, 0);
         self.ensure_mix();
+    }
+
+    /// Update CEO appearance/config and reload any external outfit sprite.
+    pub fn set_ceo(&mut self, cfg: &CeoConfig) {
+        let was_on = self.ceo_on();
+        self.ceo = cfg.clone();
+        self.ceo_look = ceo::look(cfg);
+        self.ceo_outfit = match ceo::load_outfit(cfg, &office_core::paths::outfits_dir()) {
+            Ok(o) => o,
+            Err(e) => {
+                self.errors.push(format!("ceo outfit: {e}"));
+                None
+            }
+        };
+        if self.ceo_on() != was_on {
+            self.static_key = (0, 0);
+            self.cached_layout = None;
+        }
+    }
+
+    /// Clear cached loaded themes and errors so newly imported themes/sprites reload live on next frame.
+    pub fn reload_themes(&mut self) {
+        self.themes.clear();
+        self.errors.clear();
+        self.static_key = (0, 0);
+        self.cached_layout = None;
+        self.ensure_mix();
+    }
+
+    /// Update the live whiteboard tasks rendered onto the back-wall whiteboard.
+    pub fn set_whiteboard(&mut self, wb: &office_core::whiteboard::Whiteboard) {
+        self.whiteboard = wb.clone();
     }
 
     /// Apply the display toggles (names, bubbles, zones, ...); repaints the static layer when needed.
@@ -408,7 +453,13 @@ impl Renderer {
             unsafe { libc::localtime_r(&secs, &mut tm) };
             tm.tm_hour >= 20 || tm.tm_hour < 6
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+            unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut st) };
+            st.wHour >= 20 || st.wHour < 6
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
@@ -777,11 +828,63 @@ impl Renderer {
         let night = self.is_night(t);
         let mut hits: Vec<([i32; 4], AgentId)> = Vec::new();
 
-        // Live Kanban sticky notes on the back-wall whiteboard
+        // Back-wall whiteboard: always clickable; renders live task progress when items exist,
+        // otherwise falls back to ambient Kanban sticky-note dots.
         let wb = decor_t.sprite("whiteboard");
         let wb_x = lay.w / 2 - wb.w() / 2;
         let wb_y = (WALL_H - wb.h()).max(2) / 2 + 2;
-        if self.show.ambient && decor_t.fx.palette.is_empty() && wb.w() >= 28 && !scene.agents.is_empty() {
+        let (wb_w, wb_h) = (wb.w(), wb.h());
+        hits.push(([wb_x, wb_y, wb_w, wb_h], WHITEBOARD_ID.to_string()));
+        if !self.whiteboard.items.is_empty() && wb_w >= 20 && wb_h >= 16 {
+            let fx = |c: Col| decor_t.fx.apply(c);
+            let board_bg = fx(rgb(0xf7f8fa));
+            let board_ink = fx(INK);
+            let track_col = fx(rgb(0xd4dae2));
+            let fill_col = fx(rgb(0x2fa05a));
+            let muted_col = fx(rgb(0x8a929e));
+            // Clear the inner whiteboard writing surface so live progress/tasks read crisply.
+            fill(img, wb_x + 1, wb_y + 1, wb_w - 2, (wb_h - 4).max(1), board_bg);
+
+            let pct = self.whiteboard.completion_pct();
+            let pct_label = format!("{pct}%");
+            let lw = font::text_width(&pct_label);
+            let label_x = wb_x + wb_w - 2 - lw;
+            font::draw_text(img, label_x, wb_y + 2, &pct_label, board_ink);
+
+            let bar_x = wb_x + 2;
+            let bar_y = wb_y + 3;
+            let bar_w = (label_x - bar_x - 2).max(4);
+            fill(img, bar_x, bar_y, bar_w, 3, track_col);
+            let mut green_w = ((bar_w as u32 * pct as u32 + 50) / 100) as i32;
+            if pct > 0 && green_w == 0 {
+                green_w = 1;
+            }
+            let green_w = green_w.min(bar_w);
+            if green_w > 0 {
+                fill(img, bar_x, bar_y, green_w, 3, fill_col);
+            }
+
+            // Mini checkbox rows (✓ / □) below the progress bar.
+            let max_rows = ((wb_h - 11).max(0) / 3).min(3) as usize;
+            let max_line_w = (wb_w - 11).max(2);
+            for (i, item) in self.whiteboard.items.iter().take(max_rows).enumerate() {
+                let ry = wb_y + 8 + (i as i32) * 3;
+                let bx = wb_x + 3;
+                if item.done {
+                    // Crisp 3×3 green check mark
+                    put(img, bx, ry + 1, fill_col);
+                    put(img, bx + 1, ry + 2, fill_col);
+                    put(img, bx + 2, ry, fill_col);
+                    let line_w = ((item.title.chars().count() as i32).max(4)).min(max_line_w);
+                    fill(img, bx + 5, ry + 1, line_w, 1, muted_col);
+                } else {
+                    // Crisp 3×3 hollow checkbox □
+                    outline(img, bx, ry, 3, 3, board_ink);
+                    let line_w = ((item.title.chars().count() as i32).max(4)).min(max_line_w);
+                    fill(img, bx + 5, ry + 1, line_w, 1, board_ink);
+                }
+            }
+        } else if self.show.ambient && decor_t.fx.palette.is_empty() && wb_w >= 28 && !scene.agents.is_empty() {
             let active_n = scene
                 .agents
                 .values()
@@ -1981,7 +2084,7 @@ impl Renderer {
         let mood = ceo::mood(scene, &self.ceo_look, ccx, alert_x, t);
         let top = if mood.standing() { cy + 5 } else { cy + 12 };
         let mut buf = RgbaImage::new(ceo::W as u32 + 16, ceo::H as u32 + 8);
-        ceo::draw(&mut buf, 8, 4, &self.ceo_look, mood, (t + 333) % 4200 < 140);
+        ceo::draw_with_outfit(&mut buf, 8, 4, &self.ceo_look, mood, (t + 333) % 4200 < 140, self.ceo_outfit.as_ref());
         themed_sprite(&mut buf, char_t, hl);
         blit(img, &buf, ccx - ceo::W / 2 - 8, top - 4);
 
@@ -2984,5 +3087,56 @@ mod tests {
             let has_glyph = (4..9).any(|gx| (4..9).any(|gy| img.get_pixel(gx, gy).0 != bg));
             assert!(has_glyph, "glyph blended into background for {st:?} at t={t}");
         }
+    }
+
+    #[test]
+    fn whiteboard_overlay_renders_progress_and_hit_tests() {
+        let now = 5_000_000;
+        let s = demo::demo_scene(now);
+        let mut r = renderer("procedural");
+        let empty_img = r.compose(&s, None, 640, 360, now);
+
+        let (wx, wy, ww, wh) = r.agent_rect(&WHITEBOARD_ID.to_string()).expect("whiteboard hit rect");
+        assert!(ww > 0 && wh > 0);
+        assert_eq!(r.hit_test(wx + ww / 2, wy + wh / 2).as_deref(), Some(WHITEBOARD_ID));
+
+        let mut wb = office_core::whiteboard::Whiteboard::default();
+        wb.add("Ship hardened theme loader");
+        wb.add("Add CEO outfits");
+        wb.toggle(0);
+        r.set_whiteboard(&wb);
+
+        let active_img = r.compose(&s, None, 640, 360, now);
+        assert_ne!(active_img.as_raw(), empty_img.as_raw(), "whiteboard items change pixels");
+        let (wx2, wy2, ww2, wh2) = r.agent_rect(&WHITEBOARD_ID.to_string()).expect("whiteboard hit rect");
+        assert_eq!(r.hit_test(wx2 + ww2 / 2, wy2 + wh2 / 2).as_deref(), Some(WHITEBOARD_ID));
+        // Green progress bar pixel appears inside the whiteboard rect
+        let green = rgb(0x2fa05a);
+        let has_green = (wy2..wy2 + wh2).any(|y| (wx2..wx2 + ww2).any(|x| active_img.get_pixel(x, y).0 == green));
+        assert!(has_green, "expected green progress bar pixels inside whiteboard rect");
+    }
+
+    #[test]
+    fn set_ceo_and_reload_themes_work_cleanly() {
+        let now = 5_000_000;
+        let s = demo::demo_scene(now);
+        let mut r = renderer("procedural");
+        let before = r.compose(&s, None, 640, 360, now);
+
+        let custom_ceo = CeoConfig {
+            primary_color: Some("#2266dd".into()),
+            secondary_color: Some("#eeeeff".into()),
+            outfit: Some("nonexistent-outfit-pack".into()),
+            ..Default::default()
+        };
+        r.set_ceo(&custom_ceo);
+        assert!(!r.theme_errors().is_empty(), "missing outfit records error and falls back cleanly");
+        let after = r.compose(&s, None, 640, 360, now);
+        assert_ne!(after.as_raw(), before.as_raw(), "custom CEO colors update rendered pixels");
+
+        r.reload_themes();
+        assert!(r.theme_errors().is_empty(), "reload_themes clears stale errors and reloads");
+        let reloaded = r.compose(&s, None, 640, 360, now);
+        assert_eq!(reloaded.dimensions(), (640, 360));
     }
 }

@@ -1,7 +1,7 @@
 class OfficeMode < Formula
   desc "Pixel-art terminal office for your AI coding agents"
   homepage "https://github.com/Rossonerian/office_mode"
-  version "1.0.0"
+  version "1.1.0"
   license "MIT"
 
   on_macos do
@@ -31,13 +31,14 @@ class OfficeMode < Formula
   def install
     bin.install "office"
     bin.install "office-hook"
+    bin.install "office-desktop" if File.exist?("office-desktop")
     bin.install_symlink "office" => "office_mode"
     (share/"office_mode").install "assets"
   end
 
   def caveats
     <<~EOS
-      office_mode installs `office`, `office_mode`, and `office-hook`.
+      office_mode installs `office`, `office_mode`, `office-hook`, and `office-desktop` (`office desktop`).
       To wire Claude Code and Antigravity hooks automatically, run:
         office install-hooks
         office doctor
@@ -47,6 +48,7 @@ class OfficeMode < Formula
   test do
     assert_match "office #{version}", shell_output("#{bin}/office --version")
     assert_match "office #{version}", shell_output("#{bin}/office_mode --version")
+    assert_match version.to_s, shell_output("#{bin}/office-desktop --version") if (bin/"office-desktop").exist?
     assert_match "themes", shell_output("#{bin}/office doctor")
   end
 end

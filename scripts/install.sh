@@ -74,7 +74,7 @@ fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
     echo "Removing office_mode from $BIN_DIR and $SHARE_DIR ..."
-    rm -f "$BIN_DIR/office" "$BIN_DIR/office-hook" "$BIN_DIR/office_mode"
+    rm -f "$BIN_DIR/office" "$BIN_DIR/office-hook" "$BIN_DIR/office_mode" "$BIN_DIR/office-desktop"
     rm -rf "$SHARE_DIR"
     echo "Done. (If you installed agent hooks, run 'office install-hooks --uninstall' before removing, or clean ~/.claude/settings.json and ~/.gemini/config/plugins/agent-office.)"
     exit 0
@@ -179,17 +179,23 @@ install_bin() {
 install_bin "${UNPACK_DIR}/office" "${BIN_DIR}/office"
 install_bin "${UNPACK_DIR}/office-hook" "${BIN_DIR}/office-hook"
 ln -sf "${BIN_DIR}/office" "${BIN_DIR}/office_mode"
+INSTALLED_BINS="${BIN_DIR}/office, ${BIN_DIR}/office-hook, ${BIN_DIR}/office_mode"
+if [ -f "${UNPACK_DIR}/office-desktop" ]; then
+    install_bin "${UNPACK_DIR}/office-desktop" "${BIN_DIR}/office-desktop"
+    INSTALLED_BINS="${INSTALLED_BINS}, ${BIN_DIR}/office-desktop"
+fi
 
 echo ""
 echo "Installed office_mode (${VERSION})!"
-echo "  binaries: ${BIN_DIR}/office, ${BIN_DIR}/office-hook, ${BIN_DIR}/office_mode"
+echo "  binaries: ${INSTALLED_BINS}"
 echo "  assets:   ${SHARE_DIR}/assets"
 echo ""
 echo "Next steps:"
 echo "  office install-hooks   # wire Claude Code + Antigravity hooks"
 echo "  office doctor          # check setup & bundled themes"
-echo "  office demo            # preview with synthetic agents"
-echo "  office                 # launch live office (or 'office_mode')"
+echo "  office desktop --demo  # preview native desktop app (or 'office-desktop')"
+echo "  office demo            # preview terminal office with synthetic agents"
+echo "  office                 # launch live terminal office (or 'office desktop')"
 
 case ":${PATH}:" in
     *":${BIN_DIR}:"*) ;;

@@ -1,8 +1,5 @@
 //! office: terminal agent office. See docs/DESIGN.md. main.rs is owned by workstream C.
-mod app;
-mod cli;
-mod render;
-mod sources;
+use office::{app, cli};
 
 const USAGE: &str = "\
 office (office_mode): pixel-art terminal office for your AI coding agents
@@ -10,17 +7,20 @@ office (office_mode): pixel-art terminal office for your AI coding agents
 USAGE:
     office                      run the office (live sources)
     office demo                 run with synthetic agents (no hooks needed)
+    office desktop [--demo]     launch the native desktop app
+    office import theme|sprite|ceo-outfit|sound ...
+                                import custom themes, sprites, CEO outfits, or WAV sounds
     office install-hooks [--claude] [--antigravity] [--permission] [--uninstall]
                                 install (or remove) the office-hook entries
-    office doctor               check hooks, socket, themes, router and config
+    office doctor               check hooks, socket, themes, desktop, audio, outfits, whiteboard, router and config
     office config               validate config.toml and print the effective settings
     office -h | --help          show this help
     office -V | --version       show the version
 
 KEYS (in the office): q quit · ↑↓/jk select · enter details · a/d approve/deny
-    x cancel agy call · K kill idle · X reap orphans · o resume · p dispatch
-    r/i reports/inbox · t/T themes · v view options · s sidebar · n notifications
-    c clear alerts · L labels · ? help
+    Space actions palette · x cancel · K kill idle · o resume · p dispatch · f follow-up
+    r/i reports/inbox · b whiteboard · m sound · t/T themes · v view menu · s sidebar
+    n notifications · c clear alerts · L labels · ? help
 
 CONFIG: ~/.config/agent-office/config.toml";
 
@@ -36,6 +36,8 @@ fn main() -> anyhow::Result<()> {
     }
     let cfg = office_core::config::Config::load();
     match args.first().map(String::as_str) {
+        Some("desktop") => cli::launch_desktop(args.iter().any(|a| a == "--demo")),
+        Some("import") => cli::import_asset(&args[1..]),
         Some("install-hooks") => cli::install_hooks(
             args.iter().any(|a| a == "--claude") || !args.iter().any(|a| a == "--antigravity"),
             args.iter().any(|a| a == "--antigravity") || !args.iter().any(|a| a == "--claude"),

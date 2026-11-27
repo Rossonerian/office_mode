@@ -28,6 +28,8 @@ pub struct Config {
     pub fps: u32,
     pub notifications: bool,
     pub sound: bool,
+    #[serde(default)]
+    pub sounds: SoundsConfig,
     pub cost_alert_usd: f64,
     pub stuck_after_s: u64,
     /// $ per 1M tokens: model-substring -> (input, output).
@@ -193,8 +195,35 @@ impl Default for CatConfig {
     }
 }
 
+/// `[sounds]`: sound synthesis mode and custom WAV slot overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SoundsConfig {
+    pub mode: String, // "system" (default, preserves macOS .aiff) | "synth"
+    pub test: Option<String>,
+    pub needs_you: Option<String>,
+    pub inbox: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Default for SoundsConfig {
+    fn default() -> Self {
+        SoundsConfig {
+            mode: "system".into(),
+            test: None,
+            needs_you: None,
+            inbox: None,
+            error: None,
+        }
+    }
+}
+
+fn default_outfit_mode() -> String {
+    "torso".into()
+}
+
 /// `[ceo] enabled = true, name = "CEO", number = 9, skin = "#c68642", hair = "black",
-/// hair_style = "short"|"curly"|"long"|"bald"`.
+/// hair_style = "short"|"curly"|"long"|"bald", outfit = ..., outfit_mode = "torso"|"full"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CeoConfig {
@@ -207,6 +236,18 @@ pub struct CeoConfig {
     /// A colour name (black, brown, blonde, red, grey, white) or "#rrggbb".
     pub hair: String,
     pub hair_style: String,
+    /// Sanitized outfit pack name inside `outfits_dir()`.
+    #[serde(default)]
+    pub outfit: Option<String>,
+    /// `"torso"` (default) | `"full"`.
+    #[serde(default = "default_outfit_mode")]
+    pub outfit_mode: String,
+    /// Optional `"#rrggbb"` jersey/suit override.
+    #[serde(default)]
+    pub primary_color: Option<String>,
+    /// Optional `"#rrggbb"` accent/collar override.
+    #[serde(default)]
+    pub secondary_color: Option<String>,
 }
 
 impl Default for CeoConfig {
@@ -218,6 +259,10 @@ impl Default for CeoConfig {
             skin: "#c68642".into(),
             hair: "black".into(),
             hair_style: "short".into(),
+            outfit: None,
+            outfit_mode: default_outfit_mode(),
+            primary_color: None,
+            secondary_color: None,
         }
     }
 }
@@ -248,6 +293,7 @@ impl Default for Config {
             fps: 12,
             notifications: true,
             sound: false,
+            sounds: SoundsConfig::default(),
             cost_alert_usd: 50.0,
             stuck_after_s: 120,
             prices,
@@ -362,5 +408,71 @@ mod tests {
             x.set(i, i % 2 == 0);
             assert_eq!(x.get(i), i % 2 == 0);
         }
+    }
+
+    #[test]
+    fn legacy_toml_without_sounds_or_new_ceo_fields_parses_with_defaults() {
+        let legacy = r##"
+sound = true
+fps = 15
+
+[ceo]
+name = "Boss"
+number = 7
+skin = "#c68642"
+hair = "brown"
+hair_style = "short"
+"##;
+        let c: Config = toml::from_str(legacy).unwrap();
+        assert!(c.sound);
+        assert_eq!(c.sounds, SoundsConfig::default());
+        assert_eq!(c.sounds.mode, "system");
+        assert_eq!(c.sounds.test, None);
+        assert_eq!(c.sounds.needs_you, None);
+        assert_eq!(c.sounds.inbox, None);
+        assert_eq!(c.sounds.error, None);
+        assert_eq!(c.ceo.name, "Boss");
+        assert_eq!(c.ceo.number, 7);
+        assert_eq!(c.ceo.outfit, None);
+        assert_eq!(c.ceo.outfit_mode, "torso");
+        assert_eq!(c.ceo.primary_color, None);
+        assert_eq!(c.ceo.secondary_color, None);
+    }
+
+    #[test]
+    fn sounds_and_extended_ceo_round_trip() {
+        let raw = r##"
+sound = true
+
+[sounds]
+mode = "synth"
+test = "custom_test.wav"
+needs_you = "alert.wav"
+inbox = "ding.wav"
+error = "buzz.wav"
+
+[ceo]
+outfit = "tuxedo"
+outfit_mode = "full"
+primary_color = "#112233"
+secondary_color = "#aabbcc"
+"##;
+        let c: Config = toml::from_str(raw).unwrap();
+        assert!(c.sound);
+        assert_eq!(c.sounds.mode, "synth");
+        assert_eq!(c.sounds.test.as_deref(), Some("custom_test.wav"));
+        assert_eq!(c.sounds.needs_you.as_deref(), Some("alert.wav"));
+        assert_eq!(c.sounds.inbox.as_deref(), Some("ding.wav"));
+        assert_eq!(c.sounds.error.as_deref(), Some("buzz.wav"));
+        assert_eq!(c.ceo.outfit.as_deref(), Some("tuxedo"));
+        assert_eq!(c.ceo.outfit_mode, "full");
+        assert_eq!(c.ceo.primary_color.as_deref(), Some("#112233"));
+        assert_eq!(c.ceo.secondary_color.as_deref(), Some("#aabbcc"));
+
+        let serialized = toml::to_string(&c).unwrap();
+        let back: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.sound, c.sound);
+        assert_eq!(back.sounds, c.sounds);
+        assert_eq!(back.ceo, c.ceo);
     }
 }

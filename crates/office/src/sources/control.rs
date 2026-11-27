@@ -208,6 +208,7 @@ pub fn reap_orphan_agy() -> anyhow::Result<(usize, u32)> {
 pub fn resolve_permission(request_id: &str, allow: bool) -> anyhow::Result<()> {
     let id = paths::sanitize_id(request_id);
     anyhow::ensure!(!id.is_empty(), "empty request id");
+    let _ = paths::ensure_runtime_dir()?;
     let dir = paths::decisions_dir();
     #[cfg(unix)]
     {
@@ -218,10 +219,21 @@ pub fn resolve_permission(request_id: &str, allow: bool) -> anyhow::Result<()> {
     {
         std::fs::create_dir_all(&dir)?;
     }
-    let tmp = dir.join(format!(".{id}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, if allow { "allow" } else { "deny" })?;
-    std::fs::rename(&tmp, dir.join(&id))?;
+    paths::atomic_write(&dir.join(&id), if allow { b"allow" } else { b"deny" })?;
     Ok(())
+}
+
+/// Validates a Claude/Agy session identifier: non-empty, <= 128 chars, does not start with `'-'`,
+/// and contains no control characters, shell metacharacters, quotes, or whitespace.
+pub fn is_valid_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= 128
+        && !s.starts_with('-')
+        && s.chars().all(|c| {
+            !c.is_control()
+                && !c.is_whitespace()
+                && !matches!(c, '\'' | '"' | '`' | '$' | ';' | '|' | '&' | '<' | '>')
+        })
 }
 
 fn sh_quote(s: &str) -> String {
@@ -249,48 +261,127 @@ pub fn resume_command_for(kind: AgentKind, cwd: Option<&str>, session_id: &str) 
     }
 }
 
+#[cfg(target_os = "macos")]
 fn ghostty_exists() -> bool {
     Path::new("/Applications/Ghostty.app").exists()
         || dirs::home_dir().map(|h| h.join("Applications/Ghostty.app").exists()).unwrap_or(false)
 }
 
-fn spawn_ghostty(inner_cmd: &str) -> anyhow::Result<bool> {
-    if !ghostty_exists() {
-        return Ok(false);
+/// Spawn a new terminal window running `program` with direct `args` (zero shell interpolation).
+/// Returns `Ok(true)` if a terminal was launched, or `Ok(false)` if no supported terminal is available.
+fn spawn_terminal(cwd: Option<&Path>, program: &str, args: &[&str], strip_anthropic_env: bool) -> anyhow::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        if !ghostty_exists() {
+            return Ok(false);
+        }
+        let mut cmd = Command::new("open");
+        cmd.args(["-na", "Ghostty", "--args"]);
+        if let Some(d) = cwd.filter(|p| p.is_dir()) {
+            cmd.arg(format!("--working-directory={}", d.to_string_lossy()));
+        }
+        cmd.arg("-e");
+        if strip_anthropic_env {
+            cmd.args(["/usr/bin/env", "-u", "ANTHROPIC_BASE_URL", "-u", "DISABLE_AUTO_COMPACT"]);
+        }
+        cmd.arg(program).args(args);
+        let child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+        reap(child);
+        Ok(true)
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let inner = format!("{inner_cmd}; exec {} -l", sh_quote(&shell));
-    let child = Command::new("open")
-        .args(["-na", "Ghostty", "--args", "-e", &shell, "-lic", &inner])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    reap(child);
-    Ok(true)
+    #[cfg(target_os = "linux")]
+    {
+        let valid_dir = cwd.filter(|p| p.is_dir());
+        for term in ["ghostty", "kitty", "wezterm", "x-terminal-emulator"] {
+            let mut cmd = Command::new(term);
+            if strip_anthropic_env {
+                cmd.env_remove("ANTHROPIC_BASE_URL").env_remove("DISABLE_AUTO_COMPACT");
+            }
+            if let Some(d) = valid_dir {
+                cmd.current_dir(d);
+            }
+            match term {
+                "ghostty" => {
+                    if let Some(d) = valid_dir {
+                        cmd.arg(format!("--working-directory={}", d.to_string_lossy()));
+                    }
+                    cmd.arg("-e").arg(program).args(args);
+                }
+                "kitty" => {
+                    if let Some(d) = valid_dir {
+                        cmd.arg("--directory").arg(d);
+                    }
+                    cmd.arg(program).args(args);
+                }
+                "wezterm" => {
+                    cmd.arg("start");
+                    if let Some(d) = valid_dir {
+                        cmd.arg("--cwd").arg(d);
+                    }
+                    cmd.arg("--").arg(program).args(args);
+                }
+                _ => {
+                    cmd.arg("-e").arg(program).args(args);
+                }
+            }
+            match cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                Ok(child) => {
+                    reap(child);
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("wt.exe");
+        if strip_anthropic_env {
+            cmd.env_remove("ANTHROPIC_BASE_URL").env_remove("DISABLE_AUTO_COMPACT");
+        }
+        if let Some(d) = cwd.filter(|p| p.is_dir()) {
+            cmd.arg("-d").arg(d);
+        }
+        cmd.arg("--").arg(program).args(args);
+        match cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(child) => {
+                reap(child);
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (cwd, program, args, strip_anthropic_env);
+        Ok(false)
+    }
 }
 
-fn launch_resume(cmd: String, strip_anthropic_env: bool) -> anyhow::Result<String> {
-    let _ = crate::app::export::copy_to_clipboard(&cmd);
-    let inner = if strip_anthropic_env {
-        format!("unset ANTHROPIC_BASE_URL DISABLE_AUTO_COMPACT; {cmd}")
-    } else {
-        cmd.clone()
-    };
-    let _ = spawn_ghostty(&inner);
-    Ok(cmd)
+fn launch_resume(cmd_text: String, cwd: Option<&str>, program: &str, session_id: &str, strip_anthropic_env: bool) -> anyhow::Result<String> {
+    let _ = crate::app::export::copy_to_clipboard(&cmd_text);
+    let dir = cwd.map(str::trim).filter(|c| !c.is_empty()).map(Path::new);
+    let _ = spawn_terminal(dir, program, &["--resume", session_id], strip_anthropic_env);
+    Ok(cmd_text)
 }
 
-/// Resume command for a Claude session: copy `cd <cwd> && claude --resume <id>` to the clipboard (pbcopy)
-/// asynchronously and try to open a new Ghostty window running it inside the user's login shell.
+/// Resume command for a Claude session: validate `session_id`, copy `cd <cwd> && claude --resume <id>`
+/// to the clipboard asynchronously, and try to open a new terminal window running it directly.
 pub fn resume_claude(cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
-    launch_resume(resume_command(cwd, session_id), false)
+    anyhow::ensure!(is_valid_session_id(session_id), "invalid session id");
+    launch_resume(resume_command(cwd, session_id), cwd, "claude", session_id, false)
 }
 
-/// Resume an agent session by kind: copy the command via pbcopy and open a Ghostty window.
+/// Resume an agent session by kind: validate `session_id`, copy the command to the clipboard,
+/// and try to open a new terminal window running it directly.
 pub fn resume_agent(kind: AgentKind, cwd: Option<&str>, session_id: &str) -> anyhow::Result<String> {
-    let strip_env = matches!(kind, AgentKind::Other | AgentKind::Agy);
-    launch_resume(resume_command_for(kind, cwd, session_id), strip_env)
+    anyhow::ensure!(is_valid_session_id(session_id), "invalid session id");
+    let is_agy = matches!(kind, AgentKind::Other | AgentKind::Agy);
+    let program = if is_agy { agy_cli_bin() } else { "claude" };
+    launch_resume(resume_command_for(kind, cwd, session_id), cwd, program, session_id, is_agy)
 }
 
 fn agy_cli_bin() -> &'static str {
@@ -468,8 +559,10 @@ pub fn dispatch_task(target: &str, cwd: &str, prompt: &str, agy_route_bin: &str)
             spawn_claude_detached(&["-p", prompt], Some(&dir))?;
         }
         "claude-win" => {
-            let cmd = format!("cd {} && claude {}", sh_quote(&dir_str), sh_quote(prompt));
-            anyhow::ensure!(spawn_ghostty(&cmd)?, "Ghostty.app not found");
+            anyhow::ensure!(
+                spawn_terminal(Some(&dir), "claude", &["--", prompt], false)?,
+                "no supported terminal found"
+            );
         }
         _ => anyhow::bail!("unknown dispatch target: {target}"),
     }
@@ -478,7 +571,7 @@ pub fn dispatch_task(target: &str, cwd: &str, prompt: &str, agy_route_bin: &str)
 
 /// Send a non-interactive follow-up prompt to an existing session.
 pub fn followup_session(kind: AgentKind, cwd: Option<&str>, session_id: &str, prompt: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(!session_id.trim().is_empty(), "empty session id");
+    anyhow::ensure!(is_valid_session_id(session_id), "invalid session id");
     anyhow::ensure!(!prompt.trim().is_empty(), "empty prompt");
     let dir = cwd.map(str::trim).filter(|c| !c.is_empty()).map(Path::new);
     if matches!(kind, AgentKind::Other | AgentKind::Agy) {
@@ -509,31 +602,125 @@ fn reap(mut child: std::process::Child) {
     });
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn as_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], " ")
+/// Escape XML special characters for Windows Toast notification templates.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\r' | '\n' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
-/// Desktop notification (macOS via `osascript`, Linux via `notify-send`). Must not block.
+/// Encode a UTF-8 string as UTF-16LE Base64 for PowerShell `-EncodedCommand`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn encode_utf16le_base64(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len() * 2);
+    for unit in s.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    base64_simd::STANDARD.encode_to_string(&bytes)
+}
+
+#[cfg(windows)]
+static NOTIFY_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Desktop notification (macOS via `osascript` argv, Linux via `notify-send --`,
+/// Windows via single-in-flight hidden PowerShell Toast). Must not block.
 pub fn notify(title: &str, body: &str) {
     #[cfg(target_os = "macos")]
     {
-        let script = format!("display notification \"{}\" with title \"{}\"", as_escape(body), as_escape(title));
-        if let Ok(child) =
-            Command::new("osascript").args(["-e", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        if let Ok(child) = Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)",
+                "-e",
+                "end run",
+                "--",
+                title,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
         {
             reap(child);
         }
     }
     #[cfg(target_os = "linux")]
     {
-        if let Ok(child) =
-            Command::new("notify-send").args([title, body]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        if let Ok(child) = Command::new("notify-send")
+            .args(["--", title, body])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
         {
             reap(child);
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::sync::atomic::Ordering;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        if NOTIFY_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let xml_title = xml_escape(title);
+        let xml_body = xml_escape(body);
+        let ps = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;\
+             $xml = New-Object Windows.Data.Xml.Dom.XmlDocument;\
+             $xml.LoadXml('<toast><visual><binding template=\"ToastText02\"><text id=\"1\">{xml_title}</text><text id=\"2\">{xml_body}</text></binding></visual></toast>');\
+             $toast = New-Object Windows.UI.Notifications.ToastNotification $xml;\
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('agent-office').Show($toast)"
+        );
+        let encoded = encode_utf16le_base64(&ps);
+        std::thread::spawn(move || {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    NOTIFY_IN_FLIGHT.store(false, Ordering::Release);
+                }
+            }
+            let _guard = Guard;
+            if let Ok(mut child) = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-EncodedCommand",
+                    &encoded,
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let _ = child.wait();
+            }
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (title, body);
     }
@@ -592,7 +779,11 @@ mod tests {
         assert!(dispatch_task("unknown", &tmp_s, "hello", "agy-route").is_err());
         assert!(dispatch_task("claude", "/definitely-not-a-real-dir-xyz", "hello", "agy-route").is_err());
         assert!(followup_session(AgentKind::Claude, None, "", "hi").is_err());
+        assert!(followup_session(AgentKind::Claude, None, "-flag", "hi").is_err());
+        assert!(followup_session(AgentKind::Other, None, "sid;rm", "hi").is_err());
         assert!(followup_session(AgentKind::Other, None, "sid", "  ").is_err());
+        assert!(resume_claude(None, "-flag").is_err());
+        assert!(resume_agent(AgentKind::Agy, None, "foo;rm").is_err());
 
         // Missing binary fails cleanly after passing target/input validation
         let missing_err = dispatch_task("agy:manager", &tmp_s, "audit", "/nonexistent-agy-route-bin-xyz").unwrap_err();
@@ -617,8 +808,44 @@ mod tests {
         assert!(is_valid_rosso_job(&generated), "generated invalid job name: {generated}");
     }
     #[test]
-    fn escapes_applescript() {
-        assert_eq!(as_escape("a \"b\" \\ c\nd"), r#"a \"b\" \\ c d"#);
+    fn session_id_validation() {
+        for good in ["s1", "conv-123_abc.4", "550e8400-e29b-41d4-a716-446655440000", &"a".repeat(128)] {
+            assert!(is_valid_session_id(good), "expected valid: {good}");
+        }
+        for bad in [
+            "",
+            "-flag",
+            "--resume",
+            "foo;rm",
+            "a'b",
+            "a\"b",
+            "a`b",
+            "a$b",
+            "a|b",
+            "a&b",
+            "a<b",
+            "a>b",
+            "a b",
+            "a\nb",
+            "a\x00b",
+            "a\x1bb",
+            &"a".repeat(129),
+        ] {
+            assert!(!is_valid_session_id(bad), "expected invalid: {bad:?}");
+        }
+    }
+    #[test]
+    fn xml_escape_handles_special_chars() {
+        assert_eq!(
+            xml_escape("A & <B> \"C\" 'D'\nE\x07F"),
+            "A &amp; &lt;B&gt; &quot;C&quot; &apos;D&apos; EF"
+        );
+    }
+    #[test]
+    fn utf16le_base64_matches_powershell_format() {
+        // "hi" in UTF-16LE is [0x68, 0x00, 0x69, 0x00] -> Base64 "aABpAA=="
+        assert_eq!(encode_utf16le_base64("hi"), "aABpAA==");
+        assert_eq!(encode_utf16le_base64(""), "");
     }
     #[test]
     fn cancel_refuses_init() {

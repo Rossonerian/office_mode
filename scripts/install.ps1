@@ -73,6 +73,9 @@ try {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Copy-Item -Path (Join-Path $UnpackDir "office.exe") -Destination (Join-Path $InstallDir "office.exe") -Force
     Copy-Item -Path (Join-Path $UnpackDir "office-hook.exe") -Destination (Join-Path $InstallDir "office-hook.exe") -Force
+    if (Test-Path (Join-Path $UnpackDir "office-desktop.exe")) {
+        Copy-Item -Path (Join-Path $UnpackDir "office-desktop.exe") -Destination (Join-Path $InstallDir "office-desktop.exe") -Force
+    }
 
     $DestAssets = Join-Path $InstallDir "assets"
     if (Test-Path $DestAssets) {
@@ -101,8 +104,9 @@ try {
     Write-Host "Next steps:"
     Write-Host "  office install-hooks   # wire Claude Code + Antigravity hooks"
     Write-Host "  office doctor          # check setup & bundled themes"
-    Write-Host "  office demo            # preview with synthetic agents"
-    Write-Host "  office                 # launch live office (or 'office_mode')"
+    Write-Host "  office desktop --demo  # preview native desktop app (or 'office-desktop')"
+    Write-Host "  office demo            # preview terminal office with synthetic agents"
+    Write-Host "  office                 # launch live terminal office (or 'office desktop')"
 }
 finally {
     if (Test-Path $TempDir) {

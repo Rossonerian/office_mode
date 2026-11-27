@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/office-core", "crates/office-hook", "crates/office"]
+members = ["crates/office-core", "crates/office-hook", "crates/office", "crates/office-desktop"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Rossonerian/office_mode"

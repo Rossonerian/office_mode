@@ -6,9 +6,11 @@ pub mod model;
 pub mod event;
 pub mod reducer;
 pub mod alerts;
+pub mod assets;
 pub mod config;
 pub mod paths;
 pub mod rosso;
+pub mod whiteboard;
 
 pub use event::{Event, EventKind, SourceKind};
 pub use model::{

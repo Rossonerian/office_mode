@@ -6,14 +6,14 @@ use super::panels::{self, SideTab};
 use super::state::{layer_get, App, Popup, LAYERS};
 use super::{guarded, OfficeView};
 use crate::render;
-use office_core::{model::AgentKind, Agent, AlertLevel, Scene};
+use office_core::{model::AgentKind, whiteboard::TaskSource, Agent, AlertLevel, Scene};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, BarGroup, Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Row,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs, Wrap,
+        Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, ListState,
+        Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs, Wrap,
     },
     Frame,
 };
@@ -295,6 +295,14 @@ pub fn popup_rect(area: Rect, app: &App, scene: &Scene) -> Option<Rect> {
             let w = msg.chars().count().max(hint.chars().count()) as u16 + 6;
             Some(centered(area, w, 4.min(max_h)))
         }
+        Popup::CeoOutfit { outfits, .. } => {
+            let rows = outfits.len().max(1) as u16;
+            Some(centered(area, 58, (rows + 6).clamp(7, max_h)))
+        }
+        Popup::Whiteboard { .. } => {
+            let rows = app.whiteboard.items.len().clamp(3, 14) as u16;
+            Some(centered(area, 76, (rows + 7).clamp(10, max_h)))
+        }
     }
 }
 
@@ -335,6 +343,7 @@ fn draw_card(f: &mut Frame, app: &mut App, scene: &Scene, office: Rect) {
     let pal = ui_palette(app);
     let unread = app.unread_count(scene);
     let b = Block::bordered()
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(c))
         .title(format!(" ✉ boss inbox{} ", if unread > 1 { format!(" · {unread} unread") } else { String::new() }))
         .title_bottom(Line::from(" enter read · esc dismiss · i inbox ").right_aligned())
@@ -612,7 +621,7 @@ fn draw_footer(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
     if scene.reports.iter().any(|r| r.to.is_none()) {
         spans.push(Span::styled("  i inbox", Style::new().fg(Color::Yellow)));
     }
-    spans.push(Span::styled("  p task  f reply  K ram  Space menu  ? help", dim));
+    spans.push(Span::styled("  b board  p task  f reply  K ram  Space menu  ? help", dim));
     spans.push(Span::styled("  1-4 tabs  Tab jump  t theme  [ ] cycle  T mix  v view  z fit  L labels  s side", dim));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1084,9 +1093,16 @@ fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u
     }
     let dim = Style::new().fg(Color::DarkGray);
     let h = inner.height as usize;
+    let ram_headroom = panels::ram_headroom_ratio(scene);
     let mut cons = vec![Constraint::Length(1); 4];
     let mut used = 4;
-    let (mut has_cost, mut has_active, mut has_bars, mut has_ram_btn) = (false, false, false, false);
+    let (mut has_ram_gauge, mut has_cost, mut has_active, mut has_tok_spark, mut has_bars, mut has_ram_btn) =
+        (false, false, false, false, false, false);
+    if ram_headroom.is_some() && h >= used + 10 {
+        cons.push(Constraint::Length(1));
+        has_ram_gauge = true;
+        used += 1;
+    }
     if h >= used + 2 {
         cons.push(Constraint::Length(2));
         has_cost = true;
@@ -1095,6 +1111,11 @@ fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u
     if h >= used + 2 {
         cons.push(Constraint::Length(2));
         has_active = true;
+        used += 2;
+    }
+    if h >= used + 7 {
+        cons.push(Constraint::Length(2));
+        has_tok_spark = true;
         used += 2;
     }
     if h >= used + 4 {
@@ -1112,7 +1133,11 @@ fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u
     let (label, ratio) = router_gauge_label(scene);
     let color = if ratio >= 1.0 { Color::LightRed } else if ratio >= 0.67 { Color::Yellow } else { Color::Green };
     f.render_widget(
-        Gauge::default().ratio(ratio).label(format!("router {label}")).gauge_style(Style::new().fg(color).bg(Color::Rgb(0x22, 0x22, 0x22))),
+        Gauge::default()
+            .use_unicode(true)
+            .ratio(ratio)
+            .label(format!("router {label}"))
+            .gauge_style(Style::new().fg(color).bg(Color::Rgb(0x22, 0x22, 0x22))),
         areas[0],
     );
     let (pl, pc) = pressure_label(scene.router.pressure);
@@ -1140,6 +1165,27 @@ fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u
     f.render_widget(Paragraph::new(trunc(&format!("tokens in {} · out {}", fmt_tokens(tin), fmt_tokens(tout)), w)), areas[3]);
 
     let mut next = 4;
+    if has_ram_gauge {
+        let a = areas[next];
+        next += 1;
+        if let Some((ram_lbl, ram_ratio)) = ram_headroom {
+            let ram_col = if ram_ratio <= 0.25 {
+                Color::LightRed
+            } else if ram_ratio <= 0.50 {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            };
+            f.render_widget(
+                Gauge::default()
+                    .use_unicode(true)
+                    .ratio(ram_ratio)
+                    .label(trunc(&ram_lbl, w))
+                    .gauge_style(Style::new().fg(ram_col).bg(Color::Rgb(0x22, 0x22, 0x22))),
+                a,
+            );
+        }
+    }
     if has_cost {
         let a = areas[next];
         next += 1;
@@ -1163,6 +1209,18 @@ fn draw_stats(f: &mut Frame, app: &mut App, scene: &Scene, area: Rect, now_ms: u
             l,
         );
         f.render_widget(Sparkline::default().data(&series).max(peak.max(1)).style(Style::new().fg(Color::Cyan)), sp);
+    }
+    if has_tok_spark {
+        let a = areas[next];
+        next += 1;
+        let series = app.samples.token_series(a.width as usize);
+        let max_v = series.iter().copied().max().unwrap_or(0).max(1);
+        let [l, sp] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(a);
+        f.render_widget(
+            Paragraph::new(trunc(&format!("token activity  total {}", fmt_tokens(scene.total_tokens)), w)).style(Style::new().fg(Color::Gray)),
+            l,
+        );
+        f.render_widget(Sparkline::default().data(&series).max(max_v).style(Style::new().fg(Color::LightGreen)), sp);
     }
     if has_bars {
         let a = areas[next];
@@ -1463,7 +1521,14 @@ fn draw_router(f: &mut Frame, app: &App, scene: &Scene, area: Rect) {
     let [g, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
     let (label, ratio) = router_gauge_label(scene);
     let color = if ratio >= 1.0 { Color::LightRed } else if ratio >= 0.67 { Color::Yellow } else { Color::Green };
-    f.render_widget(Gauge::default().ratio(ratio).label(label).gauge_style(Style::new().fg(color).bg(Color::Rgb(0x22, 0x22, 0x22))), g);
+    f.render_widget(
+        Gauge::default()
+            .use_unicode(true)
+            .ratio(ratio)
+            .label(label)
+            .gauge_style(Style::new().fg(color).bg(Color::Rgb(0x22, 0x22, 0x22))),
+        g,
+    );
     f.render_widget(Paragraph::new(router_lines(scene, inner.width as usize)), rest);
 }
 
@@ -1522,8 +1587,8 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         "Command Center & actions",
         &[
             ("Space", "open the Command Center quick-actions menu"),
-            ("p", "dispatch a new task (agy role / claude)"),
-            ("f", "reply / follow-up to the selected agent (or in a report)"),
+            ("b", "Whiteboard checklist (tasks + wave sync; or click board)"),
+            ("p / f", "dispatch new task (agy / claude) / reply follow-up"),
             ("K", "Free RAM: stop idle agents or reap orphan agy"),
             ("a / d / A", "approve / deny permission, or A to approve all pending"),
             ("x", "stop / cancel the selected agent process (asks y/n first)"),
@@ -1535,11 +1600,11 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         "Display",
         &[
             ("v", "view menu: toggles, c clean / a all / h hide"),
-            ("z", "toggle pixel-exact vs fill viewport scaling"),
-            ("L", "show / hide name tags and speech bubbles"),
+            ("z / L", "toggle fill-viewport scaling / name tags & bubbles"),
             ("t / [ ]", "theme picker (swatches + live preview) / cycle"),
             ("T", "theme mixer: a different theme per layer"),
-            ("s", "show / hide the sidebar"),
+            ("Space → O", "CEO Outfit picker (procedural or custom outfits)"),
+            ("s", "show / hide the sidebar (persisted)"),
         ],
     ),
     (
@@ -1713,6 +1778,7 @@ fn popup_frame_pal(f: &mut Frame, r: Rect, title: String, pal: UiPalette) -> Rec
     f.render_widget(Clear, r);
     let b = Block::bordered()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(pal.border))
         .title(title)
         .style(Style::new().bg(pal.popup_bg));
@@ -1737,6 +1803,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             f.render_widget(Clear, r);
             let mut b = Block::bordered()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(pal.border))
                 .title(" help ")
                 .style(Style::new().bg(pal.popup_bg));
@@ -1760,6 +1827,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             f.render_widget(Clear, r);
             let mut b = Block::bordered()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(pal.border))
                 .title(format!(" {} ", a.label))
                 .style(Style::new().bg(pal.popup_bg));
@@ -1831,6 +1899,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let pos = list.iter().position(|x| x.id == *id).map(|i| format!(" {}/{} ", i + 1, list.len())).unwrap_or_default();
             let b = Block::bordered()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(pal.border))
                 .title(Line::from(vec![Span::styled(" report", Style::new().bold()), Span::styled(pos, Style::new().fg(Color::Yellow).bold())]))
                 .title_bottom(Line::from(" tab/←→ view · ↑↓ scroll · y copy · w save · n/p next/prev · f reply · g sender · esc back ").right_aligned())
@@ -2085,6 +2154,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
             let p_border = if *field == 2 { Color::Yellow } else { pal.border };
             let p_block = Block::bordered()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(p_border))
                 .style(Style::new().bg(pal.popup_bg));
             let p_cursor = if *field == 2 { "▌" } else { "" };
@@ -2149,6 +2219,174 @@ fn draw_popup(f: &mut Frame, app: &mut App, scene: &Scene, office: &OfficeCtx, n
                 Line::from(Span::styled(trunc(hint, iw), Style::new().fg(Color::DarkGray))),
             ];
             f.render_widget(Paragraph::new(lines), inner);
+        }
+        Popup::CeoOutfit { sel, outfits, mode_full } => {
+            let rows = outfits.len().max(1) as u16;
+            let r = centered(area, 58, (rows + 6).clamp(7, max_h));
+            app.layout.popup = r;
+            let inner = popup_frame_pal(f, r, " CEO Outfit ".into(), pal);
+            let w = inner.width as usize;
+            let [mode_a, list_a, hint_a] =
+                Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+            let torso_st = if !*mode_full {
+                Style::new().fg(pal.badge_fg).bg(pal.accent).bold()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            let full_st = if *mode_full {
+                Style::new().fg(pal.badge_fg).bg(pal.accent).bold()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            let mode_line = Line::from(vec![
+                Span::styled(" mode: ", Style::new().fg(Color::Gray)),
+                Span::styled(" torso ", torso_st),
+                Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+                Span::styled(" full ", full_st),
+            ]);
+            f.render_widget(Paragraph::new(mode_line), mode_a);
+
+            let cur_idx = app
+                .ceo
+                .outfit
+                .as_deref()
+                .and_then(|cur| outfits.iter().position(|o| o == cur))
+                .unwrap_or(0);
+            let cap = list_a.height as usize;
+            let start = sel.saturating_sub(cap.saturating_sub(1));
+            let lines: Vec<Line> = outfits
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(cap)
+                .map(|(i, name)| {
+                    let mark = if i == *sel { "▶" } else { " " };
+                    let dot = if i == cur_idx { "●" } else { " " };
+                    let st = if i == *sel {
+                        Style::new().bg(pal.sel_bg).fg(Color::Yellow).bold()
+                    } else {
+                        Style::new()
+                    };
+                    Line::from(Span::styled(trunc(&format!("{mark} {dot} {name}"), w), st))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), list_a);
+            f.render_widget(
+                Paragraph::new(trunc(" Enter apply · Tab mode · r reload · Esc close ", w))
+                    .style(Style::new().fg(Color::DarkGray)),
+                hint_a,
+            );
+        }
+        Popup::Whiteboard { sel, input, adding } => {
+            let (done, total) = app.whiteboard.counts();
+            let pct = app.whiteboard.completion_pct();
+            let rows = app.whiteboard.items.len().clamp(3, 14) as u16;
+            let r = centered(area, 76, (rows + 7).clamp(10, max_h));
+            app.layout.popup = r;
+            let waves_badge = if app.whiteboard.sync_waves {
+                Span::styled(" [waves: on] ", Style::new().fg(Color::Green).bold())
+            } else {
+                Span::styled(" [waves: off] ", Style::new().fg(Color::DarkGray))
+            };
+            let title = Line::from(vec![
+                Span::styled(format!(" Whiteboard · {pct}% ({done}/{total}) "), Style::new().bold()),
+                waves_badge,
+            ]);
+            f.render_widget(Clear, r);
+            let b = Block::bordered()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(pal.border))
+                .title(title)
+                .style(Style::new().bg(pal.popup_bg));
+            let inner = b.inner(r);
+            f.render_widget(b, r);
+            let w = inner.width as usize;
+
+            let input_h = if *adding { 2 } else { 0 };
+            let [gauge_a, list_a, input_a, hint_a] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(input_h),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+
+            let gauge_col = if pct == 100 && total > 0 { Color::Green } else { pal.accent };
+            f.render_widget(
+                Gauge::default()
+                    .use_unicode(true)
+                    .percent(pct as u16)
+                    .label(format!("{pct}% ({done}/{total})"))
+                    .gauge_style(Style::new().fg(gauge_col).bg(Color::Rgb(0x22, 0x22, 0x22))),
+                gauge_a,
+            );
+
+            let list_lines: Vec<Line> = if app.whiteboard.items.is_empty() {
+                vec![Line::from(Span::styled(
+                    trunc("  No tasks yet — press a to add one, or enable wave sync (w).", w),
+                    Style::new().fg(Color::DarkGray),
+                ))]
+            } else {
+                let cap = list_a.height as usize;
+                let clamped_sel = (*sel).min(app.whiteboard.items.len().saturating_sub(1));
+                let start = clamped_sel.saturating_sub(cap.saturating_sub(1));
+                app.whiteboard
+                    .items
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(cap)
+                    .map(|(i, item)| {
+                        let is_sel = i == clamped_sel && !*adding;
+                        let bg = if is_sel { Style::new().bg(pal.sel_bg) } else { Style::new() };
+                        let mark = if is_sel { "▶ " } else { "  " };
+                        let (chk, chk_st) = if item.done {
+                            ("[x] ", bg.fg(Color::Green).bold())
+                        } else {
+                            ("[ ] ", bg.fg(Color::DarkGray))
+                        };
+                        let (src, src_st) = match item.source {
+                            TaskSource::Wave => ("[W] ", bg.fg(Color::Cyan)),
+                            TaskSource::Manual => ("[M] ", bg.fg(Color::Yellow)),
+                        };
+                        let title_budget = w.saturating_sub(10);
+                        let title_st = if is_sel {
+                            bg.fg(Color::White).bold()
+                        } else if item.done {
+                            bg.fg(Color::DarkGray)
+                        } else {
+                            bg
+                        };
+                        Line::from(vec![
+                            Span::styled(mark, bg.fg(Color::Yellow).bold()),
+                            Span::styled(chk, chk_st),
+                            Span::styled(src, src_st),
+                            Span::styled(trunc(&item.title, title_budget), title_st),
+                        ])
+                    })
+                    .collect()
+            };
+            f.render_widget(Paragraph::new(list_lines), list_a);
+
+            if *adding {
+                let prompt = Line::from(vec![
+                    Span::styled(" Add task: ", Style::new().fg(Color::Yellow).bold()),
+                    Span::raw(trunc(&format!("{input}▌"), w.saturating_sub(11))),
+                ]);
+                f.render_widget(Paragraph::new(prompt), input_a);
+            }
+
+            let footer = if *adding {
+                " Enter save task · Esc cancel "
+            } else {
+                " Space toggle · a add · d del · C clear done · w waves · Esc close "
+            };
+            f.render_widget(
+                Paragraph::new(trunc(footer, w)).style(Style::new().fg(Color::DarkGray)),
+                hint_a,
+            );
         }
     }
 }
@@ -2733,5 +2971,51 @@ mod tests {
         assert!(s.contains("tokyo-night") && s.contains("indigo dark studio") && s.contains("████"), "{s}");
         assert!(s.contains("nord") && s.contains("arctic slate frost"), "{s}");
         assert!(s.contains("custom-user") && s.contains("custom theme"), "{s}");
+    }
+
+    #[test]
+    fn whiteboard_ceo_outfit_and_help_render() {
+        let (mut app, scene) = test_app();
+        let mut office = OfficeCtx::new(None, None);
+
+        // Whiteboard popup with manual + wave items and adding input.
+        app.whiteboard.add("Ship release");
+        app.whiteboard.items.push(office_core::whiteboard::TaskItem {
+            id: "w-1".into(),
+            title: "council: Security Seat".into(),
+            done: true,
+            source: TaskSource::Wave,
+        });
+        app.popup = Popup::Whiteboard { sel: 0, input: String::new(), adding: false };
+        let s = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s.contains("Whiteboard · 50% (1/2)"), "{s}");
+        assert!(s.contains("[waves: on]"), "{s}");
+        assert!(s.contains("[ ] [M] Ship release"), "{s}");
+        assert!(s.contains("[x] [W] council: Security Seat"), "{s}");
+        assert!(s.contains("Space toggle · a add · d del · C clear done · w waves · Esc close"), "{s}");
+
+        app.popup = Popup::Whiteboard { sel: 0, input: "New item".into(), adding: true };
+        let s_add = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s_add.contains("Add task: New item▌"), "{s_add}");
+
+        // CEO Outfit popup.
+        app.ceo.outfit = Some("tuxedo".into());
+        app.popup = Popup::CeoOutfit {
+            sel: 1,
+            outfits: vec!["(procedural)".into(), "tuxedo".into(), "hoodie".into()],
+            mode_full: true,
+        };
+        let s_ceo = render(&mut app, &scene, &mut office, 120, 40);
+        assert!(s_ceo.contains("CEO Outfit"), "{s_ceo}");
+        assert!(s_ceo.contains("torso") && s_ceo.contains("full"), "{s_ceo}");
+        assert!(s_ceo.contains("▶ ● tuxedo"), "{s_ceo}");
+        assert!(s_ceo.contains("Enter apply · Tab mode · r reload · Esc close"), "{s_ceo}");
+
+        // Help popup lists Whiteboard, sound chimes, and CEO Outfit.
+        app.popup = Popup::Help;
+        let s_help = render(&mut app, &scene, &mut office, 120, 46);
+        assert!(s_help.contains("Whiteboard checklist"), "{s_help}");
+        assert!(s_help.contains("CEO Outfit picker"), "{s_help}");
+        assert!(s_help.contains("sound chimes"), "{s_help}");
     }
 }
